@@ -1,0 +1,16 @@
+# Environment variables — never commit these
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Dependencies
+frontend/node_modules/
+backend/__pycache__/
+backend/*.pyc
+
+# Build output
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db

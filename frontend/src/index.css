@@ -1,0 +1,119 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  font-family: 'Inter', system-ui, sans-serif;
+  background-color: #0a0a0f;
+  color: #e2e8f0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2a38;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a4a;
+}
+
+/* Markdown styles */
+.prose-dark pre {
+  background: #111118 !important;
+  border: 1px solid #22222e;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.prose-dark code {
+  background: #1a1a24;
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+}
+
+.prose-dark pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.prose-dark p { margin-bottom: 0.75em; }
+.prose-dark ul, .prose-dark ol { padding-left: 1.5em; margin-bottom: 0.75em; }
+.prose-dark li { margin-bottom: 0.3em; }
+.prose-dark h1, .prose-dark h2, .prose-dark h3 {
+  font-weight: 600;
+  margin-bottom: 0.5em;
+  margin-top: 1em;
+}
+.prose-dark h1 { font-size: 1.4em; }
+.prose-dark h2 { font-size: 1.2em; }
+.prose-dark h3 { font-size: 1.05em; }
+.prose-dark blockquote {
+  border-left: 3px solid #C8102E;
+  padding-left: 1em;
+  color: #94a3b8;
+  margin: 0.75em 0;
+}
+.prose-dark table { border-collapse: collapse; width: 100%; margin: 0.75em 0; }
+.prose-dark th, .prose-dark td {
+  border: 1px solid #22222e;
+  padding: 0.5em 0.75em;
+}
+.prose-dark th { background: #1a1a24; font-weight: 600; }
+
+/* Typing animation */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: #C8102E;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+
+/* Pulse for eval loading */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(200, 16, 46, 0.3); }
+  50% { box-shadow: 0 0 0 8px rgba(200, 16, 46, 0); }
+}
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Smooth transitions */
+.metric-bar-fill {
+  transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.gauge-progress {
+  transition: stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Message fade in */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.message-enter {
+  animation: fadeInUp 0.25s ease-out forwards;
+}
