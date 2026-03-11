@@ -4,7 +4,8 @@ import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from evaluator import evaluate_conversation
 
 load_dotenv()
@@ -19,7 +20,7 @@ log = logging.getLogger("chat-evaluator")
 api_key = os.getenv("GOOGLE_API_KEY", "")
 if not api_key:
     log.warning("GOOGLE_API_KEY is not set — requests will fail")
-genai.configure(api_key=api_key)
+client = genai.Client(api_key=api_key)
 
 app = FastAPI(title="Chat Evaluator API")
 
@@ -38,8 +39,7 @@ CHAT_SYSTEM_PROMPT = (
     "Ask clarifying questions when the request is ambiguous."
 )
 
-chat_model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash",
+CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=CHAT_SYSTEM_PROMPT,
 )
 
@@ -50,11 +50,13 @@ async def health_check():
 
 
 def _build_gemini_history(conversation_history: list) -> list:
-    """Convert our internal history format to Gemini's format."""
+    """Convert our internal history format to Gemini's Content format."""
     history = []
     for msg in conversation_history:
         role = "user" if msg["role"] == "user" else "model"
-        history.append({"role": role, "parts": [msg["content"]]})
+        history.append(
+            types.Content(role=role, parts=[types.Part(text=msg["content"])])
+        )
     return history
 
 
@@ -84,8 +86,11 @@ async def websocket_endpoint(websocket: WebSocket):
             ellipsis = "..." if len(user_content) > 120 else ""
             log.info(f"[TURN {turn}] User ({len(user_content)} chars): {preview!r}{ellipsis}")
 
-            # Build Gemini history from previous turns (exclude the new message)
+            # Build history and append current user message as the last content
             gemini_history = _build_gemini_history(conversation_history)
+            contents = gemini_history + [
+                types.Content(role="user", parts=[types.Part(text=user_content)])
+            ]
 
             conversation_history.append({"role": "user", "content": user_content})
 
@@ -95,13 +100,15 @@ async def websocket_endpoint(websocket: WebSocket):
             # -- Chat streaming --
             full_response = ""
             chunk_count = 0
-            log.info(f"[TURN {turn}] Streaming chat -> gemini-2.0-flash (history depth: {len(gemini_history)})")
+            last_chunk = None
+            log.info(f"[TURN {turn}] Streaming chat -> gemini-2.5-pro (history depth: {len(gemini_history)})")
 
             try:
-                chat = chat_model.start_chat(history=gemini_history)
-                response = await chat.send_message_async(user_content, stream=True)
-
-                async for chunk in response:
+                async for chunk in await client.aio.models.generate_content_stream(
+                    model="gemini-2.5-pro",
+                    contents=contents,
+                    config=CHAT_CONFIG,
+                ):
                     text = chunk.text
                     if text:
                         full_response += text
@@ -110,15 +117,22 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type": "stream",
                             "content": text
                         }))
+                    last_chunk = chunk
 
-                usage = response.usage_metadata
-                log.info(
-                    f"[TURN {turn}] Chat done -- "
-                    f"chunks={chunk_count}, "
-                    f"in={usage.prompt_token_count} tok, "
-                    f"out={usage.candidates_token_count} tok, "
-                    f"response={len(full_response)} chars"
-                )
+                usage = last_chunk.usage_metadata if last_chunk else None
+                if usage:
+                    log.info(
+                        f"[TURN {turn}] Chat done -- "
+                        f"chunks={chunk_count}, "
+                        f"in={usage.prompt_token_count} tok, "
+                        f"out={usage.candidates_token_count} tok, "
+                        f"response={len(full_response)} chars"
+                    )
+                else:
+                    log.info(
+                        f"[TURN {turn}] Chat done -- "
+                        f"chunks={chunk_count}, response={len(full_response)} chars"
+                    )
 
             except Exception as e:
                 err_str = str(e)

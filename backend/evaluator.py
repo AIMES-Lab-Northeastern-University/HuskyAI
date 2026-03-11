@@ -1,12 +1,19 @@
+import os
 import json
 import logging
 import time
-import google.generativeai as genai
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv()
 
 log = logging.getLogger("chat-evaluator")
 
+_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
+
 EVAL_SYSTEM_PROMPT = """You are an expert AI interaction quality evaluator specializing in coding conversations.
-Your role is to analyze conversations between users and Gemini coding assistants, evaluating the USER\'s prompting technique based on the User Agency Continuum framework.
+Your role is to analyze conversations between users and Gemini coding assistants, evaluating the USER's prompting technique based on the User Agency Continuum framework.
 
 ## Evaluation Framework
 
@@ -51,7 +58,7 @@ PEI = 0.25*PSQ + 0.25*CCM + 0.20*TSI + 0.15*CLM + 0.15*RAS
 - Advanced: PEI > 70 (leading, sophisticated prompting)
 
 ## CRITICAL INSTRUCTIONS
-1. Evaluate only the USER\'s prompting behavior, not the model\'s response quality
+1. Evaluate only the USER's prompting behavior, not the model's response quality
 2. Be precise and calibrated -- not every user is Advanced
 3. Provide actionable, specific suggestions based on actual conversation content
 4. Output ONLY valid JSON matching the exact schema -- no other text
@@ -85,12 +92,9 @@ PEI = 0.25*PSQ + 0.25*CCM + 0.20*TSI + 0.15*CLM + 0.15*RAS
   "turn_summary": "<string>"
 }"""
 
-eval_model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash",
+EVAL_CONFIG = types.GenerateContentConfig(
     system_instruction=EVAL_SYSTEM_PROMPT,
-    generation_config=genai.GenerationConfig(
-        response_mime_type="application/json",
-    ),
+    response_mime_type="application/json",
 )
 
 
@@ -106,7 +110,7 @@ async def evaluate_conversation(conversation_history: list) -> dict:
 
     eval_prompt = (
         f"Analyze this AI coding conversation ({user_turns} user turns, {total_turns} total).\n"
-        "Evaluate the USER\'s prompting quality based on the framework provided.\n\n"
+        "Evaluate the USER's prompting quality based on the framework provided.\n\n"
         f"<conversation>\n{conv_text}\n</conversation>\n\n"
         "Focus on the LATEST user message most heavily, but consider the full conversation arc "
         "for CCM and RAS scores.\n"
@@ -115,18 +119,25 @@ async def evaluate_conversation(conversation_history: list) -> dict:
         "Return ONLY the JSON object."
     )
 
-    log.info(f"[EVAL] Calling gemini-2.0-flash (JSON mode) for {user_turns}-turn conversation")
+    log.info(f"[EVAL] Calling gemini-2.5-flash (JSON mode) for {user_turns}-turn conversation")
     t0 = time.monotonic()
 
     try:
-        response = await eval_model.generate_content_async(eval_prompt)
+        response = await _client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=eval_prompt,
+            config=EVAL_CONFIG,
+        )
         elapsed = time.monotonic() - t0
 
         usage = response.usage_metadata
-        log.info(
-            f"[EVAL] Response received in {elapsed:.2f}s -- "
-            f"in={usage.prompt_token_count} tok, out={usage.candidates_token_count} tok"
-        )
+        if usage:
+            log.info(
+                f"[EVAL] Response received in {elapsed:.2f}s -- "
+                f"in={usage.prompt_token_count} tok, out={usage.candidates_token_count} tok"
+            )
+        else:
+            log.info(f"[EVAL] Response received in {elapsed:.2f}s")
 
         raw_text = response.text.strip()
         # Strip markdown code fences if present
