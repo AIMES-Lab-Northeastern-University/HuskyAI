@@ -1,10 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom'
 import ChatInterface from './components/ChatInterface'
 import EvalPanel from './components/EvalPanel'
+import LandingPage from './pages/LandingPage'
+import AuthPage from './pages/AuthPage'
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
+const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
-export default function App() {
+function ChatApp() {
+  const navigate = useNavigate()
+  const token = localStorage.getItem('token')
+  const user = JSON.parse(localStorage.getItem('user') || 'null')
+
   const [messages, setMessages] = useState([])
   const [streamingContent, setStreamingContent] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
@@ -18,11 +25,19 @@ export default function App() {
   const reconnectTimerRef = useRef(null)
   const streamBufferRef = useRef('')
 
+  const handleLogout = () => {
+    localStorage.removeItem('token')
+    localStorage.removeItem('user')
+    if (wsRef.current) wsRef.current.close()
+    navigate('/login', { replace: true })
+  }
+
   const connect = useCallback(() => {
+    if (!token) return
     if (wsRef.current?.readyState === WebSocket.OPEN) return
 
     setConnectionStatus('connecting')
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(`${WS_BASE}?token=${token}`)
     wsRef.current = ws
 
     ws.onopen = () => {
@@ -33,12 +48,16 @@ export default function App() {
       }
     }
 
-    ws.onclose = () => {
+    ws.onclose = (e) => {
       setConnectionStatus('disconnected')
       setIsStreaming(false)
       setIsTyping(false)
       setIsEvaluating(false)
-      // Auto-reconnect after 3s
+      // 4001 = auth failure, don't reconnect
+      if (e.code === 4001) {
+        handleLogout()
+        return
+      }
       reconnectTimerRef.current = setTimeout(connect, 3000)
     }
 
@@ -54,7 +73,7 @@ export default function App() {
         console.error('Failed to parse message:', e)
       }
     }
-  }, [])
+  }, [token])
 
   const handleWsMessage = (data) => {
     switch (data.type) {
@@ -78,10 +97,7 @@ export default function App() {
         const finalResponse = data.full_response || streamBufferRef.current
         streamBufferRef.current = ''
         setStreamingContent('')
-        setMessages(prev => [
-          ...prev,
-          { role: 'assistant', content: finalResponse }
-        ])
+        setMessages(prev => [...prev, { role: 'assistant', content: finalResponse }])
         break
 
       case 'eval_start':
@@ -112,6 +128,10 @@ export default function App() {
   }
 
   useEffect(() => {
+    if (!token) {
+      navigate('/login', { replace: true })
+      return
+    }
     connect()
     return () => {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
@@ -122,10 +142,11 @@ export default function App() {
   const handleSend = useCallback((content) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     if (isStreaming || isTyping) return
-
     setMessages(prev => [...prev, { role: 'user', content }])
     wsRef.current.send(JSON.stringify({ type: 'message', content }))
   }, [isStreaming, isTyping])
+
+  if (!token) return <Navigate to="/login" replace />
 
   return (
     <div className="h-screen flex flex-col overflow-hidden">
@@ -139,16 +160,24 @@ export default function App() {
           <span className="text-xs text-slate-600">—</span>
           <span className="text-xs text-slate-500">Be an AI-Ready Husky!</span>
         </div>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-3">
           <span className="text-xs px-2 py-0.5 rounded-full border border-[#C8102E]/30 text-[#C8102E] bg-[#C8102E]/10">
             Northeastern University
           </span>
+          {user && (
+            <span className="text-xs text-slate-500 hidden sm:block">{user.name}</span>
+          )}
+          <button
+            onClick={handleLogout}
+            className="text-xs text-slate-500 hover:text-slate-300 transition-colors px-2 py-1 rounded hover:bg-surface-2"
+          >
+            Sign out
+          </button>
         </div>
       </header>
 
       {/* Main layout */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Chat panel — 60% */}
         <div className="flex-1 min-w-0" style={{ flex: '0 0 60%' }}>
           <ChatInterface
             messages={messages}
@@ -159,8 +188,6 @@ export default function App() {
             connectionStatus={connectionStatus}
           />
         </div>
-
-        {/* Eval panel — 40% */}
         <div className="shrink-0" style={{ flex: '0 0 40%', minWidth: '360px' }}>
           <EvalPanel
             evalData={evalData}
@@ -170,5 +197,18 @@ export default function App() {
         </div>
       </div>
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/login" element={<AuthPage />} />
+        <Route path="/app" element={<ChatApp />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
   )
 }
