@@ -85,7 +85,7 @@ export default function MetricBar({ metric, score, isLoading }) {
       </div>
 
       {/* Tooltip-style description on hover */}
-      <p className="text-xs text-slate-600 mt-0.5 group-hover:text-slate-500 transition-colors truncate">
+      <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">
         {info.description}
       </p>
     </div>

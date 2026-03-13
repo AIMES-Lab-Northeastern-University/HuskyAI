@@ -1,0 +1,326 @@
+import { useState, useEffect } from 'react'
+import { useParams, useNavigate } from 'react-router-dom'
+import Sidebar from '../components/Sidebar'
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
+const CATEGORY_STYLES = {
+  'Technical':          { color: '#C8102E', bg: '#FDE8EC' },
+  'Creative & Strategy':{ color: '#7C3AED', bg: '#F5F3FF' },
+  'Data & Analysis':    { color: '#0D9488', bg: '#E6F7F6' },
+  'Product & Business': { color: '#D97706', bg: '#FEF9EC' },
+}
+const DIFF_STYLES = {
+  'Beginner':     { color: '#16A34A', bg: '#DCFCE7' },
+  'Intermediate': { color: '#F97316', bg: '#FEF3E8' },
+  'Advanced':     { color: '#C8102E', bg: '#FDE8EC' },
+}
+
+function statusColor(s) {
+  if (s === 'completed') return { text: '#16A34A', bg: '#DCFCE7', label: 'Completed' }
+  if (s === 'in_progress') return { text: '#C8102E', bg: '#FDE8EC', label: 'In progress' }
+  return { text: '#9A948E', bg: '#F7F3EE', label: 'Not started' }
+}
+
+export default function ChallengeDetail() {
+  const { id } = useParams()
+  const navigate = useNavigate()
+  const [challenge, setChallenge] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [starting, setStarting] = useState(null) // session number being started
+
+  const handleLogout = () => {
+    localStorage.removeItem('token')
+    localStorage.removeItem('user')
+    navigate('/login', { replace: true })
+  }
+
+  useEffect(() => {
+    const token = localStorage.getItem('token')
+    fetch(`${API_URL}/challenges/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => {
+        if (!r.ok) throw new Error('Not found')
+        return r.json()
+      })
+      .then(data => setChallenge(data))
+      .catch(() => setError('Challenge not found'))
+      .finally(() => setLoading(false))
+  }, [id])
+
+  const handleStartSession = async (sessionNumber) => {
+    setStarting(sessionNumber)
+    try {
+      const token = localStorage.getItem('token')
+      const res = await fetch(`${API_URL}/challenges/${id}/sessions/${sessionNumber}/start`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const d = await res.json()
+        alert(d.detail || 'Could not start session')
+        return
+      }
+      navigate(`/workspace?challenge=${id}&session=${sessionNumber}`)
+    } catch {
+      alert('Failed to start session')
+    } finally {
+      setStarting(null)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
+        <Sidebar onLogout={handleLogout} />
+        <div style={{ marginLeft: '220px', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ color: '#9A948E', fontSize: '14px' }}>Loading...</span>
+        </div>
+      </div>
+    )
+  }
+
+  if (error || !challenge) {
+    return (
+      <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
+        <Sidebar onLogout={handleLogout} />
+        <div style={{ marginLeft: '220px', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
+          <span style={{ color: '#C8102E', fontSize: '14px' }}>{error || 'Not found'}</span>
+          <button onClick={() => navigate('/challenges')} style={{ fontSize: '13px', color: '#C8102E', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>
+            Back to challenges
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  const cs = CATEGORY_STYLES[challenge.category] || { color: '#4A4440', bg: '#F7F3EE' }
+  const ds = DIFF_STYLES[challenge.difficulty] || { color: '#4A4440', bg: '#F7F3EE' }
+  const completedCount = challenge.sessions.filter(s => s.status === 'completed').length
+  const progress = Math.round((completedCount / challenge.total_sessions) * 100)
+
+  return (
+    <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
+      <Sidebar onLogout={handleLogout} />
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: '220px' }}>
+
+        {/* Topbar */}
+        <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+          <button
+            onClick={() => navigate('/challenges')}
+            style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '13px', padding: 0 }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 12H5M12 19l-7-7 7-7" />
+            </svg>
+            Challenges
+          </button>
+          <span style={{ color: '#E7E0D8' }}>/</span>
+          <span style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>{challenge.title}</span>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto">
+          <div style={{ maxWidth: '860px', margin: '0 auto', padding: '32px 32px' }}>
+
+            {/* Hero card */}
+            <div style={{
+              background: '#FDFCFB',
+              borderRadius: '16px',
+              padding: '28px',
+              border: '1.5px solid #E7E0D8',
+              marginBottom: '24px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', marginBottom: '16px' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px', background: cs.bg, color: cs.color }}>{challenge.category}</span>
+                    <span style={{ fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px', background: ds.bg, color: ds.color }}>{challenge.difficulty}</span>
+                    {challenge.week && (
+                      <span style={{ fontSize: '11px', fontWeight: 600, padding: '3px 10px', borderRadius: '20px', background: '#F7F3EE', color: '#9A948E', border: '1px solid #E7E0D8' }}>Week {challenge.week}</span>
+                    )}
+                  </div>
+                  <h1 style={{ fontSize: '22px', fontWeight: 600, color: '#16120E', fontFamily: "'Instrument Serif', serif", margin: 0, lineHeight: 1.3 }}>
+                    {challenge.title}
+                  </h1>
+                </div>
+                {/* Progress ring */}
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
+                  <svg width="56" height="56" viewBox="0 0 56 56">
+                    <circle cx="28" cy="28" r="22" fill="none" stroke="#F7F3EE" strokeWidth="5" />
+                    <circle
+                      cx="28" cy="28" r="22"
+                      fill="none"
+                      stroke={progress === 100 ? '#16A34A' : '#C8102E'}
+                      strokeWidth="5"
+                      strokeDasharray={`${(progress / 100) * 138} 138`}
+                      strokeDashoffset="0"
+                      strokeLinecap="round"
+                      transform="rotate(-90 28 28)"
+                    />
+                    <text x="28" y="33" textAnchor="middle" fontSize="12" fontWeight="700" fill="#16120E">{progress}%</text>
+                  </svg>
+                  <span style={{ fontSize: '10px', color: '#9A948E' }}>{completedCount}/{challenge.total_sessions} done</span>
+                </div>
+              </div>
+
+              <p style={{ fontSize: '13px', color: '#4A4440', lineHeight: 1.7, margin: 0 }}>
+                {challenge.description}
+              </p>
+            </div>
+
+            {/* Sessions list */}
+            <h2 style={{ fontSize: '13px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: '12px', marginTop: 0 }}>
+              Sessions
+            </h2>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              {challenge.sessions.map((session, idx) => {
+                const sc = statusColor(session.status)
+                const prevCompleted = idx === 0 || challenge.sessions[idx - 1].status === 'completed'
+                const isLocked = session.status === 'not_started' && !prevCompleted
+                const canStart = !isLocked && session.status !== 'completed'
+                const isActive = starting === session.session_number
+
+                return (
+                  <div
+                    key={session.session_number}
+                    style={{
+                      background: '#FDFCFB',
+                      borderRadius: '12px',
+                      padding: '20px',
+                      border: '1.5px solid',
+                      borderColor: session.status === 'in_progress' ? '#F9BFCA' : isLocked ? '#F7F3EE' : '#E7E0D8',
+                      opacity: isLocked ? 0.55 : 1,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: '16px' }}>
+                      {/* Step number */}
+                      <div style={{
+                        width: '32px', height: '32px', borderRadius: '50%', flexShrink: 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: session.status === 'completed' ? '#DCFCE7' : session.status === 'in_progress' ? '#FDE8EC' : '#F7F3EE',
+                        border: '1.5px solid',
+                        borderColor: session.status === 'completed' ? '#16A34A' : session.status === 'in_progress' ? '#C8102E' : '#E7E0D8',
+                      }}>
+                        {session.status === 'completed' ? (
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#16A34A" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12" />
+                          </svg>
+                        ) : isLocked ? (
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#9A948E" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                          </svg>
+                        ) : (
+                          <span style={{ fontSize: '12px', fontWeight: 700, color: session.status === 'in_progress' ? '#C8102E' : '#9A948E' }}>
+                            {session.session_number}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Content */}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px', gap: '12px' }}>
+                          <span style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>
+                            Session {session.session_number}: {session.title}
+                          </span>
+                          <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: sc.bg, color: sc.text, flexShrink: 0 }}>
+                            {sc.label}
+                          </span>
+                        </div>
+
+                        <p style={{ fontSize: '12px', color: '#9A948E', margin: '0 0 8px', lineHeight: 1.6 }}>
+                          <strong style={{ color: '#4A4440' }}>Goal:</strong> {session.goal}
+                        </p>
+
+                        <div style={{
+                          background: '#F7F3EE',
+                          borderRadius: '8px',
+                          padding: '12px',
+                          fontSize: '12px',
+                          color: '#4A4440',
+                          lineHeight: 1.7,
+                          whiteSpace: 'pre-wrap',
+                          marginBottom: session.best_pei != null || canStart ? '12px' : 0,
+                        }}>
+                          {session.brief}
+                        </div>
+
+                        {/* Seed question hint */}
+                        {!isLocked && (
+                          <div style={{
+                            padding: '10px 12px',
+                            background: '#FDE8EC',
+                            borderRadius: '8px',
+                            fontSize: '12px',
+                            color: '#9E0B24',
+                            lineHeight: 1.6,
+                            marginBottom: canStart ? '12px' : 0,
+                            fontStyle: 'italic',
+                          }}>
+                            <strong style={{ fontStyle: 'normal', color: '#C8102E' }}>Starting prompt: </strong>
+                            {session.seed_question}
+                          </div>
+                        )}
+
+                        {/* Meta */}
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          {session.best_pei != null && (
+                            <span style={{ fontSize: '12px', color: '#9A948E' }}>
+                              Best PEI: <strong style={{ color: '#C8102E' }}>{Math.round(session.best_pei)}</strong>
+                            </span>
+                          )}
+                          {canStart && (
+                            <button
+                              disabled={isActive}
+                              onClick={() => handleStartSession(session.session_number)}
+                              style={{
+                                marginLeft: 'auto',
+                                padding: '8px 20px',
+                                background: '#C8102E',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '8px',
+                                fontSize: '13px',
+                                fontWeight: 600,
+                                cursor: isActive ? 'not-allowed' : 'pointer',
+                                opacity: isActive ? 0.7 : 1,
+                              }}
+                            >
+                              {isActive ? 'Starting...' : session.status === 'in_progress' ? 'Continue session' : 'Start session'}
+                            </button>
+                          )}
+                          {session.status === 'completed' && (
+                            <button
+                              onClick={() => navigate(`/workspace?challenge=${id}&session=${session.session_number}`)}
+                              style={{
+                                marginLeft: 'auto',
+                                padding: '8px 20px',
+                                background: 'transparent',
+                                color: '#4A4440',
+                                border: '1.5px solid #E7E0D8',
+                                borderRadius: '8px',
+                                fontSize: '13px',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                            >
+                              Review session
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

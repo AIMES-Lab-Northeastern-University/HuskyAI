@@ -9,8 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from evaluator import evaluate_conversation
-from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult
+from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession
 from auth import router as auth_router, decode_token
+from challenges import router as challenges_router, seed_challenges
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ client = genai.Client(api_key=api_key)
 async def lifespan(app: FastAPI):
     await init_db()
     log.info("Database initialized")
+    await seed_challenges()
     yield
 
 
@@ -45,16 +47,13 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(challenges_router)
 
-CHAT_SYSTEM_PROMPT = (
-    "You are an expert coding assistant. Help users with programming questions, "
-    "debugging, code reviews, architecture decisions, and software engineering tasks.\n\n"
-    "Be concise but thorough. Provide working code examples when relevant. "
-    "Ask clarifying questions when the request is ambiguous."
-)
-
-CHAT_CONFIG = types.GenerateContentConfig(
-    system_instruction=CHAT_SYSTEM_PROMPT,
+BASE_SYSTEM_PROMPT = (
+    "You are an expert AI tutor helping students develop their AI prompting and reasoning skills. "
+    "Be a thoughtful coach: guide users to think more deeply, ask clarifying questions, "
+    "and help them reason through problems step by step. "
+    "Provide concrete, specific feedback rather than generic praise."
 )
 
 
@@ -111,8 +110,45 @@ async def _close_conversation(conversation_id: str):
         log.error(f"Failed to close conversation: {e}")
 
 
+async def _build_system_prompt(challenge_id: str | None, session_num: int | None) -> tuple[str, dict | None]:
+    """Return (system_prompt, session_data_dict) for the given challenge/session."""
+    if not challenge_id:
+        return BASE_SYSTEM_PROMPT, None
+
+    try:
+        async with AsyncSessionLocal() as db:
+            ch = await db.get(Challenge, challenge_id)
+            if not ch:
+                return BASE_SYSTEM_PROMPT, None
+            idx = (session_num or 1) - 1
+            if idx < 0 or idx >= len(ch.sessions_data):
+                idx = 0
+            sd = ch.sessions_data[idx]
+            extra = sd.get("system_prompt_extra", "")
+            prompt = (
+                f"You are an expert AI tutor coaching a student through the following challenge:\n\n"
+                f"CHALLENGE: {ch.title}\n"
+                f"SESSION {idx + 1}: {sd['title']}\n"
+                f"GOAL: {sd['goal']}\n\n"
+                f"CONTEXT FOR THIS SESSION:\n{sd['brief']}\n\n"
+                f"YOUR COACHING ROLE:\n{extra}\n\n"
+                f"Always stay in the context of this specific challenge and session. "
+                f"Guide the student to think through the problem rather than just giving answers. "
+                f"Ask probing questions. Celebrate good reasoning explicitly."
+            )
+            return prompt, sd
+    except Exception as e:
+        log.error(f"Failed to build challenge system prompt: {e}")
+        return BASE_SYSTEM_PROMPT, None
+
+
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str = Query(None),
+    challenge_id: str = Query(None),
+    session_num: int = Query(None),
+):
     if not token:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -123,6 +159,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
 
     await websocket.accept()
 
+    system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
+    chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
+
     conversation_id = None
     try:
         async with AsyncSessionLocal() as db:
@@ -131,12 +170,40 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
             await db.commit()
             await db.refresh(conv)
             conversation_id = conv.id
+
+            # Link conversation to challenge session if applicable
+            if challenge_id and session_num:
+                from sqlalchemy import select as sa_select
+                result = await db.execute(
+                    sa_select(UserChallengeSession).where(
+                        UserChallengeSession.user_id == user_id,
+                        UserChallengeSession.challenge_id == challenge_id,
+                        UserChallengeSession.session_number == session_num,
+                    )
+                )
+                ucs = result.scalar_one_or_none()
+                if ucs and not ucs.conversation_id:
+                    ucs.conversation_id = conversation_id
+                    await db.commit()
     except Exception as e:
         log.error(f"Failed to create conversation record: {e}")
 
+    # Send session context to client immediately if challenge mode
+    if session_data:
+        await websocket.send_text(json.dumps({
+            "type": "challenge_context",
+            "data": {
+                "title": session_data.get("title"),
+                "goal": session_data.get("goal"),
+                "brief": session_data.get("brief"),
+                "seed_question": session_data.get("seed_question"),
+            }
+        }))
+
     conversation_history = []
     client_host = websocket.client.host if websocket.client else "unknown"
-    log.info(f"[WS] User {user_id[:8]}... connected from {client_host} (conv: {conversation_id})")
+    mode = f"challenge={challenge_id}/session={session_num}" if challenge_id else "free"
+    log.info(f"[WS] User {user_id[:8]}... connected ({mode}) (conv: {conversation_id})")
 
     try:
         while True:
@@ -177,7 +244,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
                 async for chunk in await client.aio.models.generate_content_stream(
                     model="gemini-2.5-pro",
                     contents=contents,
-                    config=CHAT_CONFIG,
+                    config=chat_config,
                 ):
                     text = chunk.text
                     if text:

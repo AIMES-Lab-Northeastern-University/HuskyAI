@@ -5,6 +5,7 @@ import Workspace from './pages/Workspace'
 import Dashboard from './pages/Dashboard'
 import Progress from './pages/Progress'
 import Challenges from './pages/Challenges'
+import ChallengeDetail from './pages/ChallengeDetail'
 import Classroom from './pages/Classroom'
 import Settings from './pages/Settings'
 import Instructor from './pages/Instructor'
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="/workspace"   element={<RequireAuth><Workspace /></RequireAuth>} />
         <Route path="/dashboard"   element={<RequireAuth><Dashboard /></RequireAuth>} />
         <Route path="/challenges"  element={<RequireAuth><Challenges /></RequireAuth>} />
+        <Route path="/challenges/:id" element={<RequireAuth><ChallengeDetail /></RequireAuth>} />
         <Route path="/progress"    element={<RequireAuth><Progress /></RequireAuth>} />
         <Route path="/classroom"   element={<RequireAuth><Classroom /></RequireAuth>} />
         <Route path="/instructor"  element={<RequireAuth><Instructor /></RequireAuth>} />

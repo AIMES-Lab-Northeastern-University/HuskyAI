@@ -3,6 +3,10 @@ import Sidebar from '../components/Sidebar'
 
 export default function Dashboard() {
   const navigate = useNavigate()
+  const user = JSON.parse(localStorage.getItem('user') || 'null')
+  const firstName = user?.name?.split(' ')[0] || 'Husky'
+  const hour = new Date().getHours()
+  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'
 
   const handleLogout = () => {
     localStorage.removeItem('token')
@@ -50,84 +54,72 @@ export default function Dashboard() {
         <div className="flex-1 overflow-y-auto p-8">
 
           {/* Hero task card */}
-          <div
-            style={{
-              background: '#C8102E',
-              borderRadius: '16px',
-              padding: '28px 32px',
-              marginBottom: '24px',
-              position: 'relative',
-              overflow: 'hidden',
-            }}
-          >
-            {/* Watermark SVG */}
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              style={{
-                position: 'absolute',
-                right: '-10px',
-                top: '-10px',
-                width: '160px',
-                height: '160px',
-                opacity: 0.1,
-                pointerEvents: 'none',
-              }}
-            >
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-            </svg>
+          <div style={{ borderRadius: '16px', marginBottom: '24px', overflow: 'hidden', display: 'flex' }}>
 
-            {/* Label */}
-            <div style={{ fontSize: '10px', fontWeight: 700, color: 'rgba(255,255,255,0.65)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '10px' }}>
-              Active · Week 4
+            {/* Left half — AI Coach */}
+            <div style={{ flex: 1, background: '#16120E', padding: '28px 32px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+              <div>
+                <div style={{ fontSize: '10px', fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '14px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>
+                  </svg>
+                  Your AI Coach
+                </div>
+                <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#fff', marginBottom: '10px', lineHeight: 1.3 }}>
+                  {greeting}, {firstName}.
+                </div>
+                <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.6)', lineHeight: 1.75, marginBottom: '20px' }}>
+                  You're building real AI fluency — not just using tools, but directing them. Every prompt you write is a chance to lead smarter.
+                </div>
+                <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', fontStyle: 'italic', lineHeight: 1.65, borderLeft: '2px solid rgba(255,255,255,0.15)', paddingLeft: '12px' }}>
+                  "The best AI users don't ask for answers — they ask better questions."
+                </div>
+              </div>
+              <div style={{ marginTop: '24px' }}>
+                <button
+                  onClick={() => navigate('/workspace')}
+                  style={{ background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.7)', border: '1.5px solid rgba(255,255,255,0.12)', borderRadius: '8px', padding: '8px 16px', fontSize: '12px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                  </svg>
+                  Open workspace
+                </button>
+              </div>
             </div>
 
-            {/* Title */}
-            <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '24px', color: '#fff', marginBottom: '10px', lineHeight: 1.25 }}>
-              Design a Public Awareness Campaign
-            </div>
-
-            {/* Description */}
-            <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.75)', maxWidth: '480px', lineHeight: 1.65, marginBottom: '22px' }}>
-              Use AI tools to design a compelling public awareness campaign for a social issue of your choosing. Your campaign should include messaging, visual direction, and target audience analysis.
-            </div>
-
-            {/* Buttons */}
-            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-              <button
-                onClick={() => navigate('/workspace')}
-                style={{
-                  background: '#fff',
-                  color: '#C8102E',
-                  border: 'none',
-                  borderRadius: '8px',
-                  padding: '9px 18px',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
+            {/* Right half — Active Challenge */}
+            <div style={{ flex: 1, background: '#C8102E', padding: '28px 32px', position: 'relative', overflow: 'hidden' }}>
+              {/* Watermark SVG */}
+              <svg
+                viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+                style={{ position: 'absolute', right: '-10px', top: '-10px', width: '140px', height: '140px', opacity: 0.08, pointerEvents: 'none' }}
               >
-                Continue working
-              </button>
-              <button
-                style={{
-                  background: 'rgba(255,255,255,0.15)',
-                  color: '#fff',
-                  border: '1.5px solid rgba(255,255,255,0.35)',
-                  borderRadius: '8px',
-                  padding: '9px 18px',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
-              >
-                View brief
-              </button>
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+              </svg>
+              <div style={{ fontSize: '10px', fontWeight: 700, color: 'rgba(255,255,255,0.65)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '10px' }}>
+                Active · Week 4
+              </div>
+              <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#fff', marginBottom: '10px', lineHeight: 1.25 }}>
+                Design a Public Awareness Campaign
+              </div>
+              <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.75)', lineHeight: 1.65, marginBottom: '22px' }}>
+                Use AI tools to design a compelling public awareness campaign for a social issue of your choosing.
+              </div>
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <button
+                  onClick={() => navigate('/workspace')}
+                  style={{ background: '#fff', color: '#C8102E', border: 'none', borderRadius: '8px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                >
+                  Continue working
+                </button>
+                <button
+                  style={{ background: 'rgba(255,255,255,0.15)', color: '#fff', border: '1.5px solid rgba(255,255,255,0.35)', borderRadius: '8px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                >
+                  View brief
+                </button>
+              </div>
             </div>
           </div>
 

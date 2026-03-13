@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useNavigate, Navigate } from 'react-router-dom'
+import { useNavigate, useSearchParams, Navigate } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
@@ -56,16 +56,32 @@ function PeiRing({ pei = 0 }) {
 }
 
 /* ─── Dimension bar ─── */
+const DIM_DESC = {
+  PSQ: 'Verb clarity, context, constraints & focus',
+  CCM: 'Initiative, verification & course correction',
+  TSI: 'Decomposition, tool awareness & edge cases',
+  CLM: 'Chunk size, incremental building & clarity',
+  RAS: 'Trust calibration & correct reliance',
+}
+
 function DimBar({ code, value = 0, max = 100 }) {
   const meta = DIM_META[code] || { label: code, color: '#9A948E' }
   const pct = Math.min(100, (value / max) * 100)
   return (
-    <div className="flex items-center gap-[10px] mb-[10px]">
-      <div className="text-[12px] text-[#4A4440] font-medium w-[90px] flex-shrink-0">{code}</div>
-      <div className="flex-1 h-[7px] bg-[#F7F3EE] rounded-full border border-[#E7E0D8] overflow-hidden">
-        <div className="h-full rounded-full prog-fill" style={{ width: `${pct}%`, background: meta.color }} />
+    <div className="mb-[14px]">
+      <div className="flex items-center gap-[10px] mb-[4px]">
+        <div className="flex items-center gap-[6px] flex-1 min-w-0">
+          <span className="text-[11px] font-bold font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: meta.color, background: `${meta.color}15`, border: `1px solid ${meta.color}30` }}>{code}</span>
+          <span className="text-[12px] text-[#4A4440] font-medium truncate">{meta.label}</span>
+        </div>
+        <div className="text-[12px] font-bold text-[#4A4440] w-8 text-right flex-shrink-0">{Math.round(value)}</div>
       </div>
-      <div className="text-[12px] font-bold text-[#4A4440] w-8 text-right">{Math.round(value)}</div>
+      <div className="flex items-center gap-[10px]">
+        <div className="flex-1 h-[6px] bg-[#F7F3EE] rounded-full border border-[#E7E0D8] overflow-hidden">
+          <div className="h-full rounded-full prog-fill" style={{ width: `${pct}%`, background: meta.color }} />
+        </div>
+      </div>
+      <div className="text-[11px] text-[#9A948E] mt-[3px]">{DIM_DESC[code]}</div>
     </div>
   )
 }
@@ -181,9 +197,65 @@ function Message({ role, content }) {
   )
 }
 
+/* ─── Challenge brief banner ─── */
+function ChallengeBanner({ context, onUseSeed }) {
+  const [expanded, setExpanded] = useState(false)
+  if (!context) return null
+  return (
+    <div style={{
+      background: '#FDE8EC',
+      border: '1.5px solid #F9BFCA',
+      borderRadius: '12px',
+      padding: '14px 16px',
+      margin: '0 0 12px',
+      flexShrink: 0,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: expanded ? '10px' : 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#C8102E" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+          </svg>
+          <span style={{ fontSize: '12px', fontWeight: 700, color: '#C8102E' }}>Challenge: {context.title}</span>
+        </div>
+        <button
+          onClick={() => setExpanded(e => !e)}
+          style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', color: '#9E0B24', fontWeight: 600 }}
+        >
+          {expanded ? 'Hide' : 'Show brief'}
+        </button>
+      </div>
+      {expanded && (
+        <>
+          <p style={{ fontSize: '12px', color: '#9E0B24', marginBottom: '8px', lineHeight: 1.6 }}>
+            <strong>Goal:</strong> {context.goal}
+          </p>
+          <div style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px', fontSize: '12px', color: '#4A4440', lineHeight: 1.7, marginBottom: '10px', whiteSpace: 'pre-wrap' }}>
+            {context.brief}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
+            <p style={{ fontSize: '12px', color: '#9E0B24', fontStyle: 'italic', flex: 1, margin: 0, lineHeight: 1.6 }}>
+              "{context.seed_question}"
+            </p>
+            <button
+              onClick={() => onUseSeed(context.seed_question)}
+              style={{ padding: '6px 12px', background: '#C8102E', color: '#fff', border: 'none', borderRadius: '6px', fontSize: '11px', fontWeight: 600, cursor: 'pointer', flexShrink: 0 }}
+            >
+              Use this →
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 /* ─── Main Workspace ─── */
 export default function Workspace() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const challengeId  = searchParams.get('challenge')
+  const sessionNum   = searchParams.get('session')
+
   const token = localStorage.getItem('token')
   const user = JSON.parse(localStorage.getItem('user') || 'null')
 
@@ -196,6 +268,8 @@ export default function Workspace() {
   const [connStatus, setConnStatus]       = useState('disconnected')
   const [turnCount, setTurnCount]         = useState(0)
   const [input, setInput]                 = useState('')
+  const [challengeContext, setChallengeContext] = useState(null)
+  const [briefExpanded, setBriefExpanded] = useState(true)
 
   const wsRef              = useRef(null)
   const reconnectTimer     = useRef(null)
@@ -214,6 +288,9 @@ export default function Workspace() {
 
   const handleWsMessage = useCallback((data) => {
     switch (data.type) {
+      case 'challenge_context':
+        setChallengeContext(data.data)
+        break
       case 'typing':
         setIsTyping(true); setIsStreaming(false)
         streamBuffer.current = ''; setStreaming('')
@@ -242,7 +319,10 @@ export default function Workspace() {
     if (!token) return
     if (wsRef.current?.readyState === WebSocket.OPEN) return
     setConnStatus('connecting')
-    const ws = new WebSocket(`${WS_BASE}?token=${token}`)
+    let wsUrl = `${WS_BASE}?token=${token}`
+    if (challengeId) wsUrl += `&challenge_id=${challengeId}`
+    if (sessionNum)  wsUrl += `&session_num=${sessionNum}`
+    const ws = new WebSocket(wsUrl)
     wsRef.current = ws
     ws.onopen  = () => { setConnStatus('connected'); clearTimeout(reconnectTimer.current) }
     ws.onclose = (e) => {
@@ -252,7 +332,7 @@ export default function Workspace() {
     }
     ws.onerror = () => setConnStatus('error')
     ws.onmessage = (e) => { try { handleWsMessage(JSON.parse(e.data)) } catch {} }
-  }, [token, handleWsMessage])
+  }, [token, challengeId, sessionNum, handleWsMessage])
 
   useEffect(() => {
     if (!token) { navigate('/login', { replace: true }); return }
@@ -295,10 +375,31 @@ export default function Workspace() {
 
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0 sticky top-0 z-10" style={{ borderBottomWidth: '1.5px' }}>
-          <div>
-            <span className="text-[15px] font-semibold text-[#16120E]">Workspace</span>
-            <span className="text-[12px] text-[#9A948E] ml-2">AI Coding Assistant</span>
-          </div>
+          {challengeId ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <button
+                onClick={() => navigate(`/challenges/${challengeId}`)}
+                style={{ display: 'flex', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '12px', padding: 0 }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+                Challenge
+              </button>
+              <span style={{ color: '#E7E0D8' }}>/</span>
+              <span className="text-[14px] font-semibold text-[#16120E]">
+                {challengeContext?.title || 'Session ' + sessionNum}
+              </span>
+              {sessionNum && (
+                <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#FDE8EC', color: '#C8102E' }}>
+                  Session {sessionNum}
+                </span>
+              )}
+            </div>
+          ) : (
+            <div>
+              <span className="text-[15px] font-semibold text-[#16120E]">Workspace</span>
+              <span className="text-[12px] text-[#9A948E] ml-2">Free Practice</span>
+            </div>
+          )}
           <div className="ml-auto flex items-center gap-3">
             <div className="flex items-center gap-1.5 text-[12px] text-[#9A948E]">
               <div className="w-[6px] h-[6px] rounded-full" style={{ background: connDot[connStatus] }} />
@@ -314,6 +415,14 @@ export default function Workspace() {
           <div className="flex flex-col flex-1 overflow-hidden bg-[#F7F3EE]">
             {/* Messages */}
             <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4">
+              {/* Challenge brief banner */}
+              {challengeContext && (
+                <ChallengeBanner
+                  context={challengeContext}
+                  onUseSeed={(q) => { setInput(q); textareaRef.current?.focus() }}
+                />
+              )}
+
               {messages.length === 0 && !isTyping && !isStreaming && (
                 <div className="flex-1 flex flex-col items-center justify-center text-center py-20">
                   <div className="w-12 h-12 bg-[#C8102E] rounded-[14px] flex items-center justify-center mb-4 mx-auto">
@@ -322,8 +431,14 @@ export default function Workspace() {
                       <path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>
                     </svg>
                   </div>
-                  <h2 className="font-serif text-[22px] text-[#16120E] mb-2">Start your session</h2>
-                  <p className="text-[13px] text-[#9A948E] max-w-[320px] leading-[1.65]">Ask a coding question. Your prompting style will be scored in real time.</p>
+                  <h2 className="font-serif text-[22px] text-[#16120E] mb-2">
+                    {challengeContext ? 'Challenge ready' : 'Start your session'}
+                  </h2>
+                  <p className="text-[13px] text-[#9A948E] max-w-[320px] leading-[1.65]">
+                    {challengeContext
+                      ? 'Click "Use this →" above to load the seed question, or write your own.'
+                      : 'Ask a question. Your prompting style will be scored in real time.'}
+                  </p>
                 </div>
               )}
 
@@ -374,7 +489,7 @@ export default function Workspace() {
                   value={input}
                   onChange={handleTextarea}
                   onKeyDown={handleKeyDown}
-                  placeholder="Ask a coding question… (Shift+Enter for new line)"
+                  placeholder={challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)'}
                   rows={1}
                   className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
                   style={{ fontFamily: "'DM Sans', sans-serif" }}
