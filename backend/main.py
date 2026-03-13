@@ -1,12 +1,16 @@
 import os
 import json
 import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from evaluator import evaluate_conversation
+from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult
+from auth import router as auth_router, decode_token
 
 load_dotenv()
 
@@ -22,7 +26,15 @@ if not api_key:
     log.warning("GOOGLE_API_KEY is not set — requests will fail")
 client = genai.Client(api_key=api_key)
 
-app = FastAPI(title="Chat Evaluator API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    log.info("Database initialized")
+    yield
+
+
+app = FastAPI(title="Husky AI API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +43,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
 
 CHAT_SYSTEM_PROMPT = (
     "You are an expert coding assistant. Help users with programming questions, "
@@ -50,7 +64,6 @@ async def health_check():
 
 
 def _build_gemini_history(conversation_history: list) -> list:
-    """Convert our internal history format to Gemini's Content format."""
     history = []
     for msg in conversation_history:
         role = "user" if msg["role"] == "user" else "model"
@@ -60,12 +73,70 @@ def _build_gemini_history(conversation_history: list) -> list:
     return history
 
 
+async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int):
+    try:
+        async with AsyncSessionLocal() as db:
+            db.add(Message(conversation_id=conversation_id, role="user", content=user_msg))
+            db.add(Message(conversation_id=conversation_id, role="assistant", content=assistant_msg))
+            scores = eval_data.get("scores", {})
+            db.add(EvalResult(
+                conversation_id=conversation_id,
+                turn_number=turn_num,
+                pei=scores.get("PEI"),
+                psq=scores.get("PSQ"),
+                ccm=scores.get("CCM"),
+                tsi=scores.get("TSI"),
+                clm=scores.get("CLM"),
+                ras=scores.get("RAS"),
+                classification=eval_data.get("classification"),
+                leading_status=eval_data.get("leading_status"),
+                full_result=eval_data,
+            ))
+            conv = await db.get(Conversation, conversation_id)
+            if conv:
+                conv.turn_count = turn_num
+            await db.commit()
+    except Exception as e:
+        log.error(f"DB save failed for turn {turn_num}: {e}")
+
+
+async def _close_conversation(conversation_id: str):
+    try:
+        async with AsyncSessionLocal() as db:
+            conv = await db.get(Conversation, conversation_id)
+            if conv:
+                conv.ended_at = datetime.utcnow()
+                await db.commit()
+    except Exception as e:
+        log.error(f"Failed to close conversation: {e}")
+
+
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+    user_id = decode_token(token)
+    if not user_id:
+        await websocket.close(code=4001, reason="Invalid or expired token")
+        return
+
     await websocket.accept()
+
+    conversation_id = None
+    try:
+        async with AsyncSessionLocal() as db:
+            conv = Conversation(user_id=user_id)
+            db.add(conv)
+            await db.commit()
+            await db.refresh(conv)
+            conversation_id = conv.id
+    except Exception as e:
+        log.error(f"Failed to create conversation record: {e}")
+
     conversation_history = []
     client_host = websocket.client.host if websocket.client else "unknown"
-    log.info(f"[WS] Client connected from {client_host}")
+    log.info(f"[WS] User {user_id[:8]}... connected from {client_host} (conv: {conversation_id})")
 
     try:
         while True:
@@ -86,7 +157,6 @@ async def websocket_endpoint(websocket: WebSocket):
             ellipsis = "..." if len(user_content) > 120 else ""
             log.info(f"[TURN {turn}] User ({len(user_content)} chars): {preview!r}{ellipsis}")
 
-            # Build history and append current user message as the last content
             gemini_history = _build_gemini_history(conversation_history)
             contents = gemini_history + [
                 types.Content(role="user", parts=[types.Part(text=user_content)])
@@ -129,10 +199,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         f"response={len(full_response)} chars"
                     )
                 else:
-                    log.info(
-                        f"[TURN {turn}] Chat done -- "
-                        f"chunks={chunk_count}, response={len(full_response)} chars"
-                    )
+                    log.info(f"[TURN {turn}] Chat done -- chunks={chunk_count}, response={len(full_response)} chars")
 
             except Exception as e:
                 err_str = str(e)
@@ -164,6 +231,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({"type": "eval_start"}))
             log.info(f"[TURN {turn}] Starting eval (total history: {len(conversation_history)} msgs)")
 
+            eval_result = None
             try:
                 eval_result = await evaluate_conversation(conversation_history)
                 scores = eval_result.get("scores", {})
@@ -187,14 +255,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     "message": str(e)
                 }))
 
+            if conversation_id and eval_result:
+                await _save_turn(conversation_id, user_content, full_response, eval_result, turn)
+
     except WebSocketDisconnect:
-        log.info(f"[WS] Client disconnected after {len(conversation_history) // 2} turns")
+        log.info(f"[WS] User {user_id[:8]}... disconnected after {len(conversation_history) // 2} turns")
+        if conversation_id:
+            await _close_conversation(conversation_id)
     except Exception as e:
         log.error(f"[WS] Unexpected error: {type(e).__name__}: {e}", exc_info=True)
         try:
             await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
         except Exception:
             pass
+        if conversation_id:
+            await _close_conversation(conversation_id)
 
 
 if __name__ == "__main__":
