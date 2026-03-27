@@ -1,6 +1,13 @@
 1) Create backend for multiple challenges
 2) Make Rubrics properly validate it 
 3) Class functionality 
-4)What data to save 
-5)How to annom
-6)Alligining with study strucutre
+4) What data to save 
+5) How to annom
+6) Alligining with study strucutre
+
+
+
+4) What data to save 
+5) How to annom
+6) Find some good usecaases 
+7) Production Ready Check

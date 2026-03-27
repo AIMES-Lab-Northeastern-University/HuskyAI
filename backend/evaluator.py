@@ -1,163 +1,308 @@
+"""
+Two-stage PEI evaluator — generated via OpenAI Agent Builder, adapted for HuskyAI.
+
+Stage 1 — Domain Detector (gpt-4.1-nano): classifies conversation domain
+Stage 2 — Evaluator (gpt-4.1 + FileSearchTool): scores on all 5 PEI dimensions
+"""
+
 import os
-import json
 import logging
 import time
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from pydantic import BaseModel
+from agents import (
+    Agent,
+    FileSearchTool,
+    ModelSettings,
+    Runner,
+    RunConfig,
+    TResponseInputItem,
+)
 
 load_dotenv()
 
 log = logging.getLogger("chat-evaluator")
 
-_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
+# ---------------------------------------------------------------------------
+# Pydantic output schema (matches portal-generated EvaluatorSchema)
+# ---------------------------------------------------------------------------
 
-EVAL_SYSTEM_PROMPT = """You are an expert AI interaction quality evaluator specializing in coding conversations.
-Your role is to analyze conversations between users and Gemini coding assistants, evaluating the USER's prompting technique based on the User Agency Continuum framework.
+class EvaluatorSchema__Scores(BaseModel):
+    PSQ: float
+    CCM: float
+    TSI: float
+    CLM: float
+    RAS: float
+    PEI: float
 
-## Evaluation Framework
 
-### Dimension 1: Prompt Structural Quality (PSQ)
-- verb_specificity (1-5): Presence of clear action verbs (refactor, debug, implement, optimize)
-- context_completeness (0-100): % of necessary context provided upfront (code snippets, environment, goal)
-- constraint_defined (0-1): Whether limitations/requirements are explicitly stated
-- focus_clarity (1-5): How well-defined the desired outcome is
-- alignment_specified (0-1): Whether success criteria are defined
+class EvaluatorSchema__Breakdown(BaseModel):
+    verb_specificity: float
+    context_completeness: float
+    constraint_defined: float
+    focus_clarity: float
+    initiative_ratio: float
+    verification_frequency: float
+    decomposition_depth: float
+    chunk_size_appropriate: float
+    correct_reliance_rate: float
 
-### Dimension 2: Conversation Control Metrics (CCM)
-- initiative_ratio (0-1): User-initiated topic changes / total turns
-- verification_frequency (0-1): Times user verified output / times model generated code
-- course_correction_rate (0-1): User redirections after errors / total turns after errors
-- assumption_challenge_rate (0-1): Challenged model assumptions / total assumptions made
-- Score high (80-100) if user leads, medium (40-70) if mixed, low (<40) if led-by
 
-### Dimension 3: Technical Sophistication Index (TSI)
-- decomposition_depth (1-10): Sub-problems identified per request
-- tool_technique_awareness: References to specific patterns, libraries, algorithms
-- error_anticipation: Proactive mention of edge cases or potential issues
-- solution_iteration: Refinement cycles initiated by user
+class EvaluatorSchema(BaseModel):
+    scores: EvaluatorSchema__Scores
+    breakdown: EvaluatorSchema__Breakdown
+    classification: str
+    leading_status: str
+    suggestions: list[str]
+    red_flags: list[str]
+    strengths: list[str]
+    turn_summary: str
 
-### Dimension 4: Cognitive Load Management (CLM)
-- chunk_size_appropriate (0-100): Appropriate message size
-- incremental_building: Iterative vs monolithic requests ratio
-- clarification_seeking: Questions asked before proceeding with unclear tasks
-- mental_model_indicators: Use of structured thinking, step-by-step breakdowns
 
-### Dimension 5: Reliance Appropriateness Score (RAS)
-- correct_reliance_rate (0-1): Correct self-reliance + correct LLM-reliance / decisions
-- over_reliance_events: Blindly accepting suggestions without questioning
-- under_reliance_events: Rejecting clearly correct suggestions
-- trust_calibration: Confidence expressions aligned with outcome quality
+# ---------------------------------------------------------------------------
+# Stage 1 — Domain Detector
+# ---------------------------------------------------------------------------
 
-### Overall Score
-PEI = 0.25*PSQ + 0.25*CCM + 0.20*TSI + 0.15*CLM + 0.15*RAS
+domain_detector = Agent(
+    name="Domain Detector",
+    instructions="""You are a conversation domain classifier for an AI prompting evaluation system.
 
-### Classification
-- Novice: PEI < 40 (predominantly led-by, low structure)
-- Intermediate: PEI 40-70 (mixed control, improving structure)
-- Advanced: PEI > 70 (leading, sophisticated prompting)
+Your only job is to read a student's conversation with an AI assistant and
+classify it into exactly one domain.
 
-## CRITICAL INSTRUCTIONS
-1. Evaluate only the USER's prompting behavior, not the model's response quality
-2. Be precise and calibrated -- not every user is Advanced
-3. Provide actionable, specific suggestions based on actual conversation content
-4. Output ONLY valid JSON matching the exact schema -- no other text
+## Domains
 
-## Required JSON Schema
-{
-  "scores": {
-    "PSQ": <number 0-100>,
-    "CCM": <number 0-100>,
-    "TSI": <number 0-100>,
-    "CLM": <number 0-100>,
-    "RAS": <number 0-100>,
-    "PEI": <number 0-100>
-  },
-  "breakdown": {
-    "verb_specificity": <number 1-5>,
-    "context_completeness": <number 0-100>,
-    "constraint_defined": <number 0-1>,
-    "focus_clarity": <number 1-5>,
-    "initiative_ratio": <number 0-1>,
-    "verification_frequency": <number 0-1>,
-    "decomposition_depth": <number 1-10>,
-    "chunk_size_appropriate": <number 0-100>,
-    "correct_reliance_rate": <number 0-1>
-  },
-  "classification": "<Novice|Intermediate|Advanced>",
-  "leading_status": "<Leading|Led-by>",
-  "suggestions": ["<string>", ...],
-  "red_flags": ["<string>", ...],
-  "strengths": ["<string>", ...],
-  "turn_summary": "<string>"
-}"""
+coding
+  Writing new code, implementing features, building functions or classes,
+  software architecture decisions, code review, refactoring.
+  Signal: user is creating something new in code.
 
-EVAL_CONFIG = types.GenerateContentConfig(
-    system_instruction=EVAL_SYSTEM_PROMPT,
-    response_mime_type="application/json",
+debugging
+  Fixing broken code, interpreting error messages, reading stack traces,
+  diagnosing runtime failures, troubleshooting unexpected behavior.
+  Signal: something exists and is not working correctly.
+
+data_analysis
+  Writing SQL queries, working with pandas/numpy, statistics, data visualization,
+  data science pipelines, ML model training, analyzing datasets.
+  Signal: the subject is data — transforming, querying, or understanding it.
+
+casual
+  Conceptual questions, learning how something works, asking for explanations,
+  general knowledge, understanding theory without writing code.
+  Signal: no code being written or debugged, primarily learning or discussing.
+
+creative
+  Writing content, product strategy, UI/UX design thinking, brainstorming ideas,
+  business problems, non-technical problem solving.
+  Signal: output is words, ideas, or strategy — not code or data.
+
+## Decision Rules
+
+- If both debugging and coding are present, choose DEBUGGING (more specific)
+- If both data_analysis and coding are present, choose DATA_ANALYSIS
+- Base your decision primarily on the first user message
+- When unsure, choose the domain that best describes the user's GOAL
+- Never output more than one domain
+
+## Output
+
+Return a structured object with:
+  domain     — one of: coding, debugging, data_analysis, casual, creative
+  confidence — float 0.0 to 1.0 (how certain you are)
+  reasoning  — one sentence explaining your choice
+""",
+    model="gpt-4.1-nano",
+    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=256, store=True),
 )
 
 
-async def evaluate_conversation(conversation_history: list) -> dict:
-    """Evaluate the conversation quality using Gemini as the evaluator."""
-    conv_text = ""
-    for i, msg in enumerate(conversation_history):
+# ---------------------------------------------------------------------------
+# Stage 2 — PEI Evaluator
+# ---------------------------------------------------------------------------
+
+_VECTOR_STORE_ID = os.getenv(
+    "OPENAI_VECTOR_STORE_ID",
+    "vs_69c5b5732cfc8191a9fbecc9ee76b31f",  # from portal
+)
+
+file_search = FileSearchTool(vector_store_ids=[_VECTOR_STORE_ID])
+
+evaluator = Agent(
+    name="Evaluator",
+    instructions="""You are an expert AI interaction quality evaluator for HuskyAI, a prompting
+skills platform for Northeastern University students.
+
+Your role is to evaluate the USER's prompting behavior in a conversation with
+an AI coding assistant, using the User Agency Continuum framework.
+
+## Your Process — Follow This Exactly
+
+STEP 1: Read the CONVERSATION DOMAIN at the top of the input.
+STEP 2: Use your file search tool to retrieve:
+         - The rubric for that specific domain (e.g. rubric_coding.md)
+         - Exemplars at novice, intermediate, and advanced levels
+         - Relevant sections of the core framework
+         Do this BEFORE scoring. Ground your scores in what you retrieve.
+STEP 3: Read the STUDENT HISTORICAL PROFILE if provided.
+         Use it to personalize suggestions — not to adjust scores.
+         Scores are always absolute against the framework, never relative.
+STEP 4: Score the conversation using the five dimensions below.
+STEP 5: Return ONLY the JSON object. No other text.
+
+---
+
+## Evaluation Framework
+
+### Dimension 1: Prompt Structural Quality (PSQ) — weight 25%
+
+Sub-components:
+  verb_specificity (1-5)
+    1 = no clear verb ("help me", "fix this")
+    3 = generic verb ("write", "explain")
+    5 = precise action verb ("refactor", "debug", "implement", "optimize")
+
+  context_completeness (0-100)
+    % of necessary context provided: language, environment, existing code,
+    error messages, what was already tried, relevant constraints
+
+  constraint_defined (0 or 1)
+    1 = explicit limitations stated (performance, compatibility, style, scope)
+    0 = no constraints mentioned
+
+  focus_clarity (1-5)
+    1 = completely open-ended with no defined endpoint
+    5 = precisely defined desired output or success criteria
+
+  alignment_specified (0 or 1)
+    1 = user states what "done" looks like or how they will verify success
+    0 = no success criteria defined
+
+PSQ = (0.30 × verb) + (0.25 × context) + (0.20 × constraints) +
+      (0.15 × focus) + (0.10 × alignment)
+Normalize to 0-100.
+
+### Dimension 2: Conversation Control Metrics (CCM) — weight 25%
+
+Turn-level measurements:
+  initiative_ratio (0-1): User-initiated direction changes / total turns
+  verification_frequency (0-1): Times user verified output / times AI generated code
+  course_correction_rate (0-1): User redirections after AI errors / total AI errors
+  assumption_challenge_rate (0-1): User challenged AI assumptions / total AI assumptions
+
+Score: 80-100 if user clearly leads, 40-70 if mixed, 0-40 if AI leads.
+
+### Dimension 3: Technical Sophistication Index (TSI) — weight 20%
+
+  decomposition_depth (1-10): sub-problems identified before asking
+  tool_technique_awareness: references to specific patterns, libraries, algorithms
+  error_anticipation: proactive edge-case or failure-mode mentions
+  solution_iteration: user-initiated refinement cycles
+
+Adjust: for debugging domain, weight decomposition_depth +10%.
+        for casual domain, weight decomposition_depth -10%.
+
+### Dimension 4: Cognitive Load Management (CLM) — weight 15%
+
+  chunk_size_appropriate (0-100): message length appropriate to request complexity
+  incremental_building (0-1): iterative step-by-step vs monolithic requests
+  clarification_seeking (0-1): clarifying questions before acting on ambiguity
+  mental_model_indicators: numbered steps, explicit assumptions, defined scope
+
+### Dimension 5: Reliance Appropriateness Score (RAS) — weight 15%
+
+  correct_reliance_rate (0-1): (correct self-reliance + correct AI-reliance) / decisions
+  over_reliance_events: accepting incorrect AI output without questioning
+  under_reliance_events: rejecting clearly correct AI output without reason
+
+## Overall Score
+PEI = 0.25*PSQ + 0.25*CCM + 0.20*TSI + 0.15*CLM + 0.15*RAS
+
+## Classification
+- Novice: PEI < 40
+- Intermediate: PEI 40-70
+- Advanced: PEI > 70
+""",
+    model="gpt-4.1",
+    tools=[file_search],
+    output_type=EvaluatorSchema,
+    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True),
+)
+
+
+# ---------------------------------------------------------------------------
+# Public API — called from main.py after each WebSocket turn
+# ---------------------------------------------------------------------------
+
+def _format_conversation(history: list) -> str:
+    lines = []
+    for i, msg in enumerate(history):
         role = "USER" if msg["role"] == "user" else "ASSISTANT (AI)"
-        conv_text += f"\n[Turn {(i // 2) + 1}] {role}:\n{msg['content']}\n"
+        lines.append(f"[Turn {(i // 2) + 1}] {role}:\n{msg['content']}")
+    return "\n\n".join(lines)
 
-    total_turns = len(conversation_history)
+
+async def evaluate_conversation(conversation_history: list) -> dict:
+    """
+    Run two-stage evaluation. Returns dict matching legacy schema consumed
+    by main.py / database.py EvalResult rows.
+    """
+    t0 = time.monotonic()
     user_turns = sum(1 for m in conversation_history if m["role"] == "user")
+    total_turns = len(conversation_history)
+    conv_text = _format_conversation(conversation_history)
 
-    eval_prompt = (
-        f"Analyze this AI coding conversation ({user_turns} user turns, {total_turns} total).\n"
-        "Evaluate the USER's prompting quality based on the framework provided.\n\n"
+    log.info(f"[EVAL] Starting two-stage eval ({user_turns} user turns, {total_turns} total)")
+
+    input_text = (
+        f"Conversation stats: {user_turns} user turns, {total_turns} total.\n\n"
         f"<conversation>\n{conv_text}\n</conversation>\n\n"
-        "Focus on the LATEST user message most heavily, but consider the full conversation arc "
-        "for CCM and RAS scores.\n"
-        "Be calibrated: a single vague question should score low (Novice), not high.\n"
-        "Provide 3-5 specific, actionable suggestions based on what you actually observed.\n"
-        "Return ONLY the JSON object."
+        "Focus on the LATEST user message most heavily. "
+        "Be calibrated — a single vague message should score Novice. "
+        "Provide 3-5 specific, actionable suggestions."
     )
 
-    log.info(f"[EVAL] Calling gemini-2.5-flash (JSON mode) for {user_turns}-turn conversation")
-    t0 = time.monotonic()
+    conversation: list[TResponseInputItem] = [
+        {"role": "user", "content": [{"type": "input_text", "text": input_text}]}
+    ]
 
     try:
-        response = await _client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=eval_prompt,
-            config=EVAL_CONFIG,
+        # ── Stage 1: domain detection ──────────────────────────────────────
+        s1 = await Runner.run(
+            domain_detector,
+            input=conversation,
+            run_config=RunConfig(workflow_name="HuskyAI-Eval"),
         )
+        domain_text = s1.final_output_as(str)
+        log.info(f"[EVAL-S1] {domain_text[:120]}")
+
+        # Feed domain detector output into evaluator's context
+        conversation.extend([item.to_input_item() for item in s1.new_items])
+
+        # ── Stage 2: PEI evaluation ────────────────────────────────────────
+        s2 = await Runner.run(
+            evaluator,
+            input=conversation,
+            run_config=RunConfig(workflow_name="HuskyAI-Eval"),
+        )
+        result: EvaluatorSchema = s2.final_output
+
         elapsed = time.monotonic() - t0
+        log.info(
+            f"[EVAL-S2] Done in {elapsed:.2f}s — "
+            f"PEI={result.scores.PEI:.1f} ({result.classification}, {result.leading_status})"
+        )
 
-        usage = response.usage_metadata
-        if usage:
-            log.info(
-                f"[EVAL] Response received in {elapsed:.2f}s -- "
-                f"in={usage.prompt_token_count} tok, out={usage.candidates_token_count} tok"
-            )
-        else:
-            log.info(f"[EVAL] Response received in {elapsed:.2f}s")
-
-        raw_text = response.text.strip()
-        # Strip markdown code fences if present
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("```")[1]
-            if raw_text.startswith("json"):
-                raw_text = raw_text[4:]
-            raw_text = raw_text.strip()
-
-        try:
-            result = json.loads(raw_text)
-            log.debug(f"[EVAL] JSON parsed OK ({len(raw_text)} chars)")
-            return result
-        except json.JSONDecodeError as je:
-            log.error(f"[EVAL] JSON parse failed: {je} -- raw: {raw_text[:300]!r}")
-            return _default_eval()
+        out = result.model_dump()
+        # Flatten nested scores/breakdown for legacy callers
+        out["scores"] = result.scores.model_dump()
+        out["breakdown"] = result.breakdown.model_dump()
+        out["domain_raw"] = domain_text  # bonus metadata
+        return out
 
     except Exception as e:
         elapsed = time.monotonic() - t0
-        log.error(f"[EVAL] Error after {elapsed:.2f}s: {type(e).__name__}: {e}", exc_info=True)
+        log.error(f"[EVAL] Failed after {elapsed:.2f}s: {type(e).__name__}: {e}", exc_info=True)
         return _default_eval()
 
 
@@ -169,12 +314,12 @@ def _default_eval() -> dict:
             "constraint_defined": 0, "focus_clarity": 1,
             "initiative_ratio": 0, "verification_frequency": 0,
             "decomposition_depth": 1, "chunk_size_appropriate": 50,
-            "correct_reliance_rate": 0.5
+            "correct_reliance_rate": 0.5,
         },
         "classification": "Novice",
         "leading_status": "Led-by",
-        "suggestions": ["Unable to evaluate at this time. Please try again."],
+        "suggestions": ["Evaluation temporarily unavailable. Please try again."],
         "red_flags": [],
         "strengths": [],
-        "turn_summary": "Evaluation unavailable."
+        "turn_summary": "Evaluation unavailable.",
     }
