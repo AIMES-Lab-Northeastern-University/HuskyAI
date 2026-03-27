@@ -9,6 +9,7 @@ import ChallengeDetail from './pages/ChallengeDetail'
 import Classroom from './pages/Classroom'
 import Settings from './pages/Settings'
 import Instructor from './pages/Instructor'
+import HowItWorks from './pages/HowItWorks'
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
@@ -21,8 +22,9 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         {/* Public */}
-        <Route path="/"      element={<LandingPage />} />
-        <Route path="/login" element={<AuthPage />} />
+        <Route path="/"             element={<LandingPage />} />
+        <Route path="/login"        element={<AuthPage />} />
+        <Route path="/how-it-works" element={<HowItWorks />} />
 
         {/* Protected */}
         <Route path="/workspace"   element={<RequireAuth><Workspace /></RequireAuth>} />

@@ -518,7 +518,7 @@ export default function LandingPage() {
           Husky AI
         </div>
         <div style={s.navLinks}>
-          <a href="#how" style={s.navLink} className="lp-nav-link">How it works</a>
+          <a onClick={() => navigate('/how-it-works')} style={{ ...s.navLink, cursor: 'pointer' }} className="lp-nav-link">How it works</a>
           <a href="#features" style={s.navLink} className="lp-nav-link">Features</a>
           <a href="#instructors" style={s.navLink} className="lp-nav-link">For Instructors</a>
           <button
@@ -560,6 +560,7 @@ export default function LandingPage() {
               <button
                 style={{ ...s.btnSecondary, background: 'none', border: 'none', borderBottom: '1px solid var(--border)', cursor: 'pointer', paddingBottom: 2 }}
                 className="lp-btn-secondary"
+                onClick={() => navigate('/how-it-works')}
               >
                 See how it works&nbsp;<ChevronDownIcon />
               </button>
