@@ -1,17 +1,79 @@
-import { useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { useNavigate, useSearchParams, useLocation } from 'react-router-dom'
+import { API_URL, formatApiErrorDetail } from '../lib/api'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const showLocalApiHints =
+  import.meta.env.DEV ||
+  String(API_URL).includes('localhost') ||
+  String(API_URL).includes('127.0.0.1')
+
+const ROLES = [
+  {
+    id: 'student',
+    label: 'Student',
+    hint: 'Join with your class code on Classroom after sign-in.',
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
+      </svg>
+    ),
+  },
+  {
+    id: 'instructor',
+    label: 'Instructor',
+    hint: 'Create a section under Classroom → I’m an instructor.',
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" />
+      </svg>
+    ),
+  },
+  {
+    id: 'admin',
+    label: 'Admin',
+    hint: 'Admin link in the sidebar when your account is a platform admin.',
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </svg>
+    ),
+  },
+]
 
 export default function AuthPage() {
   const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
-  const [tab, setTab] = useState(searchParams.get('tab') === 'register' ? 'register' : 'login')
+  const location = useLocation()
+  const [searchParams, setSearchParams] = useSearchParams()
+  /** URL is source of truth: Sign in unless `?tab=register`. Fixes stale tab when navigating /login?tab=register → /login. */
+  const tab = searchParams.get('tab') === 'register' ? 'register' : 'login'
+  const [role, setRole] = useState('student')
   const [form, setForm] = useState({ name: '', email: '', password: '' })
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
+  const switchTab = (next) => {
+    setError('')
+    setSearchParams(
+      (prev) => {
+        const n = new URLSearchParams(prev)
+        if (next === 'register') n.set('tab', 'register')
+        else n.delete('tab')
+        return n
+      },
+      { replace: true },
+    )
+  }
+
   const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }))
+
+  useEffect(() => {
+    const id = (location.hash || '').replace(/^#/, '')
+    if (id === 'educators-login-info') setRole('instructor')
+    if (!id) return
+    requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [location.pathname, location.hash])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -27,10 +89,18 @@ export default function AuthPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || 'Something went wrong')
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(formatApiErrorDetail(data.detail))
       localStorage.setItem('token', data.access_token)
-      localStorage.setItem('user', JSON.stringify({ id: data.user_id, name: data.name, email: data.email }))
+      localStorage.setItem(
+        'user',
+        JSON.stringify({
+          id: data.user_id,
+          name: data.name,
+          email: data.email,
+          is_platform_admin: Boolean(data.is_platform_admin),
+        }),
+      )
       navigate('/dashboard')
     } catch (err) {
       setError(err.message)
@@ -86,21 +156,68 @@ export default function AuthPage() {
       <div className="flex-1 flex items-center justify-center p-12">
         <div className="w-full max-w-[400px]">
           {/* Tabs */}
-          <div className="flex gap-[2px] bg-[#EDEAE4] rounded-[10px] p-[3px] mb-7">
+          <div className="flex gap-[2px] bg-[#EDEAE4] rounded-[10px] p-[3px] mb-5">
             {['login', 'register'].map(t => (
-              <button key={t} onClick={() => { setTab(t); setError('') }}
+              <button key={t} type="button" onClick={() => switchTab(t)}
                 className={`flex-1 py-[9px] rounded-[8px] text-[13px] font-semibold transition-all duration-150 border-none cursor-pointer ${tab === t ? 'bg-[#FDFCFB] text-[#16120E] shadow-sm' : 'bg-transparent text-[#9A948E] hover:text-[#4A4440]'}`}>
                 {t === 'login' ? 'Sign in' : 'Create account'}
               </button>
             ))}
           </div>
 
-          <h2 className="font-serif text-[26px] text-[#16120E] mb-[6px]">
+          <div id="educators-login-info" className="mb-5">
+            <div className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[0.7px] mb-2.5 px-0.5">
+              I am a
+            </div>
+            <div className="flex gap-2">
+              {ROLES.map((r) => {
+                const on = role === r.id
+                return (
+                  <button
+                    key={r.id}
+                    type="button"
+                    onClick={() => {
+                      setRole(r.id)
+                      setError('')
+                      if (r.id === 'admin' && tab === 'login' && !form.email.trim()) {
+                        setForm(f => ({ ...f, email: 'admin' }))
+                      }
+                    }}
+                    className={`flex-1 flex flex-col items-center gap-1.5 rounded-[12px] border-[1.5px] py-3 px-1 transition-all cursor-pointer ${
+                      on
+                        ? 'border-[#C8102E] bg-[#FDE8EC] text-[#C8102E] shadow-sm'
+                        : 'border-[#E7E0D8] bg-[#FDFCFB] text-[#9A948E] hover:border-[#C4BCB3] hover:text-[#4A4440]'
+                    }`}
+                  >
+                    <span
+                      className={`w-11 h-11 rounded-full flex items-center justify-center ${
+                        on ? 'bg-white text-[#C8102E]' : 'bg-[#F7F3EE] text-[#6B6560]'
+                      }`}
+                    >
+                      {r.icon}
+                    </span>
+                    <span className={`text-[12px] font-semibold ${on ? 'text-[#16120E]' : 'text-[#4A4440]'}`}>{r.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+            <p className="text-[11px] text-[#6B6560] leading-snug mt-2.5 min-h-[2.5rem] px-0.5">
+              {ROLES.find((x) => x.id === role)?.hint}
+              {showLocalApiHints && tab === 'login' && role === 'admin' && (
+                <>
+                  {' '}
+                  <span className="text-[#9A948E]">·</span> Local API:{' '}
+                  <code className="text-[11px] text-[#C8102E] bg-[#F7F3EE] px-1 rounded">admin</code>
+                  {' / '}
+                  <code className="text-[11px] text-[#C8102E] bg-[#F7F3EE] px-1 rounded">1234</code>
+                </>
+              )}
+            </p>
+          </div>
+
+          <h2 className="font-serif text-[26px] text-[#16120E] mb-5">
             {tab === 'login' ? 'Welcome back' : 'Join Husky AI'}
           </h2>
-          <p className="text-[13px] text-[#9A948E] mb-6 leading-[1.6]">
-            {tab === 'login' ? 'Sign in to continue your AI learning journey.' : 'Create your account to get started.'}
-          </p>
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-[18px]">
             {tab === 'register' && (
@@ -111,9 +228,17 @@ export default function AuthPage() {
               </div>
             )}
             <div>
-              <label className="block text-[12px] font-semibold text-[#4A4440] mb-[6px] tracking-[0.2px]">Email address</label>
-              <input type="email" required value={form.email} onChange={set('email')} placeholder="you@northeastern.edu"
-                className="w-full px-[14px] py-[10px] border-[1.5px] border-[#E7E0D8] rounded-[9px] text-[14px] text-[#16120E] bg-[#FDFCFB] outline-none placeholder-[#9A948E] focus:border-[#C8102E] transition-colors" />
+              <label className="block text-[12px] font-semibold text-[#4A4440] mb-[6px] tracking-[0.2px]">
+                {tab === 'login' ? 'Email or username' : 'Email address'}
+              </label>
+              <input
+                type={tab === 'login' ? 'text' : 'email'}
+                required
+                value={form.email}
+                onChange={set('email')}
+                placeholder={tab === 'login' ? 'you@school.edu or admin' : 'you@northeastern.edu'}
+                className="w-full px-[14px] py-[10px] border-[1.5px] border-[#E7E0D8] rounded-[9px] text-[14px] text-[#16120E] bg-[#FDFCFB] outline-none placeholder-[#9A948E] focus:border-[#C8102E] transition-colors"
+              />
             </div>
             <div>
               <label className="block text-[12px] font-semibold text-[#4A4440] mb-[6px] tracking-[0.2px]">Password</label>
@@ -138,8 +263,8 @@ export default function AuthPage() {
 
           <div className="text-center mt-5 text-[13px] text-[#9A948E]">
             {tab === 'login'
-              ? <>No account? <button onClick={() => setTab('register')} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">Create one</button></>
-              : <>Already have an account? <button onClick={() => setTab('login')} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">Sign in</button></>
+              ? <>No account? <button type="button" onClick={() => switchTab('register')} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">Create one</button></>
+              : <>Already have an account? <button type="button" onClick={() => switchTab('login')} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">Sign in</button></>
             }
           </div>
         </div>

@@ -1,6 +1,7 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useCallback, useEffect, useState } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
+import { API_URL, authHeaders } from '../lib/api'
 
 const NAV_ITEMS = [
   {
@@ -76,19 +77,76 @@ function Toggle({ checked, onChange }) {
 
 export default function Settings() {
   const navigate = useNavigate()
-  const user = JSON.parse(localStorage.getItem('user') || 'null')
+  const location = useLocation()
+  const isDemo = location.pathname.startsWith('/demo')
+  const storedUser = JSON.parse(localStorage.getItem('user') || 'null')
+  const user = isDemo ? { name: 'Demo Student', email: 'demo@husky.edu' } : storedUser
   const [activeSection, setActiveSection] = useState('profile')
-  const [name, setName] = useState(user?.name || 'Alex Johnson')
-  const [email, setEmail] = useState(user?.email || 'alex.johnson@husky.edu')
-  const [section, setSection] = useState('Section A — Spring 2026')
+  const [name, setName] = useState(user?.name || '')
+  const [email, setEmail] = useState(user?.email || '')
+  const [myClassrooms, setMyClassrooms] = useState([])
   const [notifs, setNotifs] = useState({
     weeklyReport: true,
     challengeReminders: true,
     classComparison: false,
     badgeAlerts: true,
   })
+  const [classCode, setClassCode] = useState('')
+  const [joinMsg, setJoinMsg] = useState('')
+  const [joining, setJoining] = useState(false)
+
+  const loadMyClassrooms = useCallback(async () => {
+    if (isDemo) return
+    const token = localStorage.getItem('token')
+    if (!token) return
+    try {
+      const r = await fetch(`${API_URL}/classrooms/me`, { headers: { ...authHeaders() } })
+      const data = await r.json().catch(() => [])
+      setMyClassrooms(Array.isArray(data) ? data : [])
+    } catch {
+      setMyClassrooms([])
+    }
+  }, [isDemo])
+
+  useEffect(() => {
+    loadMyClassrooms()
+  }, [loadMyClassrooms])
+
+  const joinClass = async () => {
+    if (isDemo) {
+      setJoinMsg('Sign in to join a class with your instructor’s code.')
+      return
+    }
+    const token = localStorage.getItem('token')
+    if (!token) return
+    setJoinMsg('')
+    setJoining(true)
+    try {
+      const r = await fetch(`${API_URL}/classrooms/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ code: classCode.trim() }),
+      })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) {
+        setJoinMsg(typeof d.detail === 'string' ? d.detail : 'Could not join class')
+        return
+      }
+      setJoinMsg(d.status === 'already_member' ? `Already in ${d.name}` : `Joined ${d.name}`)
+      setClassCode('')
+      await loadMyClassrooms()
+    } catch {
+      setJoinMsg('Network error')
+    } finally {
+      setJoining(false)
+    }
+  }
 
   const handleLogout = () => {
+    if (isDemo) {
+      navigate('/', { replace: true })
+      return
+    }
     localStorage.removeItem('token')
     localStorage.removeItem('user')
     navigate('/login', { replace: true })
@@ -195,6 +253,60 @@ export default function Settings() {
                   </div>
                 </div>
 
+                <div style={{ marginBottom: '20px', padding: '14px', background: '#F7F3EE', borderRadius: '10px', border: '1.5px solid #E7E0D8' }}>
+                  <div style={{ fontSize: '12px', fontWeight: 600, color: '#16120E', marginBottom: '8px' }}>Join a class</div>
+                  <div style={{ fontSize: '11px', color: '#9A948E', marginBottom: '10px', lineHeight: 1.5 }}>
+                    {isDemo
+                      ? 'Sign in to enter your instructor’s class code and sync with your section.'
+                      : 'Enter the code your instructor shared (letters and numbers).'}
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <input
+                      type="text"
+                      value={classCode}
+                      onChange={(e) => setClassCode(e.target.value.toUpperCase())}
+                      placeholder="e.g. ABC12XY3"
+                      disabled={isDemo}
+                      style={{
+                        flex: '1 1 160px',
+                        minWidth: '140px',
+                        padding: '9px 12px',
+                        borderRadius: '8px',
+                        border: '1.5px solid #E7E0D8',
+                        background: isDemo ? '#EDEAE4' : '#FDFCFB',
+                        fontSize: '13px',
+                        color: '#16120E',
+                        outline: 'none',
+                        fontFamily: "'DM Sans', sans-serif",
+                        boxSizing: 'border-box',
+                        opacity: isDemo ? 0.85 : 1,
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={joinClass}
+                      disabled={joining || !classCode.trim() || isDemo}
+                      style={{
+                        padding: '9px 18px',
+                        borderRadius: '8px',
+                        border: 'none',
+                        background: joining || !classCode.trim() || isDemo ? '#E7E0D8' : '#C8102E',
+                        color: '#fff',
+                        fontSize: '13px',
+                        fontWeight: 600,
+                        cursor: joining || !classCode.trim() || isDemo ? 'default' : 'pointer',
+                      }}
+                    >
+                      {joining ? '…' : 'Join'}
+                    </button>
+                  </div>
+                  {joinMsg && (
+                    <div style={{ marginTop: '8px', fontSize: '12px', color: joinMsg.startsWith('Joined') || joinMsg.startsWith('Already') ? '#16A34A' : '#C8102E' }}>
+                      {joinMsg}
+                    </div>
+                  )}
+                </div>
+
                 {/* Fields */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                   <div>
@@ -238,12 +350,22 @@ export default function Settings() {
                     />
                   </div>
                   <div>
-                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 600, color: '#4A4440', marginBottom: '5px' }}>Class section</label>
-                    <input
-                      type="text"
-                      value={section}
-                      onChange={e => setSection(e.target.value)}
-                      style={{
+                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 600, color: '#4A4440', marginBottom: '5px' }}>Class sections</label>
+                    {isDemo ? (
+                      <div style={{
+                        width: '100%',
+                        padding: '9px 12px',
+                        borderRadius: '8px',
+                        border: '1.5px solid #E7E0D8',
+                        background: '#EDEAE4',
+                        fontSize: '13px',
+                        color: '#6B6560',
+                        boxSizing: 'border-box',
+                      }}>
+                        Demo — sign in to sync with your real classes
+                      </div>
+                    ) : (
+                      <div style={{
                         width: '100%',
                         padding: '9px 12px',
                         borderRadius: '8px',
@@ -251,11 +373,14 @@ export default function Settings() {
                         background: '#F7F3EE',
                         fontSize: '13px',
                         color: '#16120E',
-                        outline: 'none',
-                        fontFamily: "'DM Sans', sans-serif",
                         boxSizing: 'border-box',
-                      }}
-                    />
+                        lineHeight: 1.5,
+                      }}>
+                        {myClassrooms.length > 0
+                          ? myClassrooms.map(c => `${c.name} (${c.role})`).join(' · ')
+                          : 'Not enrolled — join a class with the code above, or use the Classroom page.'}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

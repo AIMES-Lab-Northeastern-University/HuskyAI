@@ -1,13 +1,21 @@
 """
-Two-stage PEI evaluator — generated via OpenAI Agent Builder, adapted for HuskyAI.
+Two-stage PEI evaluator for HuskyAI.
 
-Stage 1 — Domain Detector (gpt-4.1-nano): classifies conversation domain
-Stage 2 — Evaluator (gpt-4.1 + FileSearchTool): scores on all 5 PEI dimensions
+Uses the OpenAI *Agents* Python SDK (``openai-agents``): ``Agent``, ``Runner``,
+``FileSearchTool`` — the same primitives as workflows exported from OpenAI Agent
+Builder, but **definitions live in this file** (prompts, models, tools). Runtime
+does not call Agent Builder; it calls the OpenAI API via that SDK.
+
+Stage 1 — Domain detector (gpt-4.1-nano): conversation domain
+Stage 2 — Evaluator (gpt-4.1 + FileSearchTool on OPENAI_VECTOR_STORE_ID): PEI JSON
 """
 
 import os
+import asyncio
 import logging
 import time
+from pathlib import Path
+
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from agents import (
@@ -19,6 +27,8 @@ from agents import (
     TResponseInputItem,
 )
 
+_eval_dir = Path(__file__).resolve().parent
+load_dotenv(_eval_dir / ".env")
 load_dotenv()
 
 log = logging.getLogger("chat-evaluator")
@@ -113,7 +123,7 @@ Return a structured object with:
   reasoning  — one sentence explaining your choice
 """,
     model="gpt-4.1-nano",
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=256, store=True),
+    model_settings=ModelSettings(temperature=0.2, top_p=0.9, max_tokens=256, store=True),
 )
 
 
@@ -226,7 +236,7 @@ PEI = 0.25*PSQ + 0.25*CCM + 0.20*TSI + 0.15*CLM + 0.15*RAS
     model="gpt-4.1",
     tools=[file_search],
     output_type=EvaluatorSchema,
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True),
+    model_settings=ModelSettings(temperature=0.2, top_p=0.9, max_tokens=2048, store=True),
 )
 
 
@@ -242,10 +252,88 @@ def _format_conversation(history: list) -> str:
     return "\n\n".join(lines)
 
 
+def _is_transient_eval_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        t in msg
+        for t in (
+            "rate",
+            "429",
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily",
+            "overloaded",
+            "capacity",
+            "503",
+            "502",
+            "524",
+            "unavailable",
+        )
+    )
+
+
+def _sanitize_eval_dict(out: dict) -> dict:
+    """Clamp scores and ensure list fields exist for DB + frontend."""
+    scores = dict(out.get("scores") or {})
+    for k in ("PSQ", "CCM", "TSI", "CLM", "RAS", "PEI"):
+        if k in scores and scores[k] is not None:
+            try:
+                scores[k] = max(0.0, min(100.0, float(scores[k])))
+            except (TypeError, ValueError):
+                scores[k] = 0.0
+    out["scores"] = scores
+    for key in ("suggestions", "red_flags", "strengths"):
+        v = out.get(key)
+        if not isinstance(v, list):
+            out[key] = []
+        else:
+            out[key] = [str(x) for x in v if x is not None]
+    if not out.get("classification"):
+        out["classification"] = "Novice"
+    if not out.get("leading_status"):
+        out["leading_status"] = "Led-by"
+    if not out.get("turn_summary"):
+        out["turn_summary"] = ""
+    return out
+
+
+async def _evaluate_conversation_once(conversation_history: list, input_text: str) -> dict:
+    conversation: list[TResponseInputItem] = [
+        {"role": "user", "content": [{"type": "input_text", "text": input_text}]}
+    ]
+
+    s1 = await Runner.run(
+        domain_detector,
+        input=conversation,
+        run_config=RunConfig(workflow_name="HuskyAI-Eval"),
+    )
+    try:
+        domain_text = s1.final_output_as(str)
+    except Exception:
+        domain_text = str(s1.final_output) if s1.final_output is not None else ""
+    log.info(f"[EVAL-S1] {domain_text[:120]!r}")
+
+    conversation.extend([item.to_input_item() for item in s1.new_items])
+
+    s2 = await Runner.run(
+        evaluator,
+        input=conversation,
+        run_config=RunConfig(workflow_name="HuskyAI-Eval"),
+    )
+    result: EvaluatorSchema = s2.final_output
+
+    out = result.model_dump()
+    out["scores"] = result.scores.model_dump()
+    out["breakdown"] = result.breakdown.model_dump()
+    out["domain_raw"] = domain_text
+    return out
+
+
 async def evaluate_conversation(conversation_history: list) -> dict:
     """
-    Run two-stage evaluation. Returns dict matching legacy schema consumed
-    by main.py / database.py EvalResult rows.
+    Run two-stage evaluation with retries on transient API failures.
+    Returns dict matching legacy schema consumed by main.py / EvalResult rows.
     """
     t0 = time.monotonic()
     user_turns = sum(1 for m in conversation_history if m["role"] == "user")
@@ -262,48 +350,42 @@ async def evaluate_conversation(conversation_history: list) -> dict:
         "Provide 3-5 specific, actionable suggestions."
     )
 
-    conversation: list[TResponseInputItem] = [
-        {"role": "user", "content": [{"type": "input_text", "text": input_text}]}
-    ]
+    last_err: BaseException | None = None
+    for attempt in range(3):
+        try:
+            out = await _evaluate_conversation_once(conversation_history, input_text)
+            elapsed = time.monotonic() - t0
+            pei = out.get("scores", {}).get("PEI", 0)
+            log.info(f"[EVAL-S2] Done in {elapsed:.2f}s — PEI={pei:.1f}")
+            return _sanitize_eval_dict(out)
+        except Exception as e:
+            last_err = e
+            transient = _is_transient_eval_error(e)
+            log.warning(
+                "[EVAL] attempt %s/%s failed: %s: %s (transient=%s)",
+                attempt + 1,
+                3,
+                type(e).__name__,
+                e,
+                transient,
+            )
+            if attempt < 2 and transient:
+                await asyncio.sleep(0.5 * (2**attempt))
+                continue
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+                continue
+            break
 
-    try:
-        # ── Stage 1: domain detection ──────────────────────────────────────
-        s1 = await Runner.run(
-            domain_detector,
-            input=conversation,
-            run_config=RunConfig(workflow_name="HuskyAI-Eval"),
+    elapsed = time.monotonic() - t0
+    if last_err is not None:
+        log.error(
+            f"[EVAL] Failed after {elapsed:.2f}s: {type(last_err).__name__}: {last_err}",
+            exc_info=True,
         )
-        domain_text = s1.final_output_as(str)
-        log.info(f"[EVAL-S1] {domain_text[:120]}")
-
-        # Feed domain detector output into evaluator's context
-        conversation.extend([item.to_input_item() for item in s1.new_items])
-
-        # ── Stage 2: PEI evaluation ────────────────────────────────────────
-        s2 = await Runner.run(
-            evaluator,
-            input=conversation,
-            run_config=RunConfig(workflow_name="HuskyAI-Eval"),
-        )
-        result: EvaluatorSchema = s2.final_output
-
-        elapsed = time.monotonic() - t0
-        log.info(
-            f"[EVAL-S2] Done in {elapsed:.2f}s — "
-            f"PEI={result.scores.PEI:.1f} ({result.classification}, {result.leading_status})"
-        )
-
-        out = result.model_dump()
-        # Flatten nested scores/breakdown for legacy callers
-        out["scores"] = result.scores.model_dump()
-        out["breakdown"] = result.breakdown.model_dump()
-        out["domain_raw"] = domain_text  # bonus metadata
-        return out
-
-    except Exception as e:
-        elapsed = time.monotonic() - t0
-        log.error(f"[EVAL] Failed after {elapsed:.2f}s: {type(e).__name__}: {e}", exc_info=True)
-        return _default_eval()
+    else:
+        log.error(f"[EVAL] Failed after {elapsed:.2f}s (unknown error)")
+    return _default_eval()
 
 
 def _default_eval() -> dict:

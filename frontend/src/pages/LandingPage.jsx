@@ -266,7 +266,7 @@ export default function LandingPage() {
       fontFamily: "'DM Sans', sans-serif", fontSize: 14, fontWeight: 500,
       color: 'var(--ink-2)', textDecoration: 'none',
       display: 'inline-flex', alignItems: 'center', gap: 6,
-      borderBottom: '1px solid var(--border)', paddingBottom: 2,
+      paddingBottom: 2,
       transition: 'color 0.15s, border-color 0.15s', cursor: 'pointer', background: 'none', border: 'none', borderBottom: '1px solid var(--border)',
     },
     heroStats: {
@@ -521,6 +521,14 @@ export default function LandingPage() {
           <a onClick={() => navigate('/how-it-works')} style={{ ...s.navLink, cursor: 'pointer' }} className="lp-nav-link">How it works</a>
           <a href="#features" style={s.navLink} className="lp-nav-link">Features</a>
           <a href="#instructors" style={s.navLink} className="lp-nav-link">For Instructors</a>
+          <a
+            onClick={() => navigate('/login#educators-login-info')}
+            style={{ ...s.navLink, cursor: 'pointer' }}
+            className="lp-nav-link"
+            title="Same sign-in page — how instructors and admins get in"
+          >
+            Instructor / Admin
+          </a>
           <button
             style={s.navCta}
             className="lp-nav-cta"
@@ -549,13 +557,30 @@ export default function LandingPage() {
               Husky AI is your personal coach for learning how to think with AI — not just use it.
               Complete real challenges, get scored on your prompting, and see how your class stacks up.
             </p>
-            <div style={s.heroActions}>
+            <div style={{ ...s.heroActions, flexWrap: 'wrap', gap: '12px' }}>
               <button
                 style={s.btnPrimary}
                 className="lp-btn-primary"
                 onClick={() => navigate('/login?tab=register')}
               >
                 Get started with class code &rarr;
+              </button>
+              <button
+                type="button"
+                style={{
+                  ...s.btnSecondary,
+                  cursor: 'pointer',
+                  border: '1.5px solid var(--red)',
+                  color: 'var(--red)',
+                  background: 'var(--white)',
+                  borderRadius: '10px',
+                  padding: '12px 22px',
+                  fontSize: '14px',
+                  fontWeight: 600,
+                }}
+                onClick={() => navigate('/demo/dashboard')}
+              >
+                Try interactive demo
               </button>
               <button
                 style={{ ...s.btnSecondary, background: 'none', border: 'none', borderBottom: '1px solid var(--border)', cursor: 'pointer', paddingBottom: 2 }}

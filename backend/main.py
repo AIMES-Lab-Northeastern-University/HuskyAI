@@ -3,16 +3,24 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from evaluator import evaluate_conversation
-from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession
-from auth import router as auth_router, decode_token
-from challenges import router as challenges_router, seed_challenges
+from sqlalchemy import select, update
 
+from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession, User
+from auth import router as auth_router, decode_token, pwd_context
+from challenges import router as challenges_router, seed_challenges
+from classrooms import router as classrooms_router, seed_demo_classroom
+from admin import router as admin_router
+
+_backend_dir = Path(__file__).resolve().parent
+load_dotenv(_backend_dir / ".env")
 load_dotenv()
 
 logging.basicConfig(
@@ -22,6 +30,57 @@ logging.basicConfig(
 )
 log = logging.getLogger("chat-evaluator")
 
+
+async def _sync_platform_admin_emails() -> None:
+    """Grant is_platform_admin to users whose emails appear in PLATFORM_ADMIN_EMAILS (comma-separated)."""
+    raw = os.getenv("PLATFORM_ADMIN_EMAILS", "").strip()
+    if not raw:
+        return
+    emails = {e.strip().lower() for e in raw.split(",") if e.strip()}
+    if not emails:
+        return
+    async with AsyncSessionLocal() as db:
+        r = await db.execute(select(User).where(User.email.in_(emails)))
+        for u in r.scalars().all():
+            if not bool(u.is_platform_admin):
+                u.is_platform_admin = True
+        await db.commit()
+    log.info("Synced platform admin flag for %d email(s)", len(emails))
+
+
+async def seed_dev_platform_admin() -> None:
+    """
+    Non-production: ensure a platform admin exists for local QA.
+    Sign in with email admin@husky.local or bare login id \"admin\" + SEED_DEV_ADMIN_PASSWORD (default 1234).
+    Disabled when ENVIRONMENT=production, or SEED_DEV_ADMIN=0/false/no.
+    """
+    if os.getenv("ENVIRONMENT", "").strip().lower() in ("production", "prod"):
+        return
+    if os.getenv("SEED_DEV_ADMIN", "1").strip().lower() in ("0", "false", "no"):
+        return
+    email = os.getenv("SEED_DEV_ADMIN_EMAIL", "admin@husky.local").strip().lower()
+    password = os.getenv("SEED_DEV_ADMIN_PASSWORD", "1234")
+    name = (os.getenv("SEED_DEV_ADMIN_NAME", "Platform admin") or "Platform admin").strip()
+    async with AsyncSessionLocal() as db:
+        r = await db.execute(select(User).where(User.email == email))
+        u = r.scalar_one_or_none()
+        if u:
+            if not bool(u.is_platform_admin):
+                u.is_platform_admin = True
+                await db.commit()
+            return
+        db.add(
+            User(
+                email=email,
+                name=name,
+                password_hash=pwd_context.hash(password),
+                is_platform_admin=True,
+            )
+        )
+        await db.commit()
+    log.info("Seeded dev platform admin %r (sign in with bare id admin or this email)", email)
+
+
 api_key = os.getenv("GOOGLE_API_KEY", "")
 if not api_key:
     log.warning("GOOGLE_API_KEY is not set — requests will fail")
@@ -30,9 +89,24 @@ client = genai.Client(api_key=api_key)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    env = os.getenv("ENVIRONMENT", "").strip().lower()
+    jwt_secret = os.getenv("JWT_SECRET", "dev-secret-change-in-production")
+    if env in ("production", "prod"):
+        if len(jwt_secret) < 32:
+            raise RuntimeError(
+                "JWT_SECRET must be at least 32 characters when ENVIRONMENT=production"
+            )
+    elif not os.getenv("HUSKY_TESTING") and len(jwt_secret) < 32:
+        log.warning(
+            "JWT_SECRET is shorter than 32 characters — use a long random secret in production "
+            "(e.g. openssl rand -hex 32)."
+        )
     await init_db()
+    await seed_dev_platform_admin()
+    await _sync_platform_admin_emails()
     log.info("Database initialized")
     await seed_challenges()
+    await seed_demo_classroom()
     yield
 
 
@@ -48,6 +122,8 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(challenges_router)
+app.include_router(classrooms_router)
+app.include_router(admin_router)
 
 BASE_SYSTEM_PROMPT = (
     "You are an expert AI tutor helping students develop their AI prompting and reasoning skills. "
@@ -91,9 +167,17 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                 leading_status=eval_data.get("leading_status"),
                 full_result=eval_data,
             ))
-            conv = await db.get(Conversation, conversation_id)
-            if conv:
-                conv.turn_count = turn_num
+            res = await db.execute(
+                update(Conversation)
+                .where(Conversation.id == conversation_id)
+                .values(turn_count=turn_num)
+            )
+            if res.rowcount != 1:
+                log.warning(
+                    "turn_count update affected %s rows (expected 1) for conversation_id=%s",
+                    res.rowcount,
+                    conversation_id,
+                )
             await db.commit()
     except Exception as e:
         log.error(f"DB save failed for turn {turn_num}: {e}")
@@ -314,6 +398,9 @@ async def websocket_endpoint(
                 )
                 log.debug(f"[TURN {turn}] Suggestions: {eval_result.get('suggestions', [])}")
                 log.debug(f"[TURN {turn}] Red flags:   {eval_result.get('red_flags', [])}")
+                # Persist before notifying the client so a fast disconnect cannot cancel the save.
+                if conversation_id:
+                    await _save_turn(conversation_id, user_content, full_response, eval_result, turn)
                 await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
             except Exception as e:
                 log.error(f"[TURN {turn}] Eval error: {type(e).__name__}: {e}", exc_info=True)
@@ -321,9 +408,6 @@ async def websocket_endpoint(
                     "type": "eval_error",
                     "message": str(e)
                 }))
-
-            if conversation_id and eval_result:
-                await _save_turn(conversation_id, user_content, full_response, eval_result, turn)
 
     except WebSocketDisconnect:
         log.info(f"[WS] User {user_id[:8]}... disconnected after {len(conversation_history) // 2} turns")

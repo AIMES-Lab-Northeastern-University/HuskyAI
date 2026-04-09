@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
+import { getDemoChallengeDetail, demoSlugForChallengeId } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -25,18 +26,36 @@ function statusColor(s) {
 export default function ChallengeDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
+  const isDemo = location.pathname.startsWith('/demo')
+  const pathPrefix = isDemo ? '/demo' : ''
   const [challenge, setChallenge] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [starting, setStarting] = useState(null) // session number being started
 
   const handleLogout = () => {
+    if (isDemo) {
+      navigate('/', { replace: true })
+      return
+    }
     localStorage.removeItem('token')
     localStorage.removeItem('user')
     navigate('/login', { replace: true })
   }
 
   useEffect(() => {
+    if (isDemo) {
+      const d = getDemoChallengeDetail(id)
+      if (d) {
+        setChallenge(d)
+        setError('')
+      } else {
+        setError('Challenge not found')
+      }
+      setLoading(false)
+      return
+    }
     const token = localStorage.getItem('token')
     fetch(`${API_URL}/challenges/${id}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -48,11 +67,16 @@ export default function ChallengeDetail() {
       .then(data => setChallenge(data))
       .catch(() => setError('Challenge not found'))
       .finally(() => setLoading(false))
-  }, [id])
+  }, [id, isDemo])
 
   const handleStartSession = async (sessionNumber) => {
     setStarting(sessionNumber)
     try {
+      if (isDemo) {
+        const slug = demoSlugForChallengeId(id)
+        navigate(`${pathPrefix}/workspace?demoChallenge=${encodeURIComponent(slug)}`)
+        return
+      }
       const token = localStorage.getItem('token')
       const res = await fetch(`${API_URL}/challenges/${id}/sessions/${sessionNumber}/start`, {
         method: 'POST',
@@ -88,7 +112,7 @@ export default function ChallengeDetail() {
         <Sidebar onLogout={handleLogout} />
         <div style={{ marginLeft: '220px', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
           <span style={{ color: '#C8102E', fontSize: '14px' }}>{error || 'Not found'}</span>
-          <button onClick={() => navigate('/challenges')} style={{ fontSize: '13px', color: '#C8102E', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>
+          <button onClick={() => navigate(`${pathPrefix}/challenges`)} style={{ fontSize: '13px', color: '#C8102E', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>
             Back to challenges
           </button>
         </div>
@@ -109,7 +133,7 @@ export default function ChallengeDetail() {
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <button
-            onClick={() => navigate('/challenges')}
+            onClick={() => navigate(`${pathPrefix}/challenges`)}
             style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '13px', padding: 0 }}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -294,7 +318,14 @@ export default function ChallengeDetail() {
                           )}
                           {session.status === 'completed' && (
                             <button
-                              onClick={() => navigate(`/workspace?challenge=${id}&session=${session.session_number}`)}
+                              onClick={() => {
+                                if (isDemo) {
+                                  const slug = demoSlugForChallengeId(id)
+                                  navigate(`${pathPrefix}/workspace?demoChallenge=${encodeURIComponent(slug)}`)
+                                } else {
+                                  navigate(`/workspace?challenge=${id}&session=${session.session_number}`)
+                                }
+                              }}
                               style={{
                                 marginLeft: 'auto',
                                 padding: '8px 20px',

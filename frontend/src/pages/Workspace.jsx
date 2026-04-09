@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useNavigate, useSearchParams, Navigate } from 'react-router-dom'
+import { useNavigate, useSearchParams, Navigate, useLocation } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
+import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -252,12 +253,17 @@ function ChallengeBanner({ context, onUseSeed }) {
 /* ─── Main Workspace ─── */
 export default function Workspace() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const isDemo = location.pathname.startsWith('/demo')
   const [searchParams] = useSearchParams()
   const challengeId  = searchParams.get('challenge')
   const sessionNum   = searchParams.get('session')
+  const demoChallengeSlug = searchParams.get('demoChallenge')
 
   const token = localStorage.getItem('token')
-  const user = JSON.parse(localStorage.getItem('user') || 'null')
+  const user = isDemo
+    ? { name: 'Demo Student', email: 'demo@husky.edu' }
+    : JSON.parse(localStorage.getItem('user') || 'null')
 
   const [messages, setMessages]           = useState([])
   const [streamingContent, setStreaming]  = useState('')
@@ -280,6 +286,11 @@ export default function Workspace() {
   const userInitials = user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : 'U'
 
   const handleLogout = () => {
+    if (isDemo) {
+      wsRef.current?.close()
+      navigate('/', { replace: true })
+      return
+    }
     localStorage.removeItem('token')
     localStorage.removeItem('user')
     wsRef.current?.close()
@@ -316,7 +327,7 @@ export default function Workspace() {
   }, [])
 
   const connect = useCallback(() => {
-    if (!token) return
+    if (isDemo || !token) return
     if (wsRef.current?.readyState === WebSocket.OPEN) return
     setConnStatus('connecting')
     let wsUrl = `${WS_BASE}?token=${token}`
@@ -332,25 +343,53 @@ export default function Workspace() {
     }
     ws.onerror = () => setConnStatus('error')
     ws.onmessage = (e) => { try { handleWsMessage(JSON.parse(e.data)) } catch {} }
-  }, [token, challengeId, sessionNum, handleWsMessage])
+  }, [token, challengeId, sessionNum, handleWsMessage, isDemo])
 
   useEffect(() => {
+    if (isDemo) {
+      setConnStatus('connected')
+      return () => { clearTimeout(reconnectTimer.current); wsRef.current?.close() }
+    }
     if (!token) { navigate('/login', { replace: true }); return }
     connect()
     return () => { clearTimeout(reconnectTimer.current); wsRef.current?.close() }
-  }, [connect])
+  }, [connect, isDemo, token, navigate])
+
+  useEffect(() => {
+    if (!isDemo || !demoChallengeSlug) return
+    const ctx = DEMO_CHALLENGE_CONTEXTS[demoChallengeSlug]
+    if (ctx) setChallengeContext(ctx)
+  }, [isDemo, demoChallengeSlug])
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent])
 
   const handleSend = useCallback(() => {
     const content = input.trim()
-    if (!content || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    if (isStreaming || isTyping) return
+    if (!content || isStreaming || isTyping || isEvaluating) return
+    if (isDemo) {
+      setMessages(prev => [...prev, { role: 'user', content }])
+      setInput('')
+      if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      setIsTyping(true)
+      window.setTimeout(() => {
+        setIsTyping(false)
+        const reply = cannedAssistantReply(content)
+        setMessages(prev => [...prev, { role: 'assistant', content: reply }])
+        setIsEvaluating(true)
+        window.setTimeout(() => {
+          setEvalData(SAMPLE_EVAL)
+          setIsEvaluating(false)
+          setTurnCount((t) => t + 1)
+        }, 450)
+      }, 550)
+      return
+    }
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     setMessages(prev => [...prev, { role: 'user', content }])
     wsRef.current.send(JSON.stringify({ type: 'message', content }))
     setInput('')
     if (textareaRef.current) { textareaRef.current.style.height = 'auto' }
-  }, [input, isStreaming, isTyping])
+  }, [input, isStreaming, isTyping, isEvaluating, isDemo])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
@@ -362,7 +401,7 @@ export default function Workspace() {
     e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'
   }
 
-  if (!token) return <Navigate to="/login" replace />
+  if (!isDemo && !token) return <Navigate to="/login" replace />
 
   const connDot = { connected: '#16A34A', connecting: '#F97316', error: '#C8102E', disconnected: '#9A948E' }
 
@@ -378,7 +417,7 @@ export default function Workspace() {
           {challengeId ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <button
-                onClick={() => navigate(`/challenges/${challengeId}`)}
+                onClick={() => navigate(`${isDemo ? '/demo' : ''}/challenges/${challengeId}`)}
                 style={{ display: 'flex', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '12px', padding: 0 }}
               >
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
@@ -396,14 +435,24 @@ export default function Workspace() {
             </div>
           ) : (
             <div>
-              <span className="text-[15px] font-semibold text-[#16120E]">Workspace</span>
-              <span className="text-[12px] text-[#9A948E] ml-2">Free Practice</span>
+              <span className="text-[15px] font-semibold text-[#16120E]">
+                {isDemo ? 'Workspace (demo)' : 'Workspace'}
+              </span>
+              <span className="text-[12px] text-[#9A948E] ml-2">
+                {isDemo ? 'Sample coach + scoring' : 'Free Practice'}
+              </span>
             </div>
           )}
           <div className="ml-auto flex items-center gap-3">
             <div className="flex items-center gap-1.5 text-[12px] text-[#9A948E]">
               <div className="w-[6px] h-[6px] rounded-full" style={{ background: connDot[connStatus] }} />
-              {connStatus === 'connected' ? 'Connected' : connStatus === 'connecting' ? 'Connecting…' : 'Disconnected'}
+              {isDemo
+                ? 'Demo mode'
+                : connStatus === 'connected'
+                  ? 'Connected'
+                  : connStatus === 'connecting'
+                    ? 'Connecting…'
+                    : 'Disconnected'}
             </div>
           </div>
         </div>
@@ -496,7 +545,7 @@ export default function Workspace() {
                 />
                 <button
                   onClick={handleSend}
-                  disabled={!input.trim() || isStreaming || isTyping || connStatus !== 'connected'}
+                  disabled={!input.trim() || isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
                   className="w-9 h-9 rounded-[9px] bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer"
                 >
                   <svg className="w-4 h-4 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

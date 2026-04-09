@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
+import { DEMO_CHALLENGE_LIST } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -27,18 +28,30 @@ function diffStyle(d) {
 
 export default function Challenges() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const isDemo = location.pathname.startsWith('/demo')
+  const pathPrefix = isDemo ? '/demo' : ''
   const [challenges, setChallenges] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [activeFilter, setActiveFilter] = useState('All')
 
   const handleLogout = () => {
+    if (isDemo) {
+      navigate('/', { replace: true })
+      return
+    }
     localStorage.removeItem('token')
     localStorage.removeItem('user')
     navigate('/login', { replace: true })
   }
 
   useEffect(() => {
+    if (isDemo) {
+      setChallenges(DEMO_CHALLENGE_LIST)
+      setLoading(false)
+      return
+    }
     const token = localStorage.getItem('token')
     fetch(`${API_URL}/challenges`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -50,7 +63,7 @@ export default function Challenges() {
       })
       .catch(() => setError('Failed to load challenges'))
       .finally(() => setLoading(false))
-  }, [])
+  }, [isDemo])
 
   const categories = ['All', ...new Set(challenges.map(c => c.category))]
 
@@ -115,8 +128,42 @@ export default function Challenges() {
             </div>
           )}
 
+          {!loading && !error && !isDemo && challenges.length === 0 && (
+            <div
+              className="bg-[#FDFCFB] rounded-[14px] p-8 max-w-xl"
+              style={{ borderWidth: '1.5px', borderStyle: 'solid', borderColor: '#E7E0D8' }}
+            >
+              <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#16120E', marginBottom: '10px' }}>
+                No challenges yet
+              </div>
+              <p style={{ fontSize: '14px', color: '#6B6560', lineHeight: 1.65, marginBottom: '16px' }}>
+                Challenges are assigned per class. Join a section with your instructor’s code on the{' '}
+                <button
+                  type="button"
+                  onClick={() => navigate(`${pathPrefix}/classroom`)}
+                  style={{ color: '#C8102E', fontWeight: 600, background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
+                >
+                  Classroom
+                </button>
+                {' '}page or in{' '}
+                <button
+                  type="button"
+                  onClick={() => navigate(`${pathPrefix}/settings`)}
+                  style={{ color: '#C8102E', fontWeight: 600, background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
+                >
+                  Settings
+                </button>
+                . After you join, assigned challenges appear here.
+              </p>
+              <p style={{ fontSize: '12px', color: '#9A948E', lineHeight: 1.5 }}>
+                Local dev: the server seeds a test section <strong style={{ color: '#4A4440' }}>Husky Test Section</strong> with join code{' '}
+                <strong style={{ color: '#4A4440' }}>HUSKYDMX</strong> (override with <code style={{ fontSize: '11px' }}>SEED_CLASSROOM_CODE</code> in <code style={{ fontSize: '11px' }}>backend/.env</code>).
+              </p>
+            </div>
+          )}
+
           {/* Challenge grid */}
-          {!loading && !error && (
+          {!loading && !error && filtered.length > 0 && (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
               {filtered.map(c => {
                 const progress = c.total_sessions > 0
@@ -140,7 +187,7 @@ export default function Challenges() {
                       cursor: 'pointer',
                       transition: 'box-shadow 0.15s ease, transform 0.1s ease',
                     }}
-                    onClick={() => navigate(`/challenges/${c.id}`)}
+                    onClick={() => navigate(`${pathPrefix}/challenges/${c.id}`)}
                     onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 4px 16px rgba(22,18,14,0.08)'; e.currentTarget.style.transform = 'translateY(-1px)' }}
                     onMouseLeave={e => { e.currentTarget.style.boxShadow = 'none'; e.currentTarget.style.transform = 'none' }}
                   >
@@ -160,6 +207,11 @@ export default function Challenges() {
                       {isStarted && !isCompleted && (
                         <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#FDE8EC', color: '#C8102E', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                           Active
+                        </span>
+                      )}
+                      {c.instructor_preview && (
+                        <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#E0E7FF', color: '#4338CA', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                          Test preview
                         </span>
                       )}
                     </div>
@@ -224,7 +276,7 @@ export default function Challenges() {
 
                     {/* CTA */}
                     <button
-                      onClick={e => { e.stopPropagation(); navigate(`/challenges/${c.id}`) }}
+                      onClick={e => { e.stopPropagation(); navigate(`${pathPrefix}/challenges/${c.id}`) }}
                       style={{
                         marginTop: '14px',
                         width: '100%',

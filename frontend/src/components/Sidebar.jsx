@@ -1,4 +1,6 @@
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
+import { API_URL, authHeaders } from '../lib/api'
 
 const NAV = [
   {
@@ -13,6 +15,7 @@ const NAV = [
     group: 'Compete',
     items: [
       { label: 'Classroom',       path: '/classroom', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> },
+      { label: 'Browse sections', path: '/classroom/browse', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> },
     ],
   },
   {
@@ -25,7 +28,8 @@ const NAV = [
     group: 'Account',
     items: [
       { label: 'My Progress',     path: '/progress',    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> },
-      { label: 'Instructor View', path: '/instructor',  icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>, badge: 'New', badgeGreen: true },
+      { label: 'Instructor', path: '/instructor', instructorOnly: true, icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg> },
+      { label: 'Admin', path: '/admin', adminOnly: true, icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> },
       { label: 'Settings',        path: '/settings',    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> },
     ],
   },
@@ -34,8 +38,71 @@ const NAV = [
 export default function Sidebar({ onLogout }) {
   const navigate = useNavigate()
   const location = useLocation()
-  const user = JSON.parse(localStorage.getItem('user') || 'null')
+  const pathPrefix = location.pathname.startsWith('/demo') ? '/demo' : ''
+  const user = pathPrefix
+    ? { name: 'Demo Student', email: 'demo@husky.edu' }
+    : JSON.parse(localStorage.getItem('user') || 'null')
   const initials = user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : 'U'
+
+  const [showInstructorNav, setShowInstructorNav] = useState(!!pathPrefix)
+  const [showAdminNav, setShowAdminNav] = useState(false)
+
+  useEffect(() => {
+    if (pathPrefix) {
+      setShowInstructorNav(true)
+      setShowAdminNav(false)
+      return
+    }
+    const token = localStorage.getItem('token')
+    if (!token) {
+      setShowInstructorNav(false)
+      setShowAdminNav(false)
+      return
+    }
+    const u = JSON.parse(localStorage.getItem('user') || 'null')
+    if (u?.is_platform_admin) setShowAdminNav(true)
+    let cancelled = false
+    ;(async () => {
+      try {
+        const [meR, clR] = await Promise.all([
+          fetch(`${API_URL}/auth/me`, { headers: { ...authHeaders() } }),
+          fetch(`${API_URL}/classrooms/me`, { headers: { ...authHeaders() } }),
+        ])
+        const me = await meR.json().catch(() => ({}))
+        const list = await clR.json().catch(() => [])
+        if (cancelled) return
+        setShowAdminNav(Boolean(meR.ok && me.is_platform_admin))
+        const inst =
+          Array.isArray(list) &&
+          list.some(c => c.role === 'instructor' || c.role === 'admin')
+        setShowInstructorNav(inst)
+      } catch {
+        if (!cancelled) {
+          setShowInstructorNav(false)
+          setShowAdminNav(false)
+        }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [pathPrefix, location.pathname])
+
+  const navGroups = useMemo(
+    () =>
+      NAV.map(g => ({
+        ...g,
+        items: g.items.filter(
+          it =>
+            (!it.instructorOnly || showInstructorNav) &&
+            (!it.adminOnly || showAdminNav),
+        ),
+      })),
+    [showInstructorNav, showAdminNav],
+  )
+
+  const linkPath = (path) => {
+    if (path === '/how-it-works') return '/how-it-works'
+    return pathPrefix ? `${pathPrefix}${path}` : path
+  }
   const score = 68 // TODO: pull from user stats
 
   return (
@@ -57,15 +124,18 @@ export default function Sidebar({ onLogout }) {
 
       {/* Nav */}
       <div className="px-[10px] py-[14px] flex-1 overflow-y-auto">
-        {NAV.map(({ group, items }) => (
+        {navGroups.map(({ group, items }) => (
           <div key={group}>
             <div className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[1.2px] px-[10px] pt-3 pb-[5px]">{group}</div>
             {items.map(({ label, path, icon, badge, badgeGreen }) => {
-              const active = location.pathname === path
+              const dest = linkPath(path)
+              const active =
+                location.pathname === dest ||
+                (path === '/workspace' && location.pathname.startsWith(dest))
               return (
                 <a
                   key={path}
-                  onClick={() => navigate(path)}
+                  onClick={() => navigate(dest)}
                   className={`flex items-center gap-[10px] px-3 py-[9px] rounded-[9px] text-[13px] font-medium cursor-pointer mb-[1px] transition-all duration-[120ms] no-underline
                     ${active
                       ? 'bg-[#FDE8EC] text-[#C8102E] font-semibold'
@@ -111,7 +181,7 @@ export default function Sidebar({ onLogout }) {
             onClick={onLogout}
             className="mt-2 w-full text-[11px] text-[#9A948E] hover:text-[#C8102E] transition-colors text-left"
           >
-            Sign out
+            {pathPrefix ? 'Exit demo' : 'Sign out'}
           </button>
         )}
       </div>
