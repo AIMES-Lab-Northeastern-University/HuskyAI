@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -136,4 +137,247 @@ async def admin_overview(
         },
         "analytics": analytics,
         "classrooms": classrooms,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Users list + promote/demote
+# ---------------------------------------------------------------------------
+
+class AdminUpdateUserBody(BaseModel):
+    is_platform_admin: Optional[bool] = None
+
+
+@router.get("/users")
+async def list_users(
+    _: str = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    r = await db.execute(
+        select(
+            User.id, User.name, User.email,
+            User.is_platform_admin, User.created_at,
+            func.count(ClassroomMembership.id).label("section_count"),
+        )
+        .outerjoin(ClassroomMembership, ClassroomMembership.user_id == User.id)
+        .group_by(User.id)
+        .order_by(User.created_at.desc())
+        .limit(1000)
+    )
+    return [
+        {
+            "id": row[0],
+            "name": row[1],
+            "email": row[2],
+            "is_platform_admin": bool(row[3]),
+            "created_at": row[4].isoformat() if row[4] else None,
+            "section_count": int(row[5] or 0),
+        }
+        for row in r.all()
+    ]
+
+
+@router.patch("/users/{user_id}")
+async def update_user(
+    user_id: str,
+    body: AdminUpdateUserBody,
+    _: str = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    if body.is_platform_admin is not None:
+        u.is_platform_admin = body.is_platform_admin
+    await db.commit()
+    await db.refresh(u)
+    return {"id": u.id, "name": u.name, "email": u.email, "is_platform_admin": bool(u.is_platform_admin)}
+
+
+# ---------------------------------------------------------------------------
+# Per-user activity drill-down
+# ---------------------------------------------------------------------------
+
+@router.get("/users/{user_id}/activity")
+async def user_activity(
+    user_id: str,
+    _: str = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Workspace stats
+    conv_count = await db.scalar(
+        select(func.count()).select_from(Conversation).where(Conversation.user_id == user_id)
+    ) or 0
+    turn_total = await db.scalar(
+        select(func.sum(Conversation.turn_count)).where(Conversation.user_id == user_id)
+    ) or 0
+    eval_count = await db.scalar(
+        select(func.count()).select_from(EvalResult)
+        .join(Conversation, Conversation.id == EvalResult.conversation_id)
+        .where(Conversation.user_id == user_id)
+    ) or 0
+    avg_eval_pei = await db.scalar(
+        select(func.avg(EvalResult.pei))
+        .join(Conversation, Conversation.id == EvalResult.conversation_id)
+        .where(Conversation.user_id == user_id, EvalResult.pei.isnot(None))
+    )
+
+    # Challenge sessions
+    sessions_started = await db.scalar(
+        select(func.count()).select_from(UserChallengeSession)
+        .where(
+            UserChallengeSession.user_id == user_id,
+            UserChallengeSession.status.in_(["in_progress", "completed"]),
+        )
+    ) or 0
+    sessions_completed = await db.scalar(
+        select(func.count()).select_from(UserChallengeSession)
+        .where(UserChallengeSession.user_id == user_id, UserChallengeSession.status == "completed")
+    ) or 0
+    avg_session_pei = await db.scalar(
+        select(func.avg(UserChallengeSession.best_pei))
+        .where(UserChallengeSession.user_id == user_id, UserChallengeSession.best_pei.isnot(None))
+    )
+
+    # Recent conversations (metadata only — no message text)
+    r_conv = await db.execute(
+        select(Conversation.id, Conversation.started_at, Conversation.turn_count)
+        .where(Conversation.user_id == user_id)
+        .order_by(Conversation.started_at.desc())
+        .limit(20)
+    )
+    recent_conversations = [
+        {
+            "id": row[0],
+            "started_at": row[1].isoformat() if row[1] else None,
+            "turn_count": int(row[2] or 0),
+        }
+        for row in r_conv.all()
+    ]
+
+    # Sections they belong to
+    r_sec = await db.execute(
+        select(Classroom.id, Classroom.name, ClassroomMembership.role)
+        .join(ClassroomMembership, ClassroomMembership.classroom_id == Classroom.id)
+        .where(ClassroomMembership.user_id == user_id)
+        .order_by(ClassroomMembership.role)
+    )
+    sections = [{"id": row[0], "name": row[1], "role": row[2]} for row in r_sec.all()]
+
+    return {
+        "user": {
+            "id": u.id,
+            "name": u.name,
+            "email": u.email,
+            "is_platform_admin": bool(u.is_platform_admin),
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        },
+        "workspace": {
+            "conversations": int(conv_count),
+            "turns_total": int(turn_total),
+            "eval_count": int(eval_count),
+            "avg_eval_pei": round(float(avg_eval_pei), 1) if avg_eval_pei is not None else None,
+        },
+        "challenge_sessions": {
+            "sessions_started": int(sessions_started),
+            "sessions_completed": int(sessions_completed),
+            "avg_pei": round(float(avg_session_pei), 1) if avg_session_pei is not None else None,
+        },
+        "recent_conversations": recent_conversations,
+        "sections": sections,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-classroom drill-down
+# ---------------------------------------------------------------------------
+
+@router.get("/classrooms/{classroom_id}")
+async def classroom_detail(
+    classroom_id: str,
+    _: str = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    c = await db.get(Classroom, classroom_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+
+    # Members with role
+    r_mem = await db.execute(
+        select(User.id, User.name, User.email, ClassroomMembership.role, ClassroomMembership.joined_at)
+        .join(ClassroomMembership, ClassroomMembership.user_id == User.id)
+        .where(ClassroomMembership.classroom_id == classroom_id)
+        .order_by(ClassroomMembership.role, User.name)
+    )
+    members = [
+        {
+            "user_id": row[0],
+            "name": row[1],
+            "email": row[2],
+            "role": row[3],
+            "joined_at": row[4].isoformat() if row[4] else None,
+        }
+        for row in r_mem.all()
+    ]
+
+    # Assigned challenges
+    r_ch = await db.execute(
+        select(Challenge.id, Challenge.title, Challenge.is_active, Challenge.week, Challenge.difficulty)
+        .join(ClassroomChallenge, ClassroomChallenge.challenge_id == Challenge.id)
+        .where(ClassroomChallenge.classroom_id == classroom_id)
+        .order_by(ClassroomChallenge.sort_order)
+    )
+    challenges = [
+        {"id": row[0], "title": row[1], "is_active": bool(row[2]), "week": row[3], "difficulty": row[4]}
+        for row in r_ch.all()
+    ]
+
+    # Session analytics across students in this section
+    student_ids = [m["user_id"] for m in members if m["role"] == "student"]
+    ch_ids = [ch["id"] for ch in challenges]
+    sessions_started = sessions_completed = 0
+    avg_pei = None
+    if student_ids and ch_ids:
+        sessions_started = await db.scalar(
+            select(func.count()).select_from(UserChallengeSession)
+            .where(
+                UserChallengeSession.user_id.in_(student_ids),
+                UserChallengeSession.challenge_id.in_(ch_ids),
+            )
+        ) or 0
+        sessions_completed = await db.scalar(
+            select(func.count()).select_from(UserChallengeSession)
+            .where(
+                UserChallengeSession.user_id.in_(student_ids),
+                UserChallengeSession.challenge_id.in_(ch_ids),
+                UserChallengeSession.status == "completed",
+            )
+        ) or 0
+        avg_pei = await db.scalar(
+            select(func.avg(UserChallengeSession.best_pei))
+            .where(
+                UserChallengeSession.user_id.in_(student_ids),
+                UserChallengeSession.challenge_id.in_(ch_ids),
+                UserChallengeSession.best_pei.isnot(None),
+            )
+        )
+
+    return {
+        "id": c.id,
+        "name": c.name,
+        "join_code": c.join_code,
+        "is_active": bool(c.is_active),
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "members": members,
+        "challenges": challenges,
+        "analytics": {
+            "student_count": len(student_ids),
+            "sessions_started": int(sessions_started),
+            "sessions_completed": int(sessions_completed),
+            "avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,
+        },
     }

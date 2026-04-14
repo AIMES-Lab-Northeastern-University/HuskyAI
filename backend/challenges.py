@@ -352,6 +352,347 @@ SEED_CHALLENGES = [
             },
         ],
     },
+    {
+        "title": "The Case Analyst",
+        "description": (
+            "A Boston restaurant chain is deciding between two growth strategies. "
+            "You'll use AI to run a structured business analysis — but you must drive "
+            "the framework and catch every assumption the AI slips in that isn't "
+            "backed by the case facts. Three sessions: open analysis, framework-driven "
+            "analysis, then devil's advocate and assumption audit."
+        ),
+        "category": "Product & Business",
+        "difficulty": "Intermediate",
+        "week": None,
+        "total_sessions": 3,
+        "sessions_data": [
+            {
+                "title": "Open Analysis",
+                "goal": "See how AI responds to an open-ended strategy question — and what it gets wrong.",
+                "brief": (
+                    "--- THE CASE ---\n\n"
+                    "Harbour Table is a mid-size Boston restaurant group with 4 locations "
+                    "(South End, Cambridge, Seaport, Back Bay). Founded in 2016, it runs "
+                    "modern American cuisine at the $35–55 entrée price point. FY2024 revenue: "
+                    "$14.2M across all locations. Net margin: 8.1% — above the 3–5% industry "
+                    "average, driven by tight labor scheduling and a loyal lunch crowd.\n\n"
+                    "The ownership group is debating two options for their FY2026 capital budget ($2.1M):\n\n"
+                    "OPTION A — CITY EXPANSION: Open a fifth location in Providence, RI. "
+                    "Providence has a growing food scene and lower commercial rents (~40% below Boston). "
+                    "However, Harbour Table has no brand recognition there, the ownership team "
+                    "is already stretched managing 4 locations, and their head chef has flagged "
+                    "that quality control across a 5th site would require hiring a new culinary director "
+                    "(estimated cost: $140k/year).\n\n"
+                    "OPTION B — DELIVERY INFRASTRUCTURE: Invest in a centralized ghost kitchen "
+                    "in Roxbury to consolidate delivery operations currently split across all 4 locations. "
+                    "Delivery currently accounts for 18% of revenue but has a 12% lower margin than "
+                    "dine-in due to third-party platform fees (28–30%). A ghost kitchen would let them "
+                    "negotiate direct delivery contracts and potentially launch 2 virtual brands. "
+                    "Upfront cost: ~$1.8M in build-out. Break-even projection: 26 months (internal estimate).\n\n"
+                    "The ownership group meets in 3 weeks to vote.\n"
+                    "--- END CASE ---"
+                ),
+                "seed_question": (
+                    "Read the case above. What should Harbour Table do — expand to Providence "
+                    "or invest in the ghost kitchen? Give me your recommendation."
+                ),
+                "system_prompt_extra": (
+                    "The student is practicing business case analysis. In this first session, "
+                    "give a confident recommendation when asked — don't volunteer a structured framework yet. "
+                    "After they engage with your answer, ask: 'What assumptions did I make "
+                    "that aren't directly supported by the case?' "
+                    "This surfaces the key learning: AI jumps to conclusions without flagging unsupported assumptions."
+                ),
+            },
+            {
+                "title": "Framework-Driven Analysis",
+                "goal": "Use a named framework to ground every claim in case facts, not assumptions.",
+                "brief": (
+                    "In Session 1, you got a recommendation — but it likely included assumptions "
+                    "not in the case (e.g., Providence market size, delivery growth rates, "
+                    "management capacity).\n\n"
+                    "Now apply structure. Prompt the AI to run a proper framework analysis where "
+                    "every point is tied to a specific fact from the case. Any claim that requires "
+                    "information NOT in the case must be flagged as [ASSUMPTION].\n\n"
+                    "The case text is the same as Session 1 — refer back to it.\n\n"
+                    "Try SWOT, a decision matrix, or a risk/reward framework. Pick one and drive it yourself."
+                ),
+                "seed_question": (
+                    "Apply a SWOT analysis to Harbour Table's two options. "
+                    "For every point, cite the specific sentence or number from the case that supports it. "
+                    "If a point requires information not in the case, mark it clearly as [ASSUMPTION]."
+                ),
+                "system_prompt_extra": (
+                    "The student is running a structured case analysis. "
+                    "Follow their chosen framework strictly. For each point, distinguish "
+                    "what is in the case from what you are inferring. "
+                    "If the student doesn't ask you to flag assumptions, prompt them: "
+                    "'Should I mark which points are assumptions vs. direct case facts?' "
+                    "Help them see the difference between grounded analysis and extrapolation."
+                ),
+            },
+            {
+                "title": "Devil's Advocate & Assumption Audit",
+                "goal": "Stress-test your analysis by arguing the opposite and auditing hidden assumptions.",
+                "brief": (
+                    "You've done a structured analysis. Now stress-test it.\n\n"
+                    "Two moves:\n"
+                    "1. Ask the AI to argue the opposite recommendation with equal conviction. "
+                    "A good analysis should survive the counter-argument.\n\n"
+                    "2. Ask the AI to list the top 3 assumptions in your Session 2 analysis "
+                    "and rate how well each is supported by case facts "
+                    "(1 = pure assumption, 5 = directly stated in case).\n\n"
+                    "By the end, you should know which parts of your recommendation rest on "
+                    "solid evidence and which depend on assumptions that could easily be wrong."
+                ),
+                "seed_question": (
+                    "Argue the opposite of the recommendation from Session 2. "
+                    "Make the strongest possible case for the other option using only facts from the case. "
+                    "Then list the 3 biggest assumptions in the original analysis and rate each "
+                    "on how well the case actually supports it (1–5 scale)."
+                ),
+                "system_prompt_extra": (
+                    "The student is stress-testing their analysis. "
+                    "Argue the opposite position with conviction — don't hedge. "
+                    "When listing assumptions, be honest: flag things the analysis relied on "
+                    "that weren't in the case (market growth rates, competitive dynamics, execution risk). "
+                    "Push them to distinguish 'the case says X' from 'I assumed X.' "
+                    "End by asking: which assumptions, if wrong, would flip the recommendation?"
+                ),
+            },
+        ],
+    },
+    {
+        "title": "The Data Interpreter",
+        "description": (
+            "You're given a small quarterly sales dataset for a Boston retail company — "
+            "with one suspicious number planted in it. Three sessions: accept the AI's raw "
+            "analysis, then drive it with specific analytical questions, then challenge "
+            "a suspicious data point with sensitivity analysis. Learn when to trust "
+            "AI-generated insights and when to push back."
+        ),
+        "category": "Data & Analysis",
+        "difficulty": "Intermediate",
+        "week": None,
+        "total_sessions": 3,
+        "sessions_data": [
+            {
+                "title": "What Do You See?",
+                "goal": "Understand what happens when you give AI data without a specific question.",
+                "brief": (
+                    "--- THE DATASET ---\n\n"
+                    "Quarterly net sales ($000s) — Beacon Retail Co., 4 product lines, 5 quarters:\n\n"
+                    "Quarter    | Line A | Line B | Line C | Line D\n"
+                    "-----------|--------|--------|--------|-------\n"
+                    "Q1 2024    |  420   |  310   |  580   |  195\n"
+                    "Q2 2024    |  445   |  295   |  551   |  198\n"
+                    "Q3 2024    |  461   |  280   |   87   |  201\n"
+                    "Q4 2024    |  478   |  398   |  503   |  199\n"
+                    "Q1 2025    |  495   |  305   |  468   |  202\n\n"
+                    "Line A: Everyday basics (clothing, socks, essentials)\n"
+                    "Line B: Seasonal / gifting products\n"
+                    "Line C: Premium home goods\n"
+                    "Line D: Accessories\n\n"
+                    "Context: 12-store regional chain across New England. "
+                    "No major product changes during this period.\n"
+                    "--- END DATASET ---"
+                ),
+                "seed_question": (
+                    "Here's our quarterly sales data for the past 5 quarters across 4 product lines. "
+                    "What trends do you see? What should we pay attention to?"
+                ),
+                "system_prompt_extra": (
+                    "The student is learning to analyze data with AI. "
+                    "Give a reasonable narrative analysis: Line A growing steadily, "
+                    "Line B seasonal (high Q4), Line C declining, Line D flat. "
+                    "Do NOT flag the Q3 2024 Line C number ($87k) as suspicious unless the student asks. "
+                    "Be confident. This sets up the learning in Session 2 where structured questions "
+                    "reveal what the open-ended analysis glossed over."
+                ),
+            },
+            {
+                "title": "Specific Questions, Specific Answers",
+                "goal": "Use precise analytical prompts to get verifiable, structured output.",
+                "brief": (
+                    "In Session 1, the AI gave you a narrative. Narratives are hard to verify "
+                    "and easy to accept uncritically.\n\n"
+                    "Now ask specific analytical questions that produce numbers you can check:\n"
+                    "- Quarter-over-quarter growth rates for each line\n"
+                    "- Which line has the highest variance across the 5 quarters?\n"
+                    "- Are there any outliers? (A value more than 2 standard deviations "
+                    "from that line's mean)\n"
+                    "- Present everything as a table, not a paragraph\n\n"
+                    "Structured output (tables, numbers) is much easier to verify than "
+                    "narrative summaries. If the AI produces a number, you can check it yourself.\n\n"
+                    "The data is the same table from Session 1."
+                ),
+                "seed_question": (
+                    "For each product line, calculate the quarter-over-quarter growth rate "
+                    "for all 4 transitions (Q1→Q2, Q2→Q3, Q3→Q4, Q4→Q1 2025). "
+                    "Present as a table. Then identify any outlier values "
+                    "(more than 2 standard deviations from that line's average). "
+                    "Which line has the highest variance?"
+                ),
+                "system_prompt_extra": (
+                    "The student is asking for specific calculations. Do the math carefully. "
+                    "Line C Q2→Q3: (87-551)/551 = -84.2% — flag this prominently. "
+                    "Line C has by far the highest variance because of the Q3 outlier. "
+                    "Present everything in tables as requested. "
+                    "After presenting, ask: 'That Q3 Line C number is -84.2%. "
+                    "Does that look like a real business event to you, or could there be another explanation?'"
+                ),
+            },
+            {
+                "title": "Challenge the Numbers",
+                "goal": "Apply sensitivity analysis — what if that suspicious number is wrong?",
+                "brief": (
+                    "Line C (Premium Home Goods) dropped from $551k in Q2 2024 to $87k in Q3 2024 "
+                    "— an 84% decline in one quarter — then recovered to $503k in Q4 2024.\n\n"
+                    "That Q3 number is suspicious. For a regional chain with no major product changes, "
+                    "an 84% single-quarter drop followed by a full recovery is unusual.\n\n"
+                    "Possibilities:\n"
+                    "- Real event: supply chain disruption, store closure, lost wholesale account\n"
+                    "- Data issue: typo ($87k instead of $487k?), reporting error, missing stores\n\n"
+                    "Your job: use the AI to run a sensitivity analysis. "
+                    "What changes if that Q3 number is a data error? "
+                    "What additional data would you need to be confident either way?\n\n"
+                    "Core skill: don't just accept what the data says — "
+                    "question whether the data itself is right."
+                ),
+                "seed_question": (
+                    "The Q3 2024 Line C number ($87k) dropped 84% from Q2 and then fully recovered in Q4. "
+                    "Walk me through two scenarios: "
+                    "(1) the drop is real — what would explain it and what should management do? "
+                    "(2) the drop is a data entry error — how would that change the trend analysis? "
+                    "Then tell me: what 3 pieces of additional data would confirm which scenario is true?"
+                ),
+                "system_prompt_extra": (
+                    "The student is running a sensitivity analysis on a suspicious data point. "
+                    "For scenario 1 (real): supply chain disruption or store closure are plausible, "
+                    "but the full Q4 recovery argues against most of these explanations. "
+                    "For scenario 2 (error): a typo ($87k vs $487k) would make Line C "
+                    "a mild decline rather than a crisis — completely different story for management. "
+                    "Emphasize: the entire 'Line C is in trouble' narrative rests on this one number. "
+                    "Ask: 'What would you tell your manager differently depending on which scenario is true?'"
+                ),
+            },
+        ],
+    },
+    {
+        "title": "The Presentation Outliner",
+        "description": (
+            "You have a 10-minute class presentation coming up. AI can help you structure it — "
+            "but its default output is generic and forgettable. Three sessions: see what a vague "
+            "prompt produces, then constrain it with audience and time specifics, then role-play "
+            "the audience to find weak spots before you present."
+        ),
+        "category": "Creative & Strategy",
+        "difficulty": "Beginner",
+        "week": None,
+        "total_sessions": 3,
+        "sessions_data": [
+            {
+                "title": "The Generic Outline",
+                "goal": "See what AI produces with a vague prompt — and why it's not good enough.",
+                "brief": (
+                    "You have a 10-minute presentation next week. "
+                    "Topic: **How AI is changing the job market for college graduates.**\n\n"
+                    "This is relevant to every major at Northeastern — CS students worried about "
+                    "coding jobs, business students thinking about consulting, health science "
+                    "students thinking about diagnostics.\n\n"
+                    "In this session: ask the AI for an outline with as little detail as possible. "
+                    "Just the topic and the time limit. When you get it back, ask yourself:\n"
+                    "- Could this outline work for anyone, for any class, at any school?\n"
+                    "- Does it have a clear argument or just a list of facts?\n"
+                    "- Would a professor remember it after seeing 20 other presentations?\n\n"
+                    "The goal isn't a good outline yet — it's to see what 'generic' looks like "
+                    "so you know what to fix."
+                ),
+                "seed_question": (
+                    "Create an outline for a 10-minute presentation on how AI is changing "
+                    "the job market for college graduates."
+                ),
+                "system_prompt_extra": (
+                    "The student is learning how prompt quality affects output quality. "
+                    "Respond to their prompt as given. If they give minimal context, "
+                    "give them a generic template-style outline (Introduction, 3 main points, Conclusion). "
+                    "Make it reasonably competent but clearly generic — the kind that could apply to anyone. "
+                    "After presenting it, ask: 'How specific is this to you, your class, or your argument? "
+                    "What would make this stand out from the other 20 presentations your professor sees?'"
+                ),
+            },
+            {
+                "title": "Constrained and Specific",
+                "goal": "Use audience, time allocation, and a clear argument to force a better outline.",
+                "brief": (
+                    "That first outline works for anyone — which means it's remarkable to no one.\n\n"
+                    "To get a strong outline, give the AI constraints it can't ignore:\n\n"
+                    "**Your situation:**\n"
+                    "- Audience: 22 classmates who've used ChatGPT but haven't thought critically "
+                    "about AI's economic effects\n"
+                    "- Time: exactly 10 minutes — 1.5 min intro, 7 min body (3 points), 1.5 min conclusion\n"
+                    "- Your argument: 'AI won't eliminate jobs — it will split the job market into "
+                    "two tiers: people who use AI well, and people who get replaced by those people'\n"
+                    "- Opening: start with a surprising statistic, not 'good morning everyone'\n"
+                    "- Your major: use your actual major — this is your presentation\n\n"
+                    "Build a prompt using all of these constraints. "
+                    "The more specific you are, the less the AI can default to generic structure."
+                ),
+                "seed_question": (
+                    "Create a 10-minute presentation outline on AI and the job market with these constraints: "
+                    "audience is 22 undergrads who've used ChatGPT but haven't studied its economic impacts, "
+                    "time breakdown is 1.5 min intro / 7 min body (3 points) / 1.5 min conclusion, "
+                    "my main argument is that AI splits the job market into two tiers — "
+                    "skilled AI users vs. those replaced by them. "
+                    "Open with a surprising statistic. Every slide needs a reason to exist."
+                ),
+                "system_prompt_extra": (
+                    "The student is practicing constrained prompting. "
+                    "Respect every constraint they give you: time allocations, the specific argument, "
+                    "the audience level. Build every section around their thesis — "
+                    "not a balanced 'here are pros and cons' structure. "
+                    "The outline should feel written for this student, not pulled from a template. "
+                    "After presenting it, ask: 'Which slide would your classmates most likely "
+                    "check their phone during? And which transition feels weakest?'"
+                ),
+            },
+            {
+                "title": "Audience Stress Test",
+                "goal": "Role-play the audience to find weak spots before you're standing in front of them.",
+                "brief": (
+                    "You have a solid outline from Session 2. Now pressure-test it "
+                    "before you're standing in front of 22 people.\n\n"
+                    "Ask the AI to role-play two audience members:\n\n"
+                    "1. **A distracted classmate** — sat through 4 presentations already today, "
+                    "tired, giving yours 60% attention. What would make them tune out? "
+                    "What would snap them back?\n\n"
+                    "2. **Your professor** — heard this topic framed 10 different ways. "
+                    "What would make them think 'finally, someone with an actual argument' "
+                    "vs. 'another surface-level AI overview'?\n\n"
+                    "Use the feedback to revise at least one section. "
+                    "Walk out of this session knowing exactly which slide is your weakest "
+                    "and what you're going to do about it."
+                ),
+                "seed_question": (
+                    "You are a tired undergrad who has sat through 4 presentations today. "
+                    "Look at my outline and tell me: at what point would you check your phone, and why? "
+                    "What one change would keep you engaged? "
+                    "Then switch roles: you are my professor, who has heard this topic 15 times. "
+                    "What would make this presentation stand out vs. feel like every other AI talk?"
+                ),
+                "system_prompt_extra": (
+                    "The student is role-playing audience feedback. Take both roles seriously — "
+                    "don't just say 'this is great.' "
+                    "As the tired student: identify the most forgettable section "
+                    "(often a generic 'background on AI' or 'history' slide). "
+                    "As the professor: push for the specific argument — does the outline prove its thesis "
+                    "or just present information? Information without argument doesn't earn good grades. "
+                    "After the feedback, ask: 'Which piece of feedback surprised you most? "
+                    "What specific change are you making before you present?'"
+                ),
+            },
+        ],
+    },
 ]
 
 
@@ -424,6 +765,7 @@ class CreateChallengeBody(BaseModel):
     difficulty: str = Field(default="Beginner", max_length=64)
     week: Optional[int] = None
     total_sessions: int = Field(default=1, ge=1, le=6)
+    is_active: Optional[bool] = None  # None → publish immediately (default); False → save as draft
 
 
 class UpdateChallengeBody(BaseModel):
@@ -628,8 +970,8 @@ async def create_challenge(
         week=body.week,
         total_sessions=body.total_sessions,
         sessions_data=sessions_data,
-        is_active=True,
-        status="published",
+        is_active=body.is_active if body.is_active is not None else True,
+        status="draft" if body.is_active is False else "published",
         created_by_user_id=user_id,
     )
     db.add(ch)

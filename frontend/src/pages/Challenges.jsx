@@ -1,9 +1,14 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import { DEMO_CHALLENGE_LIST } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
+function authHeaders() {
+  const token = localStorage.getItem('token')
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
 
 const CATEGORY_STYLES = {
   'Technical':          { color: '#C8102E', bg: '#FDE8EC' },
@@ -36,6 +41,22 @@ export default function Challenges() {
   const [error, setError] = useState('')
   const [activeFilter, setActiveFilter] = useState('All')
 
+  // Instructor state
+  const [instructorSections, setInstructorSections] = useState([])
+  const [selectedSectionId, setSelectedSectionId] = useState('')
+  const [sectionChallenges, setSectionChallenges] = useState([])
+  const [sectionChallengesLoading, setSectionChallengesLoading] = useState(false)
+  const [createTitle, setCreateTitle] = useState('')
+  const [createDesc, setCreateDesc] = useState('')
+  const [createCategory, setCreateCategory] = useState('General')
+  const [createDifficulty, setCreateDifficulty] = useState('Beginner')
+  const [createWeek, setCreateWeek] = useState('')
+  const [createTotalSessions, setCreateTotalSessions] = useState(3)
+  const [createMsg, setCreateMsg] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [creatingDraft, setCreatingDraft] = useState(false)
+  const [actionMsg, setActionMsg] = useState('')
+
   const handleLogout = () => {
     if (isDemo) {
       navigate('/', { replace: true })
@@ -64,6 +85,102 @@ export default function Challenges() {
       .catch(() => setError('Failed to load challenges'))
       .finally(() => setLoading(false))
   }, [isDemo])
+
+  // Load instructor sections
+  useEffect(() => {
+    if (isDemo) return
+    fetch(`${API_URL}/classrooms/me`, { headers: authHeaders() })
+      .then(r => r.json())
+      .then(data => {
+        if (!Array.isArray(data)) return
+        const inst = data.filter(c => c.role === 'instructor' || c.role === 'admin')
+        setInstructorSections(inst)
+        if (inst.length > 0) setSelectedSectionId(inst[0].id)
+      })
+      .catch(() => {})
+  }, [isDemo])
+
+  const loadSectionChallenges = useCallback(async () => {
+    if (!selectedSectionId) return
+    setSectionChallengesLoading(true)
+    try {
+      const r = await fetch(`${API_URL}/classrooms/${selectedSectionId}/challenges`, { headers: authHeaders() })
+      const data = await r.json().catch(() => [])
+      if (r.ok) setSectionChallenges(Array.isArray(data) ? data : [])
+    } catch {} finally {
+      setSectionChallengesLoading(false)
+    }
+  }, [selectedSectionId])
+
+  useEffect(() => {
+    loadSectionChallenges()
+    setActionMsg('')
+    setCreateMsg('')
+  }, [loadSectionChallenges])
+
+  const createChallenge = async (publish = true) => {
+    if (!selectedSectionId) return
+    const title = createTitle.trim()
+    const description = createDesc.trim()
+    if (!title || !description) { setCreateMsg('Title and description are required'); return }
+    let weekNum = null
+    if (createWeek.trim() !== '') {
+      const n = parseInt(createWeek, 10)
+      if (Number.isNaN(n)) { setCreateMsg('Week must be a number'); return }
+      weekNum = n
+    }
+    setCreateMsg('')
+    if (publish) setCreating(true); else setCreatingDraft(true)
+    try {
+      const r = await fetch(`${API_URL}/challenges`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          classroom_id: selectedSectionId,
+          title, description,
+          category: createCategory.trim() || 'General',
+          difficulty: createDifficulty,
+          week: weekNum,
+          total_sessions: createTotalSessions,
+          is_active: publish,
+        }),
+      })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) { setCreateMsg(typeof d.detail === 'string' ? d.detail : 'Could not create challenge'); return }
+      setCreateMsg(publish ? 'Challenge published — students can see it now.' : 'Draft saved.')
+      setCreateTitle(''); setCreateDesc(''); setCreateWeek('')
+      await loadSectionChallenges()
+    } catch { setCreateMsg('Network error') }
+    finally { setCreating(false); setCreatingDraft(false) }
+  }
+
+  const setChallengeActive = async (challengeId, isActive) => {
+    setActionMsg('')
+    try {
+      await fetch(`${API_URL}/challenges/${challengeId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ is_active: isActive }),
+      })
+      await loadSectionChallenges()
+    } catch { setActionMsg('Network error') }
+  }
+
+  const unlinkChallenge = async (challengeId) => {
+    if (!selectedSectionId) return
+    if (!window.confirm('Remove this challenge from this section?')) return
+    try {
+      await fetch(`${API_URL}/classrooms/${selectedSectionId}/challenges/${challengeId}`, {
+        method: 'DELETE', headers: authHeaders(),
+      })
+      await loadSectionChallenges()
+    } catch { setActionMsg('Network error') }
+  }
+
+  const inputStyle = {
+    width: '100%', padding: '10px 12px', borderRadius: '8px',
+    border: '1.5px solid #E7E0D8', fontSize: '14px', background: '#fff',
+  }
 
   const categories = ['All', ...new Set(challenges.map(c => c.category))]
 
@@ -295,6 +412,131 @@ export default function Challenges() {
                   </div>
                 )
               })}
+            </div>
+          )}
+
+          {/* Instructor: Manage Challenges */}
+          {!isDemo && instructorSections.length > 0 && (
+            <div style={{ marginTop: '40px', borderTop: '1.5px solid #E7E0D8', paddingTop: '32px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px', flexWrap: 'wrap', gap: '10px' }}>
+                <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#16120E' }}>
+                  Manage challenges
+                </div>
+                {instructorSections.length > 1 && (
+                  <select
+                    value={selectedSectionId}
+                    onChange={e => setSelectedSectionId(e.target.value)}
+                    style={{ ...inputStyle, width: 'auto', fontSize: '13px' }}
+                  >
+                    {instructorSections.map(s => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                )}
+                {instructorSections.length === 1 && (
+                  <span style={{ fontSize: '13px', color: '#9A948E' }}>
+                    {instructorSections[0].name}
+                  </span>
+                )}
+              </div>
+
+              {/* Existing section challenges */}
+              {sectionChallengesLoading ? (
+                <div style={{ fontSize: '13px', color: '#9A948E', marginBottom: '20px' }}>Loading…</div>
+              ) : sectionChallenges.length === 0 ? (
+                <div style={{ fontSize: '13px', color: '#9A948E', marginBottom: '20px' }}>No challenges linked to this section yet.</div>
+              ) : (
+                <div style={{ marginBottom: '24px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {sectionChallenges.map(c => {
+                    const badge = c.is_active
+                      ? { label: 'Published', color: '#15803D', bg: '#DCFCE7' }
+                      : { label: 'Draft', color: '#9A948E', bg: '#F7F3EE' }
+                    return (
+                      <div key={c.id} style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '10px', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>{c.title}</div>
+                          {c.week != null && <div style={{ fontSize: '11px', color: '#9A948E', marginTop: '2px' }}>Week {c.week}</div>}
+                        </div>
+                        <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: badge.bg, color: badge.color, flexShrink: 0 }}>
+                          {badge.label}
+                        </span>
+                        <button
+                          onClick={() => setChallengeActive(c.id, !c.is_active)}
+                          style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #E7E0D8', background: '#fff', cursor: 'pointer', color: '#4A4440', flexShrink: 0 }}
+                        >
+                          {c.is_active ? 'Unpublish' : 'Publish'}
+                        </button>
+                        <button
+                          onClick={() => unlinkChallenge(c.id)}
+                          style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #FDE8EC', background: '#FDE8EC', cursor: 'pointer', color: '#C8102E', flexShrink: 0 }}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    )
+                  })}
+                  {actionMsg && <div style={{ fontSize: '12px', color: '#C8102E', marginTop: '4px' }}>{actionMsg}</div>}
+                </div>
+              )}
+
+              {/* Create challenge form */}
+              <div style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '12px', padding: '20px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: '14px' }}>
+                  Create challenge for this section
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <input
+                    placeholder="Title"
+                    value={createTitle}
+                    onChange={e => setCreateTitle(e.target.value)}
+                    style={inputStyle}
+                  />
+                  <textarea
+                    placeholder="Description (what students should do)"
+                    value={createDesc}
+                    onChange={e => setCreateDesc(e.target.value)}
+                    rows={3}
+                    style={{ ...inputStyle, resize: 'vertical' }}
+                  />
+                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    <select value={createCategory} onChange={e => setCreateCategory(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+                      {['General', 'Technical', 'Creative & Strategy', 'Data & Analysis', 'Product & Business'].map(c => (
+                        <option key={c}>{c}</option>
+                      ))}
+                    </select>
+                    <select value={createDifficulty} onChange={e => setCreateDifficulty(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+                      {['Beginner', 'Intermediate', 'Advanced'].map(d => <option key={d}>{d}</option>)}
+                    </select>
+                    <input
+                      placeholder="Week (optional)"
+                      value={createWeek}
+                      onChange={e => setCreateWeek(e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
+                      <span style={{ fontSize: '13px', color: '#4A4440', whiteSpace: 'nowrap' }}>{createTotalSessions} sessions</span>
+                      <input type="range" min={1} max={10} value={createTotalSessions} onChange={e => setCreateTotalSessions(Number(e.target.value))} style={{ flex: 1 }} />
+                    </div>
+                  </div>
+                  {createMsg && <div style={{ fontSize: '12px', color: createMsg.includes('published') || createMsg.includes('saved') ? '#16A34A' : '#C8102E' }}>{createMsg}</div>}
+                  <div style={{ display: 'flex', gap: '10px' }}>
+                    <button
+                      onClick={() => createChallenge(true)}
+                      disabled={creating}
+                      style={{ flex: 1, padding: '10px', background: '#C8102E', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', opacity: creating ? 0.6 : 1 }}
+                    >
+                      {creating ? 'Publishing…' : 'Publish challenge'}
+                    </button>
+                    <button
+                      onClick={() => createChallenge(false)}
+                      disabled={creatingDraft}
+                      style={{ flex: 1, padding: '10px', background: 'transparent', color: '#4A4440', border: '1.5px solid #E7E0D8', borderRadius: '8px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', opacity: creatingDraft ? 0.6 : 1 }}
+                    >
+                      {creatingDraft ? 'Saving…' : 'Save as draft'}
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 

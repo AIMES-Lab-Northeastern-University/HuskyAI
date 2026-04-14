@@ -32,7 +32,8 @@ export default function ChallengeDetail() {
   const [challenge, setChallenge] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [starting, setStarting] = useState(null) // session number being started
+  const [starting, setStarting] = useState(null)   // session number being started
+  const [completing, setCompleting] = useState(null) // session number being marked complete
 
   const handleLogout = () => {
     if (isDemo) {
@@ -44,15 +45,11 @@ export default function ChallengeDetail() {
     navigate('/login', { replace: true })
   }
 
-  useEffect(() => {
+  const loadChallenge = () => {
     if (isDemo) {
       const d = getDemoChallengeDetail(id)
-      if (d) {
-        setChallenge(d)
-        setError('')
-      } else {
-        setError('Challenge not found')
-      }
+      if (d) { setChallenge(d); setError('') }
+      else setError('Challenge not found')
       setLoading(false)
       return
     }
@@ -67,7 +64,9 @@ export default function ChallengeDetail() {
       .then(data => setChallenge(data))
       .catch(() => setError('Challenge not found'))
       .finally(() => setLoading(false))
-  }, [id, isDemo])
+  }
+
+  useEffect(() => { loadChallenge() }, [id, isDemo]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleStartSession = async (sessionNumber) => {
     setStarting(sessionNumber)
@@ -92,6 +91,30 @@ export default function ChallengeDetail() {
       alert('Failed to start session')
     } finally {
       setStarting(null)
+    }
+  }
+
+  const handleCompleteSession = async (sessionNumber) => {
+    if (isDemo) return
+    setCompleting(sessionNumber)
+    try {
+      const token = localStorage.getItem('token')
+      const res = await fetch(`${API_URL}/challenges/${id}/sessions/${sessionNumber}/complete`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}))
+        alert(d.detail || 'Could not mark session as complete')
+        return
+      }
+      // Reload so progress ring, status badges, and unlock state all update
+      setLoading(true)
+      loadChallenge()
+    } catch {
+      alert('Failed to complete session')
+    } finally {
+      setCompleting(null)
     }
   }
 
@@ -289,58 +312,101 @@ export default function ChallengeDetail() {
                           </div>
                         )}
 
-                        {/* Meta */}
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        {/* Meta + actions */}
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
                           {session.best_pei != null && (
                             <span style={{ fontSize: '12px', color: '#9A948E' }}>
                               Best PEI: <strong style={{ color: '#C8102E' }}>{Math.round(session.best_pei)}</strong>
                             </span>
                           )}
-                          {canStart && (
-                            <button
-                              disabled={isActive}
-                              onClick={() => handleStartSession(session.session_number)}
-                              style={{
-                                marginLeft: 'auto',
-                                padding: '8px 20px',
-                                background: '#C8102E',
-                                color: '#fff',
-                                border: 'none',
-                                borderRadius: '8px',
-                                fontSize: '13px',
-                                fontWeight: 600,
-                                cursor: isActive ? 'not-allowed' : 'pointer',
-                                opacity: isActive ? 0.7 : 1,
-                              }}
-                            >
-                              {isActive ? 'Starting...' : session.status === 'in_progress' ? 'Continue session' : 'Start session'}
-                            </button>
-                          )}
-                          {session.status === 'completed' && (
-                            <button
-                              onClick={() => {
-                                if (isDemo) {
-                                  const slug = demoSlugForChallengeId(id)
-                                  navigate(`${pathPrefix}/workspace?demoChallenge=${encodeURIComponent(slug)}`)
-                                } else {
-                                  navigate(`/workspace?challenge=${id}&session=${session.session_number}`)
-                                }
-                              }}
-                              style={{
-                                marginLeft: 'auto',
-                                padding: '8px 20px',
-                                background: 'transparent',
-                                color: '#4A4440',
-                                border: '1.5px solid #E7E0D8',
-                                borderRadius: '8px',
-                                fontSize: '13px',
-                                fontWeight: 600,
-                                cursor: 'pointer',
-                              }}
-                            >
-                              Review session
-                            </button>
-                          )}
+
+                          <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto', flexWrap: 'wrap' }}>
+                            {/* in_progress: Continue + Mark as complete */}
+                            {session.status === 'in_progress' && (
+                              <>
+                                <button
+                                  disabled={completing === session.session_number}
+                                  onClick={() => handleCompleteSession(session.session_number)}
+                                  style={{
+                                    padding: '8px 16px',
+                                    background: 'transparent',
+                                    color: completing === session.session_number ? '#9A948E' : '#16A34A',
+                                    border: `1.5px solid ${completing === session.session_number ? '#E7E0D8' : '#16A34A'}`,
+                                    borderRadius: '8px',
+                                    fontSize: '13px',
+                                    fontWeight: 600,
+                                    cursor: completing === session.session_number ? 'not-allowed' : 'pointer',
+                                  }}
+                                >
+                                  {completing === session.session_number ? 'Saving…' : 'Mark as complete'}
+                                </button>
+                                <button
+                                  disabled={isActive}
+                                  onClick={() => handleStartSession(session.session_number)}
+                                  style={{
+                                    padding: '8px 20px',
+                                    background: '#C8102E',
+                                    color: '#fff',
+                                    border: 'none',
+                                    borderRadius: '8px',
+                                    fontSize: '13px',
+                                    fontWeight: 600,
+                                    cursor: isActive ? 'not-allowed' : 'pointer',
+                                    opacity: isActive ? 0.7 : 1,
+                                  }}
+                                >
+                                  {isActive ? 'Starting...' : 'Continue session'}
+                                </button>
+                              </>
+                            )}
+
+                            {/* not_started (and not locked): Start session */}
+                            {session.status === 'not_started' && !isLocked && (
+                              <button
+                                disabled={isActive}
+                                onClick={() => handleStartSession(session.session_number)}
+                                style={{
+                                  padding: '8px 20px',
+                                  background: '#C8102E',
+                                  color: '#fff',
+                                  border: 'none',
+                                  borderRadius: '8px',
+                                  fontSize: '13px',
+                                  fontWeight: 600,
+                                  cursor: isActive ? 'not-allowed' : 'pointer',
+                                  opacity: isActive ? 0.7 : 1,
+                                }}
+                              >
+                                {isActive ? 'Starting...' : 'Start session'}
+                              </button>
+                            )}
+
+                            {/* completed: Review */}
+                            {session.status === 'completed' && (
+                              <button
+                                onClick={() => {
+                                  if (isDemo) {
+                                    const slug = demoSlugForChallengeId(id)
+                                    navigate(`${pathPrefix}/workspace?demoChallenge=${encodeURIComponent(slug)}`)
+                                  } else {
+                                    navigate(`/workspace?challenge=${id}&session=${session.session_number}`)
+                                  }
+                                }}
+                                style={{
+                                  padding: '8px 20px',
+                                  background: 'transparent',
+                                  color: '#4A4440',
+                                  border: '1.5px solid #E7E0D8',
+                                  borderRadius: '8px',
+                                  fontSize: '13px',
+                                  fontWeight: 600,
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                Review session
+                              </button>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </div>

@@ -247,7 +247,3 @@ Tables are created on startup via `init_db()`; Postgres-specific column drift is
 See `backend/.env.example` for optional variables (seed code, Supabase-style DSN pieces, etc.).
 
 ---
-
-## Roadmap
-
-See `todo.md` for prioritized work: demo vs production paths, auth hardening, reporting APIs, admin tools, and evaluation regression fixtures.

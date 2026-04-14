@@ -242,6 +242,14 @@ export default function Classroom() {
     if (location.state?.needInstructor) setRoleTab('instructor')
   }, [location.state?.needInstructor])
 
+  // Auto-switch to instructor tab when the user manages at least one section
+  // and the user hasn't manually selected the student tab
+  useEffect(() => {
+    if (!loading && instructingClassrooms.length > 0 && !location.state?.forceStudentTab) {
+      setRoleTab('instructor')
+    }
+  }, [loading, instructingClassrooms.length, location.state?.forceStudentTab])
+
   const studentPrimary = classrooms.find(c => c.role === 'student') ?? null
 
   const updateListedInDirectory = async (classroomId, next) => {

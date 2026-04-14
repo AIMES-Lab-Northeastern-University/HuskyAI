@@ -1,25 +1,28 @@
 # HuskyAI roadmap and TODO
 
-Work in priority order **P1 → P11**. Last updated: 2026-04-08.
+Work in priority order **P1 → P11**. Last updated: 2026-04-14.
 
 ---
 
 ## Current state (today)
 
 - App skeleton works end to end (frontend, backend, DB, Eval Model).
-- Instructor tools are working (create, edit, assign, reorder challenges; test as student).
-- Reporting is working for instructors and admins (section analytics, student drill-down, admin overview analytics).
-- Biggest missing pieces are admin management UI (P6), and production hardening checklist (P9), Benchmarking for llm eval agent.
+- Instructor tools are working (create, edit, assign, reorder, rename section, manage challenges from Challenges page).
+- Reporting is working for instructors and admins (section analytics, student drill-down, admin overview analytics, classroom + user drill-down modals).
+- Session completion now fully wired: "Mark as complete" button calls POST /complete, unblocking progress tracking and sequential unlock.
+- Admin section complete: user list, promote/demote, user activity modal, classroom detail modal.
+- Auth registration flow fixed: instructor registration auto-creates a section and redirects to instructor dashboard; admin registration blocked with "reach out to team" message.
+- 3 new seed challenges added: The Case Analyst, The Data Interpreter, The Presentation Outliner.
+- Biggest remaining gaps: password reset, pre-pilot hardening (P9).
 
 ---
 
 ## Next actions items
 
-- [ ] P2: lock production database confirm all backend changes
+- [ ] P4: password reset — students will get locked out without it
+- [ ] P9: run full pre-pilot checklist (CORS, JWT_SECRET, log level, .gitignore)
 - [ ] P8: add CSV or JSON export for instructor analytics
-- [ ] P6: admin UI to manage users and sections
-- [ ] P5: edit per-session content in the UI; draft / publish
-- [ ] P9: run full pre-pilot checklist (E2E + ops)
+- [ ] P3: more challenge content + QA matrix
 
 ---
 
@@ -82,7 +85,7 @@ Goal: visitors can try the product without an account; logged-in users hit the r
 - [x] Instructor dashboard: section picker, join code, challenge list, create form
 - [x] “Test preview” on student Challenges when applicable
 - [ ] Edit `sessions_data` per session in the UI
-- [ ] Draft vs published workflow for challenges
+- [x] Draft vs published workflow for challenges
 - [ ] Soft-delete challenge (optional)
 - [ ] Clearer audit trail / `updated_at` usage
 
@@ -93,7 +96,9 @@ Goal: visitors can try the product without an account; logged-in users hit the r
 - [x] Platform admin flag on user; sync emails from env on startup
 - [x] Admin overview API (counts, classrooms, join codes, DB analytics block)
 - [x] Admin page + sidebar link; dev seed admin for local QA
-- [ ] User list: promote / demote platform admin
+- [x] User list: promote / demote platform admin
+- [x] Drill into a section: members, challenges, session analytics
+- [x] Drill into a user: workspace stats, challenge sessions, recent conversations (metadata only), sections
 - [ ] Deactivate or archive sections from the UI
 - [ ] Activity logs
 - [ ] Data exports from admin (see P8)
@@ -132,7 +137,7 @@ Goal: visitors can try the product without an account; logged-in users hit the r
 
 - [ ] Export CSV or JSON (section or student)
 - [ ] Optional charts or PDF report
-- [ ] Admin: drill into one section or user (if you want parity with instructor)
+- [x] Admin: drill into one section or user (parity with instructor)
 - [ ] Short policy: what instructors may export or store
 
 **Other pages**

@@ -21,7 +21,7 @@ const ROLES = [
   {
     id: 'instructor',
     label: 'Instructor',
-    hint: 'Create a section under Classroom → I’m an instructor.',
+    hint: "You’ll create your first section right after registering.",
     icon: (
       <svg viewBox="0 0 24 24" className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
         <rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" />
@@ -101,7 +101,21 @@ export default function AuthPage() {
           is_platform_admin: Boolean(data.is_platform_admin),
         }),
       )
-      navigate('/dashboard')
+      if (tab === 'register' && role === 'instructor') {
+        // Auto-create a default section so instructor role is live immediately
+        try {
+          await fetch(API_URL + '/classrooms', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${data.access_token}` },
+            body: JSON.stringify({ name: `${form.name.trim()}'s Section` }),
+          })
+        } catch {
+          // Non-fatal — they can create a section manually
+        }
+        navigate('/instructor')
+      } else {
+        navigate('/dashboard')
+      }
     } catch (err) {
       setError(err.message)
     } finally {
@@ -215,8 +229,26 @@ export default function AuthPage() {
             </p>
           </div>
 
+          {tab === 'register' && role === 'admin' ? (
+            <div className="rounded-[12px] border-[1.5px] border-[#E7E0D8] bg-[#FDFCFB] p-6 text-center">
+              <div className="w-12 h-12 rounded-full bg-[#F7F3EE] flex items-center justify-center mx-auto mb-3">
+                <svg viewBox="0 0 24 24" className="w-6 h-6 text-[#C8102E]" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                </svg>
+              </div>
+              <div className="text-[14px] font-semibold text-[#16120E] mb-1">Admin accounts are invite-only</div>
+              <div className="text-[12px] text-[#6B6560] leading-relaxed">
+                Reach out to the HuskyAI team to get admin access.<br />
+                Already have an account?{' '}
+                <button type="button" onClick={() => { switchTab('login'); setRole('admin') }} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">
+                  Sign in here
+                </button>
+              </div>
+            </div>
+          ) : (
+          <>
           <h2 className="font-serif text-[26px] text-[#16120E] mb-5">
-            {tab === 'login' ? 'Welcome back' : 'Join Husky AI'}
+            {tab === 'login' ? 'Welcome back' : role === 'instructor' ? 'Join as Instructor' : 'Join Husky AI'}
           </h2>
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-[18px]">
@@ -267,6 +299,8 @@ export default function AuthPage() {
               : <>Already have an account? <button type="button" onClick={() => switchTab('login')} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">Sign in</button></>
             }
           </div>
+          </>
+          )}
         </div>
       </div>
     </div>

@@ -46,6 +46,7 @@ export default function Sidebar({ onLogout }) {
 
   const [showInstructorNav, setShowInstructorNav] = useState(!!pathPrefix)
   const [showAdminNav, setShowAdminNav] = useState(false)
+  const [debugRoles, setDebugRoles] = useState([])
 
   useEffect(() => {
     if (pathPrefix) {
@@ -76,6 +77,9 @@ export default function Sidebar({ onLogout }) {
           Array.isArray(list) &&
           list.some(c => c.role === 'instructor' || c.role === 'admin')
         setShowInstructorNav(inst)
+        const roles = Array.isArray(list) ? [...new Set(list.map(c => c.role))] : []
+        if (me.is_platform_admin && !roles.includes('platform_admin')) roles.unshift('platform_admin')
+        setDebugRoles(roles)
       } catch {
         if (!cancelled) {
           setShowInstructorNav(false)
@@ -166,6 +170,12 @@ export default function Sidebar({ onLogout }) {
             <div className="text-[13px] font-semibold text-[#16120E]">{user?.name || 'User'}</div>
             <div className="text-[11px] text-[#9A948E]">{user?.email?.split('@')[0] || ''}</div>
           </div>
+        </div>
+        <div className="mt-[8px]">
+          <span className="text-[10px] font-semibold text-[#9A948E] uppercase tracking-[0.5px]">Roles: </span>
+          <span className="text-[10px] text-[#C8102E] font-mono">
+            {debugRoles.length > 0 ? debugRoles.join(', ') : 'none'}
+          </span>
         </div>
         <div className="mt-[10px] pt-[10px] border-t border-[#E7E0D8]">
           <div className="flex justify-between items-center mb-[5px]">

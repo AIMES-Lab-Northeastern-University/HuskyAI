@@ -40,9 +40,9 @@ function DualBar({ label, yourPct, partnerPct, yourColor, partnerColor }) {
 function challengeBadge(c) {
   const active = c.is_active
   return {
-    label: active ? 'Active' : 'Inactive',
-    color: active ? '#C8102E' : '#9A948E',
-    bg: active ? '#FDE8EC' : '#F7F3EE',
+    label: active ? 'Published' : 'Draft',
+    color: active ? '#15803D' : '#9A948E',
+    bg: active ? '#DCFCE7' : '#F7F3EE',
     week: c.week != null ? `Week ${c.week}` : 'No week set',
   }
 }
@@ -85,11 +85,16 @@ export default function Instructor() {
   const [createTotalSessions, setCreateTotalSessions] = useState(3)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
+  const [creatingDraft, setCreatingDraft] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [editTitle, setEditTitle] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [actionMsg, setActionMsg] = useState('')
   const [testToggleSaving, setTestToggleSaving] = useState(false)
+  const [renamingSection, setRenamingSection] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
+  const [renameMsg, setRenameMsg] = useState('')
+  const [renameSaving, setRenameSaving] = useState(false)
   const [reordering, setReordering] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(false)
@@ -307,6 +312,27 @@ export default function Instructor() {
     }
   }
 
+  const renameSection = async () => {
+    const name = renameValue.trim()
+    if (!name) { setRenameMsg('Name cannot be empty'); return }
+    if (!selectedId) return
+    setRenameSaving(true)
+    setRenameMsg('')
+    try {
+      const r = await fetch(`${API_URL}/classrooms/${selectedId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ name }),
+      })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) { setRenameMsg(typeof d.detail === 'string' ? d.detail : 'Could not rename'); return }
+      setRenamingSection(false)
+      setRenameMsg('')
+      await loadSections()
+    } catch { setRenameMsg('Network error') }
+    finally { setRenameSaving(false) }
+  }
+
   const reorderChallenge = async (fromIdx, toIdx) => {
     if (!selectedId || fromIdx === toIdx || fromIdx < 0 || toIdx < 0 || toIdx >= challenges.length) return
     const arr = [...challenges]
@@ -400,7 +426,7 @@ export default function Instructor() {
     }
   }
 
-  const createChallenge = async () => {
+  const createChallenge = async (publish = true) => {
     if (!selectedId) {
       setCreateMsg('Select a section first')
       return
@@ -421,7 +447,8 @@ export default function Instructor() {
       weekNum = n
     }
     setCreateMsg('')
-    setCreating(true)
+    if (publish) setCreating(true)
+    else setCreatingDraft(true)
     try {
       const r = await fetch(`${API_URL}/challenges`, {
         method: 'POST',
@@ -434,6 +461,7 @@ export default function Instructor() {
           difficulty: createDifficulty,
           week: weekNum,
           total_sessions: createTotalSessions,
+          is_active: publish,
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -441,7 +469,9 @@ export default function Instructor() {
         setCreateMsg(typeof d.detail === 'string' ? d.detail : 'Could not create challenge')
         return
       }
-      setCreateMsg('Challenge created and assigned to this section.')
+      setCreateMsg(publish
+        ? 'Challenge published — students can see it now.'
+        : 'Draft saved. Use Publish to make it visible to students.')
       setCreateTitle('')
       setCreateDesc('')
       setCreateWeek('')
@@ -450,6 +480,7 @@ export default function Instructor() {
       setCreateMsg('Network error')
     } finally {
       setCreating(false)
+      setCreatingDraft(false)
     }
   }
 
@@ -789,6 +820,38 @@ export default function Instructor() {
                           <option key={s.id} value={s.id} style={{ color: '#16120E' }}>{s.name}</option>
                         ))}
                       </select>
+                      {!renamingSection ? (
+                        <button
+                          onClick={() => { setRenameValue(selectedSection?.name || ''); setRenamingSection(true); setRenameMsg('') }}
+                          style={{ padding: '8px 14px', borderRadius: '8px', border: '1.5px solid rgba(255,255,255,0.2)', background: 'transparent', color: 'rgba(255,255,255,0.7)', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                        >
+                          Rename
+                        </button>
+                      ) : (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <input
+                            value={renameValue}
+                            onChange={e => setRenameValue(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') renameSection(); if (e.key === 'Escape') setRenamingSection(false) }}
+                            autoFocus
+                            style={{ padding: '8px 12px', borderRadius: '8px', border: '1.5px solid rgba(255,255,255,0.3)', background: 'rgba(255,255,255,0.1)', color: '#fff', fontSize: '14px', minWidth: '200px' }}
+                          />
+                          <button
+                            onClick={renameSection}
+                            disabled={renameSaving}
+                            style={{ padding: '8px 14px', borderRadius: '8px', border: 'none', background: '#C8102E', color: '#fff', fontSize: '12px', fontWeight: 600, cursor: 'pointer', opacity: renameSaving ? 0.6 : 1 }}
+                          >
+                            {renameSaving ? 'Saving…' : 'Save'}
+                          </button>
+                          <button
+                            onClick={() => setRenamingSection(false)}
+                            style={{ padding: '8px 14px', borderRadius: '8px', border: '1.5px solid rgba(255,255,255,0.2)', background: 'transparent', color: 'rgba(255,255,255,0.7)', fontSize: '12px', cursor: 'pointer' }}
+                          >
+                            Cancel
+                          </button>
+                          {renameMsg && <span style={{ fontSize: '12px', color: '#FCA5A5' }}>{renameMsg}</span>}
+                        </div>
+                      )}
                     </div>
                     {selectedSection?.join_code && (
                       <div style={{ marginBottom: '16px' }}>
@@ -823,9 +886,15 @@ export default function Instructor() {
                     </label>
                     <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
                       <div>
-                        <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '28px', color: '#fff', lineHeight: 1 }}>{challengesLoading ? '…' : challenges.length}</div>
-                        <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.5)' }}>challenges assigned</div>
+                        <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '28px', color: '#fff', lineHeight: 1 }}>{challengesLoading ? '…' : challenges.filter(c => c.is_active).length}</div>
+                        <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.5)' }}>published</div>
                       </div>
+                      {!challengesLoading && challenges.filter(c => !c.is_active).length > 0 && (
+                        <div>
+                          <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '28px', color: 'rgba(255,255,255,0.45)', lineHeight: 1 }}>{challenges.filter(c => !c.is_active).length}</div>
+                          <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.35)' }}>draft</div>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -1355,9 +1424,12 @@ export default function Instructor() {
                                         <button
                                           type="button"
                                           onClick={() => setChallengeActive(c.id, !c.is_active)}
-                                          style={btnSm}
+                                          style={c.is_active
+                                            ? btnSm
+                                            : { ...btnSm, background: '#16120E', color: '#fff', borderColor: '#16120E' }
+                                          }
                                         >
-                                          {c.is_active ? 'Deactivate' : 'Activate'}
+                                          {c.is_active ? 'Unpublish' : 'Publish'}
                                         </button>
                                         <button
                                           type="button"
@@ -1445,28 +1517,48 @@ export default function Instructor() {
                             ))}
                           </select>
                         </div>
-                        <button
-                          type="button"
-                          onClick={createChallenge}
-                          disabled={creating}
-                          style={{
-                            alignSelf: 'flex-start',
-                            background: creating ? '#E7E0D8' : '#C8102E',
-                            color: '#fff',
-                            border: 'none',
-                            borderRadius: '8px',
-                            padding: '10px 20px',
-                            fontSize: '13px',
-                            fontWeight: 600,
-                            cursor: creating ? 'default' : 'pointer',
-                          }}
-                        >
-                          {creating ? 'Creating…' : 'Create & assign challenge'}
-                        </button>
+                        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                          <button
+                            type="button"
+                            onClick={() => createChallenge(true)}
+                            disabled={creating || creatingDraft}
+                            style={{
+                              background: creating || creatingDraft ? '#E7E0D8' : '#C8102E',
+                              color: '#fff',
+                              border: 'none',
+                              borderRadius: '8px',
+                              padding: '10px 20px',
+                              fontSize: '13px',
+                              fontWeight: 600,
+                              cursor: creating || creatingDraft ? 'default' : 'pointer',
+                            }}
+                          >
+                            {creating ? 'Publishing…' : 'Publish challenge'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => createChallenge(false)}
+                            disabled={creating || creatingDraft}
+                            style={{
+                              background: 'transparent',
+                              color: creating || creatingDraft ? '#9A948E' : '#16120E',
+                              border: `1.5px solid ${creating || creatingDraft ? '#E7E0D8' : '#16120E'}`,
+                              borderRadius: '8px',
+                              padding: '10px 20px',
+                              fontSize: '13px',
+                              fontWeight: 600,
+                              cursor: creating || creatingDraft ? 'default' : 'pointer',
+                            }}
+                          >
+                            {creatingDraft ? 'Saving draft…' : 'Save as draft'}
+                          </button>
+                        </div>
                         {createMsg && (
                           <div style={{
                             fontSize: '13px',
-                            color: createMsg.startsWith('Challenge created') ? '#15803D' : '#C8102E',
+                            color: createMsg.startsWith('Challenge') || createMsg.startsWith('Draft')
+                              ? '#15803D'
+                              : '#C8102E',
                           }}>
                             {createMsg}
                           </div>
