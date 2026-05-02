@@ -44,9 +44,11 @@ export default function Sidebar({ onLogout }) {
     : JSON.parse(localStorage.getItem('user') || 'null')
   const initials = user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : 'U'
 
-  const [showInstructorNav, setShowInstructorNav] = useState(!!pathPrefix)
+    const [showInstructorNav, setShowInstructorNav] = useState(
+    () => pathPrefix ? true : localStorage.getItem('is_instructor') === 'true')
   const [showAdminNav, setShowAdminNav] = useState(false)
-  const [debugRoles, setDebugRoles] = useState([])
+    const [debugRoles, setDebugRoles] = useState(
+    () => { try { return JSON.parse(localStorage.getItem('debug_roles') || '[]') } catch { return [] } })
 
   useEffect(() => {
     if (pathPrefix) {
@@ -76,10 +78,12 @@ export default function Sidebar({ onLogout }) {
         const inst =
           Array.isArray(list) &&
           list.some(c => c.role === 'instructor' || c.role === 'admin')
-        setShowInstructorNav(inst)
+          localStorage.setItem('is_instructor', inst)
+          setShowInstructorNav(inst)
         const roles = Array.isArray(list) ? [...new Set(list.map(c => c.role))] : []
         if (me.is_platform_admin && !roles.includes('platform_admin')) roles.unshift('platform_admin')
-        setDebugRoles(roles)
+          localStorage.setItem('debug_roles', JSON.stringify(roles))
+          setDebugRoles(roles)
       } catch {
         if (!cancelled) {
           setShowInstructorNav(false)
@@ -188,7 +192,11 @@ export default function Sidebar({ onLogout }) {
         </div>
         {onLogout && (
           <button
-            onClick={onLogout}
+            onClick={() => {
+              localStorage.removeItem('is_instructor')
+              localStorage.removeItem('debug_roles')
+              onLogout()
+            }}
             className="mt-2 w-full text-[11px] text-[#9A948E] hover:text-[#C8102E] transition-colors text-left"
           >
             {pathPrefix ? 'Exit demo' : 'Sign out'}
