@@ -7,7 +7,7 @@ const NAV = [
     group: 'Learn',
     items: [
       { label: 'Dashboard',       path: '/dashboard', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> },
-      { label: 'Challenges',      path: '/challenges', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>, badge: '3' },
+      { label: 'Challenges',      path: '/challenges', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> },
       { label: 'Workspace',       path: '/workspace',  icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> },
     ],
   },
@@ -15,7 +15,6 @@ const NAV = [
     group: 'Compete',
     items: [
       { label: 'Classroom',       path: '/classroom', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> },
-      { label: 'Browse sections', path: '/classroom/browse', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> },
     ],
   },
   {
@@ -49,6 +48,8 @@ export default function Sidebar({ onLogout }) {
   const [showAdminNav, setShowAdminNav] = useState(false)
     const [debugRoles, setDebugRoles] = useState(
     () => { try { return JSON.parse(localStorage.getItem('debug_roles') || '[]') } catch { return [] } })
+  const [bestPei, setBestPei] = useState(pathPrefix ? 68 : null)
+  const [activeCount, setActiveCount] = useState(pathPrefix ? 3 : 0)
 
   useEffect(() => {
     if (pathPrefix) {
@@ -94,6 +95,35 @@ export default function Sidebar({ onLogout }) {
     return () => { cancelled = true }
   }, [pathPrefix, location.pathname])
 
+  // Live Husky Score (best PEI across challenges) + Challenges nav badge (in-progress count)
+  useEffect(() => {
+    if (pathPrefix) return
+    const token = localStorage.getItem('token')
+    if (!token) {
+      setBestPei(null)
+      setActiveCount(0)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      try {
+        const r = await fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() } })
+        if (!r.ok) return
+        const data = await r.json().catch(() => [])
+        if (cancelled || !Array.isArray(data)) return
+        const peis = data.map(c => c.best_pei).filter(p => p != null && !Number.isNaN(p))
+        setBestPei(peis.length ? Math.round(Math.max(...peis)) : null)
+        const inProgress = data.filter(
+          c => c.sessions_completed > 0 && c.sessions_completed < c.total_sessions,
+        ).length
+        setActiveCount(inProgress)
+      } catch {
+        // non-fatal: sidebar still renders
+      }
+    })()
+    return () => { cancelled = true }
+  }, [pathPrefix, location.pathname])
+
   const navGroups = useMemo(
     () =>
       NAV.map(g => ({
@@ -111,7 +141,7 @@ export default function Sidebar({ onLogout }) {
     if (path === '/how-it-works') return '/how-it-works'
     return pathPrefix ? `${pathPrefix}${path}` : path
   }
-  const score = 68 // TODO: pull from user stats
+  const scoreBarPct = bestPei != null ? Math.max(0, Math.min(100, bestPei)) : 0
 
   return (
     <div className="w-[220px] bg-white border-r border-r-[#E7E0D8] flex flex-col fixed top-0 left-0 bottom-0 z-50" style={{ borderRightWidth: '1.5px' }}>
@@ -140,6 +170,10 @@ export default function Sidebar({ onLogout }) {
               const active =
                 location.pathname === dest ||
                 (path === '/workspace' && location.pathname.startsWith(dest))
+              const computedBadge =
+                label === 'Challenges'
+                  ? (activeCount > 0 ? String(activeCount) : null)
+                  : badge
               return (
                 <a
                   key={path}
@@ -152,9 +186,9 @@ export default function Sidebar({ onLogout }) {
                 >
                   <span className={`w-[15px] h-[15px] flex-shrink-0 ${active ? 'text-[#C8102E]' : ''}`}>{icon}</span>
                   {label}
-                  {badge && (
+                  {computedBadge && (
                     <span className={`ml-auto text-[10px] font-bold px-[7px] py-[2px] rounded-[20px] text-white ${badgeGreen ? 'bg-[#16A34A]' : 'bg-[#F97316]'}`}>
-                      {badge}
+                      {computedBadge}
                     </span>
                   )}
                 </a>
@@ -184,10 +218,10 @@ export default function Sidebar({ onLogout }) {
         <div className="mt-[10px] pt-[10px] border-t border-[#E7E0D8]">
           <div className="flex justify-between items-center mb-[5px]">
             <span className="text-[10px] font-semibold text-[#9A948E] uppercase tracking-[0.5px]">Husky Score</span>
-            <span className="text-[14px] font-bold text-[#C8102E]">{score}</span>
+            <span className="text-[14px] font-bold text-[#C8102E]">{bestPei != null ? bestPei : '-'}</span>
           </div>
           <div className="h-1 bg-[#E7E0D8] rounded-full">
-            <div className="h-1 bg-[#C8102E] rounded-full" style={{ width: `${score}%` }} />
+            <div className="h-1 bg-[#C8102E] rounded-full" style={{ width: `${scoreBarPct}%` }} />
           </div>
         </div>
         {onLogout && (

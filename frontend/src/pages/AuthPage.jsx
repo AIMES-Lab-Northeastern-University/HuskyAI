@@ -2,11 +2,6 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom'
 import { API_URL, formatApiErrorDetail } from '../lib/api'
 
-const showLocalApiHints =
-  import.meta.env.DEV ||
-  String(API_URL).includes('localhost') ||
-  String(API_URL).includes('127.0.0.1')
-
 const ROLES = [
   {
     id: 'student',
@@ -110,7 +105,7 @@ export default function AuthPage() {
             body: JSON.stringify({ name: `${form.name.trim()}'s Section` }),
           })
         } catch {
-          // Non-fatal — they can create a section manually
+          // Non-fatal - they can create a section manually
         }
         navigate('/instructor')
       } else {
@@ -147,7 +142,7 @@ export default function AuthPage() {
             Learn to<br />think with<br /><em className="italic text-[#C8102E]">AI.</em>
           </h1>
           <p className="text-[14px] text-white/50 leading-[1.75] font-light max-w-[340px]">
-            Real challenges. Real feedback. A coach that scores how you think — not just what you produce.
+            Real challenges. Real feedback. A coach that scores how you think - not just what you produce.
           </p>
           <div className="flex gap-7 mt-10 pt-8 border-t border-white/10">
             <div>
@@ -217,15 +212,6 @@ export default function AuthPage() {
             </div>
             <p className="text-[11px] text-[#6B6560] leading-snug mt-2.5 min-h-[2.5rem] px-0.5">
               {ROLES.find((x) => x.id === role)?.hint}
-              {showLocalApiHints && tab === 'login' && role === 'admin' && (
-                <>
-                  {' '}
-                  <span className="text-[#9A948E]">·</span> Local API:{' '}
-                  <code className="text-[11px] text-[#C8102E] bg-[#F7F3EE] px-1 rounded">admin</code>
-                  {' / '}
-                  <code className="text-[11px] text-[#C8102E] bg-[#F7F3EE] px-1 rounded">1234</code>
-                </>
-              )}
             </p>
           </div>
 

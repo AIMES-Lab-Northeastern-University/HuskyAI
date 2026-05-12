@@ -68,7 +68,7 @@ export default function MetricBar({ metric, score, isLoading }) {
           className="text-sm font-bold font-mono"
           style={{ color: isLoading ? '#2a2a38' : getScoreColor(displayScore) }}
         >
-          {isLoading ? '—' : displayScore}
+          {isLoading ? '-' : displayScore}
         </span>
       </div>
 

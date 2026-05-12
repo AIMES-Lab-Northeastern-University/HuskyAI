@@ -14,7 +14,7 @@ export default function DemoLayout() {
           Sample data
         </span>
         <span className="text-[12px] text-white/85 max-w-[560px]">
-          Full product UI without sign-in — sample data only. Sign in to save progress, join a class, and run live chat + evaluation.
+          Full product UI without sign-in - sample data only. Sign in to save progress, join a class, and run live chat + evaluation.
         </span>
         <Link
           to="/login?tab=register"

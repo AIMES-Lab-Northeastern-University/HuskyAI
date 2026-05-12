@@ -1,0 +1,794 @@
+{
+  "_meta": {
+    "purpose": "Judge benchmark for evaluating PEI evaluator variants against held-out golden scores.",
+    "rubric_source": "backend/evaluator.py PEI framework (PSQ 25%, CCM 25%, TSI 20%, CLM 15%, RAS 15%)",
+    "classification_thresholds": {"Novice": "PEI<40", "Intermediate": "40<=PEI<=70", "Advanced": "PEI>70"},
+    "stratification": "5 cases per domain (coding/debugging/data/casual) x random quality; 15 single-turn + 5 multi-turn",
+    "evaluated_turn_index": "0-based index of the user message being scored in `conversation`. For single-turn cases, the last user message.",
+  },
+  "cases": [
+    {
+      "id": "coding-001",
+      "domain": "coding",
+      "tier": "novice",
+      "turn_type": "single",
+      "task": "Write a function that sorts a list of numbers in ascending order. Specify the language and any constraints you would give a junior developer.",
+      "conversation": [
+        {"role": "user", "content": "help me sort a list"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 12, "CCM": 15, "TSI": 15, "CLM": 20, "RAS": 50, "PEI": 20},
+        "breakdown": {
+          "verb_specificity": 1,
+          "context_completeness": 8,
+          "constraint_defined": 0,
+          "focus_clarity": 1,
+          "initiative_ratio": 0.0,
+          "verification_frequency": 0.0,
+          "decomposition_depth": 1,
+          "chunk_size_appropriate": 30,
+          "correct_reliance_rate": 0.5
+        },
+        "classification": "Novice",
+        "leading_status": "ai-led",
+        "suggestions": [
+          "State the language you are using (Python, JS, etc.) and the data type of the list elements.",
+          "Define success: in-place sort? new list returned? handle duplicates how?",
+          "Add at least one constraint (e.g., must run on Python 3.10+, no external libraries)."
+        ],
+        "red_flags": [
+          "No verb beyond 'help'; AI must guess the entire task surface.",
+          "Zero context — no language, no input format, no expected output."
+        ],
+        "strengths": [],
+        "turn_summary": "A bare, vague ask with no language, constraints, or success criteria. The AI would have to make every meaningful decision on the student's behalf."
+      },
+      "label_notes": "Anchor case for Novice tier. PSQ floored by absent verb specificity, zero context, no constraints. RAS held at neutral 50 since no reliance event yet."
+    },
+    {
+      "id": "coding-002",
+      "domain": "coding",
+      "tier": "advanced",
+      "turn_type": "single",
+      "task": "Implement a debounce utility for a React project. Choose the language and define the API yourself.",
+      "conversation": [
+        {"role": "user", "content": "Implement a debounce utility in TypeScript with these requirements:\n\nRequirements:\n- Generic over the wrapped function's signature\n- Options: { leading?: boolean, trailing?: boolean, maxWait?: number }\n- Returned function exposes .cancel(), .flush(), and .pending() methods\n- ES2020 target, no external dependencies\n- AbortController-compatible cleanup pattern\n\nEdge cases:\n- Rapid successive calls with different arguments must use the latest args\n- .cancel() called before the trailing edge must prevent invocation\n- maxWait forces invocation even under continuous calls\n\nSuccess criteria — must pass these Jest cases:\n1. wait=5ms, 10 calls within 1ms => fires once with last args\n2. leading=true, trailing=false, 3 calls => fires immediately on first call, no trailing\n3. maxWait=10ms, continuous calls => fires every 10ms\n\nPlease produce the implementation plus a minimal test file."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 95, "CCM": 80, "TSI": 90, "CLM": 85, "RAS": 70, "PEI": 85},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 95,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.7,
+          "verification_frequency": 0.5,
+          "decomposition_depth": 9,
+          "chunk_size_appropriate": 92,
+          "correct_reliance_rate": 0.7
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Consider stating runtime invariants you expect (e.g., behavior on negative wait values).",
+          "If you have a preferred internal representation (Map vs WeakMap for state), mention it."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Precise action verb plus concrete API surface, options, and method names.",
+          "Decomposed into requirements, edge cases, and falsifiable success criteria.",
+          "Explicit non-functional constraints: ES target, no deps, cleanup pattern."
+        ],
+        "turn_summary": "Exemplary single-turn prompt: clear scope, complete context, falsifiable success criteria, anticipated edge cases. Leaves the AI to do implementation only, not design."
+      },
+      "label_notes": "Anchor case for Advanced tier on a single-turn prompt. CCM capped near 80 — strong leadership but no multi-turn verification/correction signal yet."
+    },
+    {
+      "id": "coding-003",
+      "domain": "coding",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "task": "Write a Python helper to read CSV data. State your assumptions and constraints.",
+      "conversation": [
+        {"role": "user", "content": "Write a Python function `read_csv_to_dicts(path: str) -> list[dict]` that uses csv.DictReader to parse a CSV file and returns a list of dicts. The file has headers in the first row. Skip rows where every value is empty/whitespace. Raise FileNotFoundError if the file doesn't exist (let the natural exception propagate is fine). Targeting Python 3.10+, no third-party libs."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 78, "CCM": 65, "TSI": 60, "CLM": 65, "RAS": 60, "PEI": 67},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 72,
+          "constraint_defined": 1,
+          "focus_clarity": 4,
+          "initiative_ratio": 0.4,
+          "verification_frequency": 0.2,
+          "decomposition_depth": 5,
+          "chunk_size_appropriate": 78,
+          "correct_reliance_rate": 0.6
+        },
+        "classification": "Intermediate",
+        "leading_status": "mixed",
+        "suggestions": [
+          "Define success criteria: a sample input/output or a one-line test would lock the behavior down.",
+          "Specify how to handle malformed rows (wrong column count) — silently skip, raise, or return None?"
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Concrete function signature and types reduce ambiguity.",
+          "States Python version and dependency constraint."
+        ],
+        "turn_summary": "Solid intermediate prompt: function signature, language version, edge-case behavior (blank rows, missing file). Stops short of explicit success criteria or malformed-data behavior."
+      },
+      "label_notes": "Intermediate ceiling held by missing alignment_specified and the malformed-row case. Good template for 'thoughtful but not exhaustive' prompting."
+    },
+    {
+      "id": "coding-004",
+      "domain": "coding",
+      "tier": "novice",
+      "turn_type": "single",
+      "task": "Build a simple authentication form for a web app. Choose your stack and define your scope.",
+      "conversation": [
+        {"role": "user", "content": "make me a login form in react with email and password fields"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 30, "CCM": 25, "TSI": 22, "CLM": 30, "RAS": 50, "PEI": 30},
+        "breakdown": {
+          "verb_specificity": 3,
+          "context_completeness": 18,
+          "constraint_defined": 0,
+          "focus_clarity": 2,
+          "initiative_ratio": 0.0,
+          "verification_frequency": 0.0,
+          "decomposition_depth": 2,
+          "chunk_size_appropriate": 35,
+          "correct_reliance_rate": 0.5
+        },
+        "classification": "Novice",
+        "leading_status": "ai-led",
+        "suggestions": [
+          "Specify state management approach (useState, react-hook-form, formik) — the AI will otherwise guess.",
+          "State validation rules (email format, password length) and submission target (API URL, callback prop).",
+          "Mention styling system (CSS modules, Tailwind, MUI) so output matches your project."
+        ],
+        "red_flags": [
+          "No validation, error handling, or accessibility considerations mentioned.",
+          "No defined endpoint — the AI must invent the submit behavior."
+        ],
+        "strengths": [
+          "Stack is at least named (React)."
+        ],
+        "turn_summary": "Generic boilerplate request. The named stack is the only signal; everything else (validation, submit handler, styling, state) is left to the AI to invent."
+      },
+      "label_notes": "Mid-novice. Slightly above coding-001 because a stack is named. Useful for testing whether eval variants distinguish 'tiny improvement on novice baseline'."
+    },
+    {
+      "id": "coding-005",
+      "domain": "coding",
+      "tier": "advanced",
+      "turn_type": "multi",
+      "task": "Build a rate limiter for an HTTP API. Define your own requirements as you go.",
+      "conversation": [
+        {"role": "user", "content": "I need to build a rate limiter for a Node.js Express API. Before I code, can you help me think through requirements? Constraints: single-process for now (no Redis), but the design must be portable to a Redis-backed store later. Use case: 100 req/min/user, with bursts of up to 20 within 5 seconds acceptable. I'm choosing between fixed-window, sliding-window-log, and token-bucket — can you compare them for this profile?"},
+        {"role": "assistant", "content": "Quick comparison:\n\n**Fixed-window** (e.g., counter resets each minute): simplest, lowest state (1 int per user). But suffers from the 'edge problem' — a user can fire 20 in the last second of minute N and 20 in the first second of minute N+1. For your 20-burst-in-5s target this is too permissive at boundaries.\n\n**Sliding-window-log** (timestamp list per user): precise. Stores every request timestamp; on each request, drops timestamps older than the window and checks count. Memory grows with active users * avg request rate.\n\n**Token-bucket**: refill_rate + burst capacity. Cheap state (2 numbers per user). Burst naturally bounded by bucket capacity. Maps cleanly to Redis later (INCR + EXPIRE or a Lua script for atomic refill).\n\nFor your profile (100/min with 20-burst-in-5s), I'd recommend **sliding-window-log** for the strongest correctness guarantees on the burst clause. Token-bucket is close but slightly harder to tune to a 'within 5 seconds' window."},
+        {"role": "user", "content": "Thanks. I want to push back on sliding-window-log — the memory cost of storing every timestamp per user scales poorly past ~10k active users, and the burst clause isn't a hard SLA, it's an 'acceptable behavior' band. I'd rather use a token bucket with refill_rate = 100/60 tokens/sec and burst capacity = 20. That gives burst tolerance naturally and keeps state to 2 numbers per user.\n\nCan you sketch the in-memory implementation as an Express middleware, with the storage layer behind an IStore interface so I can swap in Redis later (INCR/EXPIRE or Lua)? Please be explicit about:\n1. Concurrent requests from the same user (race conditions on the in-memory map)\n2. Token refill calculation on each request — lazy (compute on read) vs scheduled (setInterval)\n3. What the IStore interface looks like, including how the Redis impl would handle atomic check-and-decrement"}
+      ],
+      "evaluated_turn_index": 2,
+      "golden": {
+        "scores": {"PSQ": 92, "CCM": 90, "TSI": 88, "CLM": 82, "RAS": 82, "PEI": 88},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 90,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.75,
+          "verification_frequency": 0.4,
+          "decomposition_depth": 9,
+          "chunk_size_appropriate": 88,
+          "correct_reliance_rate": 0.85
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Could specify a target throughput for the middleware (e.g., p99 added latency budget) to lock the perf bar.",
+          "Worth stating which Express middleware contract (req/res/next vs async) you prefer."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Challenged AI's recommendation with domain reasoning (memory scaling, SLA framing) rather than accepting it.",
+          "Decomposed turn-3 ask into 3 explicit numbered sub-questions.",
+          "Defined the future Redis interface up front to keep design portable."
+        ],
+        "turn_summary": "Strong user-led course correction: the student weighed the AI's tradeoffs, rejected the recommendation on legitimate grounds, and replaced it with a fully-specified alternative with sub-questions. Hallmark of calibrated reliance."
+      },
+      "label_notes": "Anchor case for advanced multi-turn. CCM elevated by explicit course correction (assumption_challenge_rate=1.0). RAS high because the student used the AI as a thinking partner but did not blindly accept."
+    },
+    {
+      "id": "debugging-001",
+      "domain": "debugging",
+      "tier": "novice",
+      "turn_type": "single",
+      "task": "Diagnose and fix an issue in code you are working on. Provide enough context.",
+      "conversation": [
+        {"role": "user", "content": "my code doesnt work fix it\n\n```python\ndef process(data):\n    result = []\n    for x in data:\n        if x.value > 0:\n            result.append(x.value * 2)\n        elif x.value == 0:\n            result.append(None)\n        else:\n            result.append(x.value)\n    return result\n\nd = [{'value': 5}, {'value': 0}, {'value': -3}]\nprint(process(d))\n```"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 18, "CCM": 18, "TSI": 12, "CLM": 22, "RAS": 50, "PEI": 21},
+        "breakdown": {
+          "verb_specificity": 1,
+          "context_completeness": 22,
+          "constraint_defined": 0,
+          "focus_clarity": 1,
+          "initiative_ratio": 0.0,
+          "verification_frequency": 0.0,
+          "decomposition_depth": 1,
+          "chunk_size_appropriate": 40,
+          "correct_reliance_rate": 0.5
+        },
+        "classification": "Novice",
+        "leading_status": "ai-led",
+        "suggestions": [
+          "Paste the actual error message or traceback — 'doesn't work' is not a symptom.",
+          "State what behavior you expected versus what you observed.",
+          "Mention what you have already tried."
+        ],
+        "red_flags": [
+          "No traceback or expected behavior.",
+          "No description of what 'doesn't work' means."
+        ],
+        "strengths": [
+          "Code snippet is included and is minimal — small positive signal."
+        ],
+        "turn_summary": "Classic 'fix it' prompt: code is shown but the symptom, expected behavior, and prior attempts are absent. The AI must reverse-engineer both the bug and the requirements."
+      },
+      "label_notes": "Slight bump over coding-001 because at least code is attached. Useful for testing whether eval variants over-credit 'code is present' as a signal."
+    },
+    {
+      "id": "debugging-002",
+      "domain": "debugging",
+      "tier": "advanced",
+      "turn_type": "single",
+      "task": "Resolve a 500 error in a FastAPI endpoint.",
+      "conversation": [
+        {"role": "user", "content": "FastAPI POST /api/users returning 500. Repro:\n`curl -X POST .../api/users -d '{\"email\":\"a@b.com\",\"role\":\"admin\"}'`\n\nTraceback:\n```\nFile \"/app/routers/users.py\", line 42, in create_user\n  user = UserCreate(**payload)\nFile \"pydantic/main.py\", line 341, in pydantic.main.BaseModel.__init__\nValidationError: 1 validation error for UserCreate\nrole\n  unexpected value; permitted: 'student','instructor' (type=value_error.const)\n```\n\nI've verified: DB connection is fine, request body parses correctly. Schema lives in `schemas/users.py`.\n\nTwo hypotheses:\n(a) `role` is `Literal['student','instructor']` in the schema and 'admin' was added to the DB enum but not the schema.\n(b) There's a separate AdminCreate schema and the router is dispatching to the wrong one for admin role.\n\nPreferred fix direction: a Discriminated Union over role rather than widening the Literal, since admins have role-specific fields we'd want type-checked separately.\n\nCan you (1) tell me which hypothesis is correct or suggest a third, and (2) sketch the discriminated-union approach if (a)?\n\nSchema below:\n```python\nclass UserCreate(BaseModel):\n    email: EmailStr\n    role: Literal['student', 'instructor']\n```"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 92, "CCM": 78, "TSI": 90, "CLM": 88, "RAS": 75, "PEI": 85},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 92,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.6,
+          "verification_frequency": 0.3,
+          "decomposition_depth": 9,
+          "chunk_size_appropriate": 90,
+          "correct_reliance_rate": 0.75
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Could mention which Pydantic major version (v1 vs v2) to lock the syntax of the fix."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Full traceback plus repro command.",
+          "Two competing hypotheses with reasoning before asking the AI to weigh in.",
+          "States the preferred fix direction and the reason (type-checked role-specific fields)."
+        ],
+        "turn_summary": "Textbook debugging prompt: precise symptom, reproduction, verified non-causes, hypothesis space, and a directional preference for the fix. Leaves the AI to do real reasoning, not guess at the problem."
+      },
+      "label_notes": "Sister case to coding-002 in the debugging domain. Same anchor purpose for Advanced single-turn."
+    },
+    {
+      "id": "debugging-003",
+      "domain": "debugging",
+      "tier": "advanced",
+      "turn_type": "multi",
+      "task": "Track down a flaky Jest test in your codebase.",
+      "conversation": [
+        {"role": "user", "content": "I have a Jest test that fails intermittently — passes locally most of the time but fails maybe 1 in 5 in CI. It tests an event handler that fires after a debounced 100ms wait. What's the right way to make it deterministic?"},
+        {"role": "assistant", "content": "The flake usually comes from real timers + async behavior racing the assertion. The standard fix:\n\n1. `jest.useFakeTimers()` at the top of the test (or in beforeEach).\n2. Advance time explicitly with `jest.advanceTimersByTime(100)` instead of waiting.\n3. If the debounced function returns a Promise, make sure to flush microtasks — `await Promise.resolve()` or `await flushPromises()` after advancing.\n\nIf the handler chains async work after the debounce fires, use `jest.advanceTimersByTimeAsync(100)` (Jest 27+) which advances timers and flushes the microtask queue together."},
+        {"role": "user", "content": "OK I tried `jest.useFakeTimers()` + `jest.advanceTimersByTime(100)` but it still fails maybe 1 in 8. Let me look at the source... the handler does `return debounced(args)` and my test does `handler(args); jest.advanceTimersByTime(100); expect(...)` with no await.\n\nSo I think the issue is: the debounced fn fires synchronously when advanceTimersByTime runs, but the handler's returned Promise resolves on the next microtask, and my expect runs before that flush.\n\nShould I switch to `await jest.advanceTimersByTimeAsync(100)` and await the handler call too? Or is awaiting handler() enough since advanceTimersByTime is synchronous?"}
+      ],
+      "evaluated_turn_index": 2,
+      "golden": {
+        "scores": {"PSQ": 72, "CCM": 82, "TSI": 70, "CLM": 72, "RAS": 80, "PEI": 75},
+        "breakdown": {
+          "verb_specificity": 4,
+          "context_completeness": 75,
+          "constraint_defined": 0,
+          "focus_clarity": 4,
+          "initiative_ratio": 0.7,
+          "verification_frequency": 0.6,
+          "decomposition_depth": 6,
+          "chunk_size_appropriate": 75,
+          "correct_reliance_rate": 0.8
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "State Jest version explicitly — `advanceTimersByTimeAsync` is 27+."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Applied AI's suggestion, observed it didn't fully resolve, then dug into the source code rather than asking the AI again.",
+          "Formed a precise causal hypothesis (microtask flush ordering) and named it before asking.",
+          "Posed two concrete alternatives instead of an open question."
+        ],
+        "turn_summary": "Excellent user-led iteration: tried the AI's advice, found it insufficient, read the source, isolated the root cause, and returned with a sharper question. Reliance is well-calibrated — the AI is a sparring partner, not a crutch."
+      },
+      "label_notes": "Advanced multi-turn with strong CCM/RAS because of explicit verification and course correction across turns."
+    },
+    {
+      "id": "debugging-004",
+      "domain": "debugging",
+      "tier": "novice",
+      "turn_type": "multi",
+      "task": "Debug a 'TypeError: undefined is not a function' from a JavaScript app.",
+      "conversation": [
+        {"role": "user", "content": "im getting TypeError undefined is not a function in my js"},
+        {"role": "assistant", "content": "Can you share the stack trace and the line of code where it's thrown? That error means you're calling something as a function, but its value is `undefined`. Common causes: a method name typo, an unimported module, a destructured property that doesn't exist on the object."},
+        {"role": "user", "content": "i dont know how to get the stack trace"},
+        {"role": "assistant", "content": "Open your browser's DevTools (F12 on most browsers), go to the Console tab, and reproduce the error. You'll see the message with a stack trace below it — clickable lines showing which file and line number. Paste that here."},
+        {"role": "user", "content": "ok i added a console.log right above the line and it shows the thing is undefined. so its undefined. can you just fix it"}
+      ],
+      "evaluated_turn_index": 4,
+      "golden": {
+        "scores": {"PSQ": 15, "CCM": 18, "TSI": 12, "CLM": 18, "RAS": 30, "PEI": 18},
+        "breakdown": {
+          "verb_specificity": 2,
+          "context_completeness": 15,
+          "constraint_defined": 0,
+          "focus_clarity": 1,
+          "initiative_ratio": 0.1,
+          "verification_frequency": 0.1,
+          "decomposition_depth": 1,
+          "chunk_size_appropriate": 28,
+          "correct_reliance_rate": 0.3
+        },
+        "classification": "Novice",
+        "leading_status": "ai-led",
+        "suggestions": [
+          "Share what the variable is, where it should be assigned, and which file/line.",
+          "Tell the AI what you expected the variable to contain when you reached that line.",
+          "Try one diagnostic of your own before asking again — e.g., search the file for where that variable gets its value."
+        ],
+        "red_flags": [
+          "Refusing to engage with the diagnostic process — 'can you just fix it' after the AI gave a useful path.",
+          "No reproduction info, no file/line context across 5 turns.",
+          "Under-reliance on own debugging plus over-reliance on AI to produce a fix without information."
+        ],
+        "strengths": [
+          "Did at least run the suggested console.log and report a result."
+        ],
+        "turn_summary": "Persistent novice pattern: each turn defers the actual diagnostic work to the AI without providing the context the AI keeps asking for. RAS is low because the student is bypassing the (correct) AI guidance to do basic debugging themselves."
+      },
+      "label_notes": "Anchor case for novice multi-turn. Tests whether eval variants correctly down-score conversations where the student is being led rather than leading."
+    },
+    {
+      "id": "debugging-005",
+      "domain": "debugging",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "task": "Investigate a memory leak in a Node.js application.",
+      "conversation": [
+        {"role": "user", "content": "Our Node.js Express app's RSS memory climbs ~50MB/hour in production. Heap snapshots show the count of `Map` objects growing linearly with uptime. I already ruled out user-session storage (TTL eviction is firing correctly per metrics).\n\nMy current suspicion: a websocket handler that registers listeners on connection but doesn't remove them on disconnect, so closed sockets are retained via the Map of (socketId -> handler) and never collected.\n\nNode 20, `ws` library, single process per pod.\n\nCan you give me (a) the heap-snapshot retention path I should be looking for to confirm or rule out this hypothesis, and (b) the code pattern in the `ws` handler that would cause this? I want to know what to grep for before I open the file."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 78, "CCM": 65, "TSI": 72, "CLM": 72, "RAS": 65, "PEI": 71},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 78,
+          "constraint_defined": 0,
+          "focus_clarity": 4,
+          "initiative_ratio": 0.5,
+          "verification_frequency": 0.3,
+          "decomposition_depth": 6,
+          "chunk_size_appropriate": 80,
+          "correct_reliance_rate": 0.7
+        },
+        "classification": "Advanced",
+        "leading_status": "mixed",
+        "suggestions": [
+          "State which heap-profiling tool you're using (Chrome DevTools, clinic.js, heapdump) so retention-path syntax matches."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Quantified symptom (~50MB/hour, Map count growing) rather than vague 'leaking'.",
+          "Stated what was already ruled out.",
+          "Hypothesis with a falsification plan (a) retention path, (b) code pattern to grep for."
+        ],
+        "turn_summary": "Strong intermediate-to-advanced debugging prompt. Quantified, hypothesis-driven, decomposed into 'what to check before opening the file'. Falls just over the Advanced threshold on composite weighting."
+      },
+      "label_notes": "Borderline Intermediate/Advanced (PEI 71). Useful for testing whether eval variants agree on classification near the threshold."
+    },
+    {
+      "id": "data-001",
+      "domain": "data",
+      "tier": "advanced",
+      "turn_type": "single",
+      "task": "Write a SQL query to analyze sales trends.",
+      "conversation": [
+        {"role": "user", "content": "Postgres 14. Schema:\n```\nsales(id bigserial, sale_date date, region_id int, product_id int, amount numeric(12,2))\n  ~50M rows over 5 years\n  indexes: (sale_date), (product_id, sale_date)\n```\n\nGoal: return `product_id`s whose Q4 2025 monthly revenue grew >20% month-over-month in at least 2 of the 3 month-pairs (Oct->Nov, Nov->Dec, and yes I know that's only 2 pairs from 3 months).\n\nI tried:\n```sql\nWITH monthly AS (\n  SELECT product_id, date_trunc('month', sale_date) m, sum(amount) rev\n  FROM sales WHERE sale_date BETWEEN '2025-10-01' AND '2025-12-31'\n  GROUP BY 1,2\n),\nwith_prev AS (\n  SELECT product_id, m, rev,\n         LAG(rev) OVER (PARTITION BY product_id ORDER BY m) prev\n  FROM monthly\n)\nSELECT product_id FROM with_prev\nWHERE prev IS NOT NULL AND rev > prev * 1.20\nGROUP BY product_id\nHAVING count(*) >= 2;\n```\nBut I'm getting products that grew >20% in only one month-pair, not two. Suspect my HAVING count is counting all rows per product, not the qualifying ones.\n\nConstraints: must run <30s on prod (so index-friendly), single CTE chain preferred over functions.\n\nCan you (1) confirm the bug, (2) propose a fix, and (3) suggest any index that would help?"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 94, "CCM": 78, "TSI": 90, "CLM": 88, "RAS": 78, "PEI": 86},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 95,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.6,
+          "verification_frequency": 0.5,
+          "decomposition_depth": 8,
+          "chunk_size_appropriate": 90,
+          "correct_reliance_rate": 0.78
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Could specify whether 'product_id with only 1 sale-month' (Oct or Dec missing) should be excluded entirely or evaluated on its single qualifying pair."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Schema, row count, and existing indexes provided up front.",
+          "Showed the query attempt and a hypothesis about why it's wrong.",
+          "Numerical perf constraint (<30s) and stylistic preference (single CTE chain)."
+        ],
+        "turn_summary": "Exemplary data-engineering prompt. Self-debugged to a specific suspected fault (HAVING count semantics) before asking. The AI can focus on the bug rather than reverse-engineering the schema."
+      },
+      "label_notes": "Anchor case for Advanced in the data domain."
+    },
+    {
+      "id": "data-002",
+      "domain": "data",
+      "tier": "novice",
+      "turn_type": "single",
+      "task": "Investigate something interesting in a dataset you have.",
+      "conversation": [
+        {"role": "user", "content": "can you analyze my data and tell me whats interesting"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 8, "CCM": 15, "TSI": 8, "CLM": 18, "RAS": 50, "PEI": 18},
+        "breakdown": {
+          "verb_specificity": 2,
+          "context_completeness": 0,
+          "constraint_defined": 0,
+          "focus_clarity": 1,
+          "initiative_ratio": 0.0,
+          "verification_frequency": 0.0,
+          "decomposition_depth": 1,
+          "chunk_size_appropriate": 25,
+          "correct_reliance_rate": 0.5
+        },
+        "classification": "Novice",
+        "leading_status": "ai-led",
+        "suggestions": [
+          "Attach the data (or paste a sample) — the AI cannot analyze data it cannot see.",
+          "State what 'interesting' means in your context (anomalies? trends? correlations?).",
+          "Describe the domain so the AI can reason about what would be unexpected."
+        ],
+        "red_flags": [
+          "Pronoun 'my data' with no data attached or described.",
+          "'Interesting' is undefined — purely AI's judgment of what matters."
+        ],
+        "strengths": [],
+        "turn_summary": "Lowest-floor novice prompt: no data, no domain, no operational definition of 'interesting'. The AI cannot meaningfully respond."
+      },
+      "label_notes": "Floor case for the data domain — paired with coding-001 and casual-001 as cross-domain novice anchors."
+    },
+    {
+      "id": "data-003",
+      "domain": "data",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "task": "Clean a messy pandas DataFrame.",
+      "conversation": [
+        {"role": "user", "content": "Pandas 2.0+. DataFrame `df` has columns ['customer_id', 'signup_date', 'plan', 'mrr'], ~12k rows. Issues:\n- `signup_date` is mixed: sometimes string '2024-03-15', sometimes pd.Timestamp\n- `plan` has inconsistent casing/whitespace: 'pro', 'Pro', 'PRO ', and a real distinct value 'pro_v2'\n- `mrr` has some negative values which represent refunds\n\nGoal: get a clean DataFrame ready for cohort analysis. Rules:\n- Coerce signup_date to datetime64[ns], drop rows where coercion fails\n- Normalize plan to lowercase + strip, but keep 'pro_v2' as its own tier (do NOT collapse into 'pro')\n- Keep refund rows, but add a boolean `is_refund` column (True where mrr < 0)\n\nWrite the cleaning code. Idiomatic pandas preferred; comments only where the intent isn't obvious."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 80, "CCM": 65, "TSI": 62, "CLM": 75, "RAS": 60, "PEI": 70},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 80,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.4,
+          "verification_frequency": 0.2,
+          "decomposition_depth": 6,
+          "chunk_size_appropriate": 82,
+          "correct_reliance_rate": 0.6
+        },
+        "classification": "Intermediate",
+        "leading_status": "mixed",
+        "suggestions": [
+          "Could state how to surface dropped rows (count? warning? return tuple?) so downstream code knows what was lost."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Explicit transformation rules per column instead of 'clean this'.",
+          "Disambiguated the 'pro_v2' edge case (often where novice prompts fail silently)."
+        ],
+        "turn_summary": "Tight intermediate prompt: per-column rules, version pinned, stylistic preference. Stops just short of specifying what to do with the data lost during coercion."
+      },
+      "label_notes": "Right at the Intermediate/Advanced boundary (PEI 70). Good case to detect classification boundary disagreement between eval variants."
+    },
+    {
+      "id": "data-004",
+      "domain": "data",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "task": "Find anomalies in a numerical dataset.",
+      "conversation": [
+        {"role": "user", "content": "I have student exam scores (n=240, range 0-100, roughly normal from a quick histogram). I want to flag outliers for instructor review. The flagged list will be reviewed by hand, so false positives are worse than false negatives — I'd rather miss a couple of real outliers than over-flag.\n\nShould I use the ±2 sigma rule, IQR (1.5x or 3x), modified Z-score, or something else? I'm not looking for a code answer yet — I want the reasoning on which fits this use case (small n, near-normal, asymmetric error cost). Then I'll ask for code."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 72, "CCM": 68, "TSI": 65, "CLM": 70, "RAS": 78, "PEI": 70},
+        "breakdown": {
+          "verb_specificity": 4,
+          "context_completeness": 72,
+          "constraint_defined": 1,
+          "focus_clarity": 4,
+          "initiative_ratio": 0.55,
+          "verification_frequency": 0.3,
+          "decomposition_depth": 5,
+          "chunk_size_appropriate": 78,
+          "correct_reliance_rate": 0.78
+        },
+        "classification": "Intermediate",
+        "leading_status": "mixed",
+        "suggestions": [
+          "If you can share an actual cut of the distribution (mean, std, tail counts), the AI can quantify the false-positive rate per method."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Stated the asymmetric error cost up front — critical context most prompts skip.",
+          "Explicitly asked for reasoning before code (good staging of the conversation)."
+        ],
+        "turn_summary": "Thoughtful intermediate prompt: provides distribution context, names the error-cost asymmetry, and stages the dialogue (reason first, then code). Doesn't quite hit Advanced because the data shape is described rather than shown."
+      },
+      "label_notes": "Tier-defining intermediate case with strong RAS — explicitly using the AI for reasoning, not a fix dispenser."
+    },
+    {
+      "id": "data-005",
+      "domain": "data",
+      "tier": "advanced",
+      "turn_type": "multi",
+      "task": "Investigate why a key product metric dropped.",
+      "conversation": [
+        {"role": "user", "content": "DAU dropped 12% on 2026-03-08. No deploys that day. Stack: Postgres OLTP, Snowflake analytics, Segment for event collection. Help me think through where to look before I start digging."},
+        {"role": "assistant", "content": "Standard checklist:\n1. Infra: status pages for hosting, CDN, your auth provider.\n2. Tracking pipeline: any delivery delays or dropped events in Segment? Check the Segment delivery dashboard for that day.\n3. External: app store update with a regression, marketing campaign ended, OS update breaking SDK.\n4. Segment breakdowns: slice by platform (iOS/Android/web), region, app version, login method — a clean drop everywhere points to infra/tracking; a single-segment drop points to a release or external cause.\n5. Composition: is the drop in returning users, new users, or both?\n6. Definition: did the DAU SQL/query change in dbt or LookML on or before that day?"},
+        {"role": "user", "content": "Worked through that:\n(1) Infra: StatusPage clean for us, AWS, and Segment.\n(2) Pipeline: Segment had a delivery delay window 4-6am EST on 2026-03-08, dead-letter-queue is now empty but I want to confirm those delayed events were actually replayed into Snowflake vs lost.\n(3) External: no app version pushed in the last 10 days, no marketing pulse.\n(4) Breakdowns: iOS dropped 18%, Android 9%, web 4%.\n(5) Composition: drop concentrated in returning users on iOS.\n(6) Definition: no dbt model changes that week.\n\nThe iOS-heavy drop + 4-6am Segment delay window aligns suspiciously well. Working hypothesis: Segment dropped or delayed enough iOS events past our daily aggregation cutoff (UTC midnight) that DAU is artificially low, and actual user activity that day was normal.\n\nTwo verification paths I want to run before declaring this a measurement artifact:\n(a) Re-aggregate DAU for 2026-03-08 from raw events with a +24h lateness buffer\n(b) Compare iOS event counts at the SDK delivery layer (we have CloudWatch logs of accepted POSTs to our Segment HTTP source) vs Segment-delivered events into Snowflake for the 4-6am window\n\nCan you (1) sketch the SQL for (a) given a typical daily-aggregation DAU model, and (2) tell me specifically what discrepancy pattern in (b) would confirm vs falsify the hypothesis?"}
+      ],
+      "evaluated_turn_index": 2,
+      "golden": {
+        "scores": {"PSQ": 92, "CCM": 92, "TSI": 90, "CLM": 88, "RAS": 88, "PEI": 90},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 95,
+          "constraint_defined": 0,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.8,
+          "verification_frequency": 0.7,
+          "decomposition_depth": 9,
+          "chunk_size_appropriate": 92,
+          "correct_reliance_rate": 0.9
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "State the dialect (Snowflake SQL vs dbt model) for the verification query so the response is directly runnable."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Worked every item on the AI's checklist and reported results inline.",
+          "Synthesized two independent signals (iOS-heavy drop + Segment delay window) into a falsifiable hypothesis.",
+          "Defined the falsification criteria for the verification paths up front."
+        ],
+        "turn_summary": "Top-tier investigative thinking. The student is using the AI to expand the search space, not to do the search. Hypothesis and falsification criteria are pre-committed."
+      },
+      "label_notes": "Highest-PEI case in the set. Useful for testing the ceiling behavior of eval variants — do they distinguish 85 from 90 or compress everything above 80?"
+    },
+    {
+      "id": "casual-001",
+      "domain": "casual",
+      "tier": "novice",
+      "turn_type": "single",
+      "task": "Write a short essay on a topic that matters to you.",
+      "conversation": [
+        {"role": "user", "content": "write me an essay about climate change"}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 12, "CCM": 18, "TSI": 10, "CLM": 25, "RAS": 45, "PEI": 20},
+        "breakdown": {
+          "verb_specificity": 2,
+          "context_completeness": 8,
+          "constraint_defined": 0,
+          "focus_clarity": 1,
+          "initiative_ratio": 0.0,
+          "verification_frequency": 0.0,
+          "decomposition_depth": 1,
+          "chunk_size_appropriate": 25,
+          "correct_reliance_rate": 0.45
+        },
+        "classification": "Novice",
+        "leading_status": "ai-led",
+        "suggestions": [
+          "Specify length, audience, and angle (causes? policy? personal stakes?).",
+          "State the format: argumentative, explanatory, narrative?",
+          "Indicate constraints: required citations, prohibited phrases, tone."
+        ],
+        "red_flags": [
+          "No length, audience, angle, or tone — the AI must invent the entire frame."
+        ],
+        "strengths": [],
+        "turn_summary": "Canonical novice casual prompt: a topic and nothing else. The AI will produce a generic, audience-less essay that is unlikely to be useful for any specific purpose."
+      },
+      "label_notes": "Cross-domain novice anchor (paired with coding-001 and data-002)."
+    },
+    {
+      "id": "casual-002",
+      "domain": "casual",
+      "tier": "advanced",
+      "turn_type": "single",
+      "task": "Plan a piece of writing for a specific audience.",
+      "conversation": [
+        {"role": "user", "content": "I'm writing a 600-word op-ed for our university student newspaper arguing that AI literacy should be a graduation requirement. Audience: undergraduates who are skeptical of AI but use it daily (think: humanities majors who use ChatGPT to draft emails but distrust it for coursework).\n\nConstraints:\n- No jargon like 'foundation models' or 'agentic' or 'LLM'\n- Include exactly one concrete anecdote and one counter-argument I'll address directly\n- Open with a hook, end with an action they can take this semester (not 'demand change from administrators')\n- Tone: confident but not preachy, no 'we must' or 'we should' constructions\n\nI'm not asking for the draft yet. Give me three different angles I could take: (a) career-readiness angle, (b) critical-thinking angle, (c) equity-of-access angle. For each: a one-sentence thesis, a candidate opening hook, and the strongest counter-argument I'd need to address. I'll pick one angle and write the draft myself."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 94, "CCM": 80, "TSI": 80, "CLM": 88, "RAS": 85, "PEI": 86},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 95,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.7,
+          "verification_frequency": 0.4,
+          "decomposition_depth": 7,
+          "chunk_size_appropriate": 90,
+          "correct_reliance_rate": 0.85
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Could share one of your previous op-eds so the AI can match voice."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Audience characterized with a behavior pattern, not a demographic label.",
+          "Explicit do-not-use list (jargon, 'we must') alongside positive constraints.",
+          "Defined the AI's role: explore option space, not produce the artifact."
+        ],
+        "turn_summary": "Top-tier writing prompt: tight scope, characterized audience, explicit constraints, and staged work (angles now, draft later). RAS is high because the student reserves the actual writing for themselves."
+      },
+      "label_notes": "Advanced casual anchor. Demonstrates calibrated reliance — using AI for ideation but not for the final artifact."
+    },
+    {
+      "id": "casual-003",
+      "domain": "casual",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "task": "Plan a short trip.",
+      "conversation": [
+        {"role": "user", "content": "Plan a 3-day trip to Lisbon for a family of 4: two adults, kids ages 7 and 10. Arriving Friday evening, leaving Monday morning. Vegetarian throughout (kids also won't eat fish). Mid-range budget. Pacing: one main activity per day, kids tire by mid-afternoon so include a rest window from ~2-4pm. We prefer walking to taxis where possible.\n\nFor each day give me: morning activity, lunch spot, rest window plan, late-afternoon/evening activity, dinner. Suggest one neighborhood to stay in (justify the pick) and 2-3 restaurants per day with at least one vegetarian-explicit option each.\n\nIf any activity is weather-dependent, give a backup."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 80, "CCM": 62, "TSI": 60, "CLM": 78, "RAS": 60, "PEI": 69},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 82,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.35,
+          "verification_frequency": 0.2,
+          "decomposition_depth": 6,
+          "chunk_size_appropriate": 88,
+          "correct_reliance_rate": 0.6
+        },
+        "classification": "Intermediate",
+        "leading_status": "mixed",
+        "suggestions": [
+          "Specify which months/weather expectations apply so the backup logic is concrete."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Pacing constraints (rest window, walking preference) are specific and operational.",
+          "Explicit output structure per day reduces variance in the response."
+        ],
+        "turn_summary": "Well-structured planning prompt: concrete constraints, output template, dietary restriction, family-size detail. Doesn't push to Advanced because the AI is being asked to do most of the synthesis rather than augment user judgment."
+      },
+      "label_notes": "Strong Intermediate. Demonstrates that highly structured prompts can hit Intermediate even with low CCM/RAS."
+    },
+    {
+      "id": "casual-004",
+      "domain": "casual",
+      "tier": "intermediate",
+      "turn_type": "multi",
+      "task": "Draft and refine a cover letter.",
+      "conversation": [
+        {"role": "user", "content": "Draft a 250-word cover letter for a UX research role at a fintech startup. My background: 3 years as a product designer at a healthcare SaaS, led user research for our 3 biggest feature launches. Why fintech: I'm interested in how design decisions shape people's relationship with money."},
+        {"role": "assistant", "content": "[Drafts a serviceable 250-word cover letter: opener naming the role and personal motivation, middle paragraph on healthcare experience and research leadership, paragraph connecting to fintech interest, closing thanking them and welcoming follow-up.]"},
+        {"role": "user", "content": "Solid first pass. Two changes I want:\n\n(1) Paragraph 2 reads like it could apply to any product role — the research-specific verbs need to be sharper. Replace soft phrasing like 'worked on user research' with verbs that show research leadership: 'designed and led generative interviews', 'synthesized findings into prioritization framework', 'ran usability sessions on prototype iterations'. Use those exact verb stems, not 'worked on'.\n\n(2) The closing feels generic. End with a specific question I have about their product instead. Context: I've been using their app for a year and noticed they don't show the long-term-goal impact of small daily savings — you can only see the daily-savings number, not 'this $5/day puts you $1800 ahead in a year'. I think this is a behavioral-design miss. I want to surface this observation without sounding presumptuous.\n\nRewrite paragraphs 2 and 4. Keep the opener as is."}
+      ],
+      "evaluated_turn_index": 2,
+      "golden": {
+        "scores": {"PSQ": 75, "CCM": 75, "TSI": 60, "CLM": 75, "RAS": 75, "PEI": 72},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 80,
+          "constraint_defined": 1,
+          "focus_clarity": 4,
+          "initiative_ratio": 0.65,
+          "verification_frequency": 0.5,
+          "decomposition_depth": 5,
+          "chunk_size_appropriate": 82,
+          "correct_reliance_rate": 0.75
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Could state the publication-style voice you want (e.g., 'plainspoken' vs 'polished consultant')."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Diagnosed exactly what was generic in the first draft instead of just saying 'redo'.",
+          "Provided concrete verb stems for the rewrite — the AI has no room to revert to soft phrasing.",
+          "Surfaced a real product observation to use as the closing, with reasoning about tone."
+        ],
+        "turn_summary": "Tight, calibrated revision request. The student gave the AI a useful first pass, then steered with specifics rather than vague 'make it better'. Just over Advanced threshold."
+      },
+      "label_notes": "Borderline Intermediate/Advanced. The composite lands at 72 — useful for catching variants that under-credit specific revision feedback."
+    },
+    {
+      "id": "casual-005",
+      "domain": "casual",
+      "tier": "advanced",
+      "turn_type": "single",
+      "task": "Brainstorm options for a creative decision.",
+      "conversation": [
+        {"role": "user", "content": "Help me brainstorm names for a productivity app I'm building. Concept: helps people who feel busy-but-not-productive identify the 1-3 things that actually matter this week and ignore the rest.\n\nName constraints:\n- 1-2 syllables\n- Pronounceable in English, Spanish, and Mandarin (avoid consonant clusters like 'str-', 'spl-')\n- .com or .io available is a bonus, not a hard requirement\n- Avoid AI/tech cliche suffixes: no -ify, -ly, -fy, -ai\n- Avoid productivity-cliche words: 'Focus', 'Flow', 'Zen', 'Deep', 'Sprint'\n- Avoid anything that sounds like an existing major app (Notion, Linear, Things, Todoist, Asana, ClickUp)\n\nProcess: give me 15 names across three angles:\n(a) verbs or action words (5 names)\n(b) physical objects or metaphors — compass, anchor, lighthouse, etc. (5 names)\n(c) abstract or coined words (5 names)\n\nFor each, tag it: 'safe' (defensible, professional) or 'weird-in-a-good-way' (memorable, polarizing).\n\nI'll narrow from there."}
+      ],
+      "evaluated_turn_index": 0,
+      "golden": {
+        "scores": {"PSQ": 95, "CCM": 78, "TSI": 78, "CLM": 85, "RAS": 75, "PEI": 83},
+        "breakdown": {
+          "verb_specificity": 5,
+          "context_completeness": 92,
+          "constraint_defined": 1,
+          "focus_clarity": 5,
+          "initiative_ratio": 0.65,
+          "verification_frequency": 0.3,
+          "decomposition_depth": 7,
+          "chunk_size_appropriate": 92,
+          "correct_reliance_rate": 0.78
+        },
+        "classification": "Advanced",
+        "leading_status": "user-led",
+        "suggestions": [
+          "Could pre-share 2-3 names you've already considered and rejected, so the AI doesn't suggest them."
+        ],
+        "red_flags": [],
+        "strengths": [
+          "Defined the negative space (what to avoid) as carefully as the positive constraints.",
+          "Structured the output explicitly (3 angles, 5 each, with safe/weird tag) — minimizes response variance.",
+          "Stated 'I'll narrow from there' — making the AI's role 'expand options' not 'pick one'."
+        ],
+        "turn_summary": "Excellent brainstorming prompt. Heavy on negative constraints, output structure pre-specified, AI's role bounded to ideation. Reliance is well-calibrated."
+      },
+      "label_notes": "Advanced anchor for creative/casual single-turn. Tests whether eval variants reward negative-constraint specification (often overlooked)."
+    }
+  ]
+}

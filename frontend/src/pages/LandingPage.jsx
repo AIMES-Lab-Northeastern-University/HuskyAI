@@ -525,7 +525,7 @@ export default function LandingPage() {
             onClick={() => navigate('/login#educators-login-info')}
             style={{ ...s.navLink, cursor: 'pointer' }}
             className="lp-nav-link"
-            title="Same sign-in page — how instructors and admins get in"
+            title="Same sign-in page - how instructors and admins get in"
           >
             Instructor / Admin
           </a>
@@ -546,7 +546,7 @@ export default function LandingPage() {
           <div style={s.heroLeft}>
             <div style={s.heroEyebrow}>
               <div style={s.eyebrowLine} />
-              Northeastern University
+              AIMES Lab, Northeastern University
             </div>
             <h1 style={s.heroH1}>
               Be an<br />
@@ -554,7 +554,7 @@ export default function LandingPage() {
               Husky.
             </h1>
             <p style={s.heroSub}>
-              Husky AI is your personal coach for learning how to think with AI — not just use it.
+              Husky AI is your personal coach for learning how to think with AI - not just use it.
               Complete real challenges, get scored on your prompting, and see how your class stacks up.
             </p>
             <div style={{ ...s.heroActions, flexWrap: 'wrap', gap: '12px' }}>
@@ -700,7 +700,7 @@ export default function LandingPage() {
             <div style={s.stepIconWrap}><MonitorIcon /></div>
             <div style={s.stepTitle}>Get a challenge</div>
             <div style={s.stepText}>
-              Each week your class gets a real, open-ended project — design a campaign, analyze a dataset,
+              Each week your class gets a real, open-ended project - design a campaign, analyze a dataset,
               build something. No multiple choice. No hand-holding.
             </div>
           </div>
@@ -712,7 +712,7 @@ export default function LandingPage() {
             <div style={s.stepTitle}>Work with AI, get scored</div>
             <div style={s.stepText}>
               Use AI to complete the challenge. Every prompt you write is evaluated in real time across
-              five dimensions — specificity, iteration, control, and more.
+              five dimensions - specificity, iteration, control, and more.
             </div>
           </div>
 
@@ -748,7 +748,7 @@ export default function LandingPage() {
             <div style={s.featTitle}>Live Prompt Evaluator</div>
             <div style={s.featText}>
               Every message you send to AI gets scored instantly. See exactly which dimensions improved and
-              get a specific tip for your next prompt — not generic advice.
+              get a specific tip for your next prompt - not generic advice.
             </div>
             <div style={s.featTag}>Core feature</div>
           </div>
@@ -758,7 +758,7 @@ export default function LandingPage() {
             <div style={s.featIconDark}><UsersIcon dimColor="rgba(255,255,255,0.7)" /></div>
             <div style={s.featTitleLight}>Classroom Signal</div>
             <div style={s.featTextLight}>
-              Two classrooms, anonymously paired. Your class sees the other's aggregate pattern — not
+              Two classrooms, anonymously paired. Your class sees the other's aggregate pattern - not
               individual scores, not raw prompts. Just a signal strong enough to learn from.
             </div>
             <div style={s.featTagLight}>Research-backed</div>
@@ -770,7 +770,7 @@ export default function LandingPage() {
             <div style={s.featTitle}>Progress Tracking</div>
             <div style={s.featText}>
               Watch your Husky Score grow across the semester. See which dimensions are improving, where
-              you plateau, and how you rank in your class — all in one place.
+              you plateau, and how you rank in your class - all in one place.
             </div>
             <div style={s.featTag}>Student dashboard</div>
           </div>
@@ -781,7 +781,7 @@ export default function LandingPage() {
             <div style={s.featTitle}>Not just LLMs</div>
             <div style={s.featText}>
               Challenges cover AI image generation, data analysis, creative co-authoring, and more.
-              AI literacy is broader than prompting ChatGPT — this platform teaches all of it.
+              AI literacy is broader than prompting ChatGPT - this platform teaches all of it.
             </div>
             <div style={s.featTag}>Full AI literacy</div>
           </div>
@@ -801,12 +801,12 @@ export default function LandingPage() {
               Your class vs. theirs. <em style={s.clsH2Em}>Anonymously.</em>
             </h2>
             <p style={s.clsText}>
-              Learning to use AI well is a social skill — it improves faster when you can see how others do it.
+              Learning to use AI well is a social skill - it improves faster when you can see how others do it.
               Husky AI creates a live feedback loop between two classrooms, without revealing anyone's identity.
             </p>
             <div style={s.clsPoints}>
               {[
-                'Aggregate scores only — no individual data is ever shared with the partner class',
+                'Aggregate scores only - no individual data is ever shared with the partner class',
                 'Updates live during sessions so your class can see the signal and respond',
                 'Coach insights tell you what the partner class is doing differently and how to close the gap',
               ].map((text, i) => (
@@ -913,7 +913,7 @@ export default function LandingPage() {
               Ready to become<br /><em style={s.ctaH2Em}>AI-ready?</em>
             </h2>
             <p style={s.ctaSub}>
-              Enter your class code and start your first challenge today. No setup, no downloads —
+              Enter your class code and start your first challenge today. No setup, no downloads -
               just open your browser and begin.
             </p>
           </div>
@@ -941,7 +941,7 @@ export default function LandingPage() {
             <span key={lbl} style={s.footerLink} className="lp-footer-link">{lbl}</span>
           ))}
         </div>
-        <div style={s.footerCopy}>&copy; 2025 Northeastern University</div>
+        <div style={s.footerCopy}>&copy; 2025 AIMES Lab, Northeastern University</div>
       </footer>
 
     </div>

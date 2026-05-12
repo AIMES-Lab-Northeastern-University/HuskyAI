@@ -48,7 +48,7 @@ function challengeBadge(c) {
 }
 
 function formatActivityTime(iso) {
-  if (!iso) return '—'
+  if (!iso) return '-'
   try {
     return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
   } catch {
@@ -301,7 +301,7 @@ export default function Instructor() {
       }
       setActionMsg(
         enabled
-          ? 'This section’s challenges now appear on your Challenges page — open Challenges to try them like a student.'
+          ? 'This section’s challenges now appear on your Challenges page - open Challenges to try them like a student.'
           : 'Test-as-student mode off for this section.',
       )
       await loadSections()
@@ -470,7 +470,7 @@ export default function Instructor() {
         return
       }
       setCreateMsg(publish
-        ? 'Challenge published — students can see it now.'
+        ? 'Challenge published - students can see it now.'
         : 'Draft saved. Use Publish to make it visible to students.')
       setCreateTitle('')
       setCreateDesc('')
@@ -531,7 +531,7 @@ export default function Instructor() {
                   Currently active · Week 4 of 12
                 </div>
                 <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#fff', marginBottom: '20px' }}>
-                  Week 4 Challenge — Public Awareness Campaign
+                  Week 4 Challenge - Public Awareness Campaign
                 </div>
                 <div style={{ display: 'flex', gap: '24px' }}>
                   {[
@@ -618,7 +618,7 @@ export default function Instructor() {
                     justifyContent: 'space-between',
                   }}>
                     <div style={{ fontSize: '13px', fontWeight: 600, color: '#fff' }}>
-                      Live comparison — Week 4
+                      Live comparison - Week 4
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                       <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#16A34A' }} />
@@ -881,7 +881,7 @@ export default function Instructor() {
                         style={{ accentColor: '#C8102E', marginTop: '3px', flexShrink: 0 }}
                       />
                       <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.88)', lineHeight: 1.5 }}>
-                        <strong style={{ color: '#fff' }}>Test as student</strong> — show this section’s assigned challenges on my <strong style={{ color: '#fff' }}>Challenges</strong> page so I can run through them after posting (same flow as students).
+                        <strong style={{ color: '#fff' }}>Test as student</strong> - show this section’s assigned challenges on my <strong style={{ color: '#fff' }}>Challenges</strong> page so I can run through them after posting (same flow as students).
                       </span>
                     </label>
                     <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
@@ -931,7 +931,7 @@ export default function Instructor() {
                             { k: 'Completed', v: analytics.sessions_completed, sub: 'session rows' },
                             {
                               k: 'Avg PEI',
-                              v: analytics.avg_best_pei != null ? Number(analytics.avg_best_pei).toFixed(1) : '—',
+                              v: analytics.avg_best_pei != null ? Number(analytics.avg_best_pei).toFixed(1) : '-',
                               sub: 'challenge sessions',
                             },
                           ].map(({ k, v, sub }) => (
@@ -972,7 +972,7 @@ export default function Instructor() {
                             { k: 'Scored turns', v: analytics.eval_turns_count ?? 0, sub: 'eval rows' },
                             {
                               k: 'Avg eval PEI',
-                              v: analytics.avg_eval_pei != null ? Number(analytics.avg_eval_pei).toFixed(1) : '—',
+                              v: analytics.avg_eval_pei != null ? Number(analytics.avg_eval_pei).toFixed(1) : '-',
                               sub: 'per scored turn',
                             },
                             { k: 'Last activity', v: formatActivityTime(analytics.last_activity_at), sub: 'any metric above' },
@@ -1018,7 +1018,7 @@ export default function Instructor() {
                                       <td style={{ padding: '8px 10px', color: '#4A4440' }}>{row.sessions_started}</td>
                                       <td style={{ padding: '8px 10px', color: '#4A4440' }}>{row.sessions_completed}</td>
                                       <td style={{ padding: '8px 10px', color: '#4A4440' }}>
-                                        {row.avg_best_pei != null ? Number(row.avg_best_pei).toFixed(1) : '—'}
+                                        {row.avg_best_pei != null ? Number(row.avg_best_pei).toFixed(1) : '-'}
                                       </td>
                                     </tr>
                                   ))}
@@ -1183,7 +1183,7 @@ export default function Instructor() {
                                   { k: 'Chats', v: drillData.workspace?.conversations ?? 0 },
                                   { k: 'Turns', v: drillData.workspace?.turns_total ?? 0 },
                                   { k: 'Scored turns', v: drillData.workspace?.eval_turns ?? 0 },
-                                  { k: 'Avg eval PEI', v: drillData.workspace?.avg_eval_pei != null ? Number(drillData.workspace.avg_eval_pei).toFixed(1) : '—' },
+                                  { k: 'Avg eval PEI', v: drillData.workspace?.avg_eval_pei != null ? Number(drillData.workspace.avg_eval_pei).toFixed(1) : '-' },
                                   { k: 'Last activity', v: formatActivityTime(drillData.workspace?.last_activity_at) },
                                 ].map(({ k, v }) => (
                                   <div key={k} style={{ background: '#F7F3EE', borderRadius: '8px', padding: '8px', border: '1px solid #E7E0D8', textAlign: 'center' }}>
@@ -1199,7 +1199,7 @@ export default function Instructor() {
                                 {[
                                   { k: 'Started', v: drillData.challenge_sessions?.sessions_started ?? 0 },
                                   { k: 'Completed', v: drillData.challenge_sessions?.sessions_completed ?? 0 },
-                                  { k: 'Avg PEI', v: drillData.challenge_sessions?.avg_best_pei != null ? Number(drillData.challenge_sessions.avg_best_pei).toFixed(1) : '—' },
+                                  { k: 'Avg PEI', v: drillData.challenge_sessions?.avg_best_pei != null ? Number(drillData.challenge_sessions.avg_best_pei).toFixed(1) : '-' },
                                 ].map(({ k, v }) => (
                                   <div key={k} style={{ background: '#FAFAF8', borderRadius: '8px', padding: '8px', border: '1px solid #EDE8E2', textAlign: 'center' }}>
                                     <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '18px', color: '#16120E' }}>{v}</div>
@@ -1226,7 +1226,7 @@ export default function Instructor() {
                                             <td style={{ padding: '6px 8px' }}>{bc.title || bc.challenge_id?.slice(0, 8)}</td>
                                             <td style={{ padding: '6px 8px', textAlign: 'center' }}>{bc.sessions_started}</td>
                                             <td style={{ padding: '6px 8px', textAlign: 'center' }}>{bc.sessions_completed}</td>
-                                            <td style={{ padding: '6px 8px', textAlign: 'center' }}>{bc.avg_best_pei != null ? Number(bc.avg_best_pei).toFixed(1) : '—'}</td>
+                                            <td style={{ padding: '6px 8px', textAlign: 'center' }}>{bc.avg_best_pei != null ? Number(bc.avg_best_pei).toFixed(1) : '-'}</td>
                                           </tr>
                                         ))}
                                       </tbody>
@@ -1254,7 +1254,7 @@ export default function Instructor() {
                                             <td style={{ padding: '6px 8px', maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={sr.challenge_title}>{sr.challenge_title}</td>
                                             <td style={{ padding: '6px 8px', textAlign: 'center' }}>{sr.session_number}</td>
                                             <td style={{ padding: '6px 8px', textAlign: 'center' }}>{sr.status}</td>
-                                            <td style={{ padding: '6px 8px', textAlign: 'center' }}>{sr.best_pei != null ? Number(sr.best_pei).toFixed(1) : '—'}</td>
+                                            <td style={{ padding: '6px 8px', textAlign: 'center' }}>{sr.best_pei != null ? Number(sr.best_pei).toFixed(1) : '-'}</td>
                                             <td style={{ padding: '6px 8px', fontSize: '10px', color: '#6B6560' }}>{formatActivityTime(sr.started_at)}</td>
                                           </tr>
                                         ))}

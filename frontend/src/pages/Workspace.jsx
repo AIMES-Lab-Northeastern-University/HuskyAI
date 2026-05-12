@@ -92,8 +92,8 @@ function EvalSidebar({ evalData, isEvaluating, turnCount }) {
   const pei = evalData?.scores?.PEI ?? 0
   const scores = evalData?.scores || {}
   const suggestions = evalData?.suggestions || []
-  const classification = evalData?.classification || '—'
-  const leadStatus = evalData?.leading_status || '—'
+  const classification = evalData?.classification || '-'
+  const leadStatus = evalData?.leading_status || '-'
 
   return (
     <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col overflow-y-auto" style={{ borderLeftWidth: '1.5px' }}>
@@ -121,7 +121,7 @@ function EvalSidebar({ evalData, isEvaluating, turnCount }) {
               {scoreLabel(pei)}
             </span>
           </div>
-          {classification !== '—' && (
+          {classification !== '-' && (
             <div className="text-[12px] text-[#9A948E]">{classification} · {leadStatus}</div>
           )}
         </div>
