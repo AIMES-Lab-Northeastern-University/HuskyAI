@@ -147,7 +147,7 @@ export default function Challenges() {
       })
       const d = await r.json().catch(() => ({}))
       if (!r.ok) { setCreateMsg(typeof d.detail === 'string' ? d.detail : 'Could not create challenge'); return }
-      setCreateMsg(publish ? 'Challenge published — students can see it now.' : 'Draft saved.')
+      setCreateMsg(publish ? 'Challenge published - students can see it now.' : 'Draft saved.')
       setCreateTitle(''); setCreateDesc(''); setCreateWeek('')
       await loadSectionChallenges()
     } catch { setCreateMsg('Network error') }

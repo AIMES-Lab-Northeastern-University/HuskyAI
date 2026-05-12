@@ -131,10 +131,10 @@ export default function Dashboard() {
                   {greeting}, {firstName}.
                 </div>
                 <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.6)', lineHeight: 1.75, marginBottom: '20px' }}>
-                  You're building real AI fluency — not just using tools, but directing them. Every prompt you write is a chance to lead smarter.
+                  You're building real AI fluency - not just using tools, but directing them. Every prompt you write is a chance to lead smarter.
                 </div>
                 <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', fontStyle: 'italic', lineHeight: 1.65, borderLeft: '2px solid rgba(255,255,255,0.15)', paddingLeft: '12px' }}>
-                  "The best AI users don't ask for answers — they ask better questions."
+                  "The best AI users don't ask for answers - they ask better questions."
                 </div>
               </div>
               <div style={{ marginTop: '24px' }}>
@@ -265,7 +265,7 @@ export default function Dashboard() {
                 <div className="bg-[#FDFCFB] rounded-[14px] px-5 py-[18px]" style={{ borderWidth: '1.5px', borderStyle: 'solid', borderColor: '#E7E0D8' }}>
                   <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '6px' }}>Best PEI</div>
                   <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '32px', color: '#16120E', lineHeight: 1 }}>
-                    {challengesLoading ? '…' : liveStats.bestPei != null ? liveStats.bestPei : '—'}
+                    {challengesLoading ? '…' : liveStats.bestPei != null ? liveStats.bestPei : '-'}
                   </div>
                   <div style={{ fontSize: '12px', color: '#9A948E', marginTop: '4px' }}>
                     {liveStats.bestPei != null ? 'Across your challenges' : 'Complete a scored session'}
@@ -359,7 +359,7 @@ export default function Dashboard() {
                   { dot: '#16A34A', label: 'Workspace session', sub: '2 hours ago', score: '+0.6' },
                   { dot: '#F97316', label: 'Challenge submitted', sub: 'Yesterday', score: '7.1' },
                   { dot: '#0D9488', label: 'New badge earned', sub: '2 days ago', score: null },
-                  { dot: '#7C3AED', label: 'Prompt streak — 5 days', sub: '3 days ago', score: null },
+                  { dot: '#7C3AED', label: 'Prompt streak - 5 days', sub: '3 days ago', score: null },
                   { dot: '#C8102E', label: 'Challenge started', sub: 'Week 4 began', score: null },
                 ].map((item, i) => (
                   <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: i < 4 ? '14px' : 0, paddingBottom: i < 4 ? '14px' : 0, borderBottom: i < 4 ? '1px solid #F7F3EE' : 'none' }}>

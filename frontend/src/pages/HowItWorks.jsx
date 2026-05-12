@@ -80,7 +80,7 @@ const DIMENSIONS = [
     name: 'Conversation Control Metrics',
     color: '#7C3AED',
     bg: '#EDE9FE',
-    desc: 'Tracks who steers the conversation. A leading student redirects errors, challenges assumptions, and drives the AI — rather than accepting whatever it produces.',
+    desc: 'Tracks who steers the conversation. A leading student redirects errors, challenges assumptions, and drives the AI - rather than accepting whatever it produces.',
     sub: [
       { label: 'Initiative Ratio', eg: 'User-initiated direction changes / total turns' },
       { label: 'Verification Frequency', eg: 'Times user verified AI output' },
@@ -130,10 +130,10 @@ const DIMENSIONS = [
 ]
 
 const KB_FILES = [
-  { path: 'CORE/', color: '#C8102E', items: ['framework_core.pdf — full PEI definitions, leading/led-by paradigm', 'scoring_rules.md — exact thresholds, red flag triggers, edge cases'] },
-  { path: 'RUBRICS/', color: '#7C3AED', items: ['rubric_coding.md — verb specificity in code, CCM in code review', 'rubric_debugging.md — isolation, context requirements, TSI signals', 'rubric_data_analysis.md — SQL, pandas, business question framing', 'rubric_casual.md — TSI down-weighted, CLM and RAS signals'] },
-  { path: 'EXEMPLARS/', color: '#0891B2', items: ['exemplars_novice.md — PEI 10–35, annotated why-low breakdowns', 'exemplars_intermediate.md — PEI 40–65, partial improvement patterns', 'exemplars_advanced.md — PEI 70–90, annotated why-high breakdowns'] },
-  { path: 'RESEARCH/', color: '#059669', items: ['appropriate_reliance_2024.pdf — Zhang et al. over-reliance in code gen', 'prompting_patterns_2025.pdf — Mahmoud et al. decomposition → quality', 'ai_literacy_frameworks.pdf — NEU AI Literacy Lab, 2025', 'llm_overreliance_studies.pdf — Chen et al., skill stagnation study'] },
+  { path: 'CORE/', color: '#C8102E', items: ['framework_core.pdf - full PEI definitions, leading/led-by paradigm', 'scoring_rules.md - exact thresholds, red flag triggers, edge cases'] },
+  { path: 'RUBRICS/', color: '#7C3AED', items: ['rubric_coding.md - verb specificity in code, CCM in code review', 'rubric_debugging.md - isolation, context requirements, TSI signals', 'rubric_data_analysis.md - SQL, pandas, business question framing', 'rubric_casual.md - TSI down-weighted, CLM and RAS signals'] },
+  { path: 'EXEMPLARS/', color: '#0891B2', items: ['exemplars_novice.md - PEI 10–35, annotated why-low breakdowns', 'exemplars_intermediate.md - PEI 40–65, partial improvement patterns', 'exemplars_advanced.md - PEI 70–90, annotated why-high breakdowns'] },
+  { path: 'RESEARCH/', color: '#059669', items: ['appropriate_reliance_2024.pdf - Zhang et al. over-reliance in code gen', 'prompting_patterns_2025.pdf - Mahmoud et al. decomposition → quality', 'ai_literacy_frameworks.pdf - NEU AI Literacy Lab, 2025', 'llm_overreliance_studies.pdf - Chen et al., skill stagnation study'] },
 ]
 
 import { useEffect, useRef } from 'react'
@@ -214,7 +214,7 @@ export default function HowItWorks() {
 
         <p className="hiw-reveal" style={{ fontSize: 17, color: 'var(--ink-2)', lineHeight: 1.7, maxWidth: 620, margin: '0 auto 32px' }}>
           Every message you send is analyzed by a two-stage AI pipeline that scores your prompting behavior
-          across five research-grounded dimensions — producing a live Prompting Effectiveness Index (PEI).
+          across five research-grounded dimensions - producing a live Prompting Effectiveness Index (PEI).
         </p>
 
         {/* Attribution card */}
@@ -293,7 +293,7 @@ export default function HowItWorks() {
             The Pipeline at a Glance
           </h2>
           <p style={{ fontSize: 15, color: 'var(--ink-3)', maxWidth: 520, margin: '0 auto' }}>
-            One message triggers two sequential LLM calls and a vector store retrieval — all within ~2.5 seconds.
+            One message triggers two sequential LLM calls and a vector store retrieval - all within ~2.5 seconds.
           </p>
         </div>
 
@@ -309,7 +309,7 @@ export default function HowItWorks() {
               borderRadius: 12, padding: '12px 20px', flex: 1,
             }}>
               <div style={{ fontSize: 10, fontWeight: 700, color: '#9A8E88', letterSpacing: '0.08em', marginBottom: 4 }}>STUDENT</div>
-              <div style={{ fontSize: 13, color: '#F7F3EE', fontFamily: 'monospace' }}>"Debug this auth middleware — JWT token expires but session persists..."</div>
+              <div style={{ fontSize: 13, color: '#F7F3EE', fontFamily: 'monospace' }}>"Debug this auth middleware - JWT token expires but session persists..."</div>
             </div>
             <div style={{ color: '#C8102E', fontSize: 22 }}>→</div>
             <div style={{
@@ -339,7 +339,7 @@ export default function HowItWorks() {
               borderRadius: 12, padding: '14px 18px', flex: 1,
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#E8E4E0' }}>Stage 1 — Domain Detector</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#E8E4E0' }}>Stage 1 - Domain Detector</div>
                 <span style={{ fontSize: 11, background: '#7C3AED22', color: '#A78BFA', borderRadius: 6, padding: '2px 8px' }}>~500ms</span>
               </div>
               <div style={{ fontSize: 12, color: '#9A8E88', marginBottom: 8 }}>gpt-4.1-nano · temperature 1 · structured output</div>
@@ -365,7 +365,7 @@ export default function HowItWorks() {
               borderRadius: 12, padding: '14px 18px', flex: 1,
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#E8E4E0' }}>Stage 2 — PEI Evaluator</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#E8E4E0' }}>Stage 2 - PEI Evaluator</div>
                 <span style={{ fontSize: 11, background: '#C8102E22', color: '#FCA5A5', borderRadius: 6, padding: '2px 8px' }}>~2000ms</span>
               </div>
               <div style={{ fontSize: 12, color: '#9A8E88', marginBottom: 8 }}>gpt-4.1 · FileSearchTool · 8 KB chunks retrieved per call</div>
@@ -384,7 +384,7 @@ export default function HowItWorks() {
         <div className="hiw-reveal" style={{ marginBottom: 32 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
             <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#7C3AED', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: '#fff', flexShrink: 0 }}>1</div>
-            <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: 'var(--ink)' }}>Stage 1 — Domain Detector</h2>
+            <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: 'var(--ink)' }}>Stage 1 - Domain Detector</h2>
           </div>
           <p style={{ fontSize: 15, color: 'var(--ink-2)', lineHeight: 1.7, maxWidth: 700 }}>
             Before scoring, the pipeline must know <em>what kind</em> of work the student is doing.
@@ -397,8 +397,8 @@ export default function HowItWorks() {
           {[
             { domain: 'coding', color: '#7C3AED', bg: '#EDE9FE', signal: 'User is creating something new in code', eg: 'Features, architecture, code review' },
             { domain: 'debugging', color: '#C8102E', bg: '#FDE8EC', signal: 'Something exists and is not working', eg: 'Error messages, stack traces, broken behavior' },
-            { domain: 'data_analysis', color: '#0891B2', bg: '#E0F2FE', signal: 'Subject is data — querying or understanding it', eg: 'SQL, pandas, statistics, ML pipelines' },
-            { domain: 'casual', color: '#059669', bg: '#D1FAE5', signal: 'No code written — learning or discussing', eg: 'Concept questions, theory, explanations' },
+            { domain: 'data_analysis', color: '#0891B2', bg: '#E0F2FE', signal: 'Subject is data - querying or understanding it', eg: 'SQL, pandas, statistics, ML pipelines' },
+            { domain: 'casual', color: '#059669', bg: '#D1FAE5', signal: 'No code written - learning or discussing', eg: 'Concept questions, theory, explanations' },
             { domain: 'creative', color: '#D97706', bg: '#FEF3C7', signal: 'Output is words, ideas, or strategy', eg: 'Writing, design thinking, brainstorming' },
           ].map(({ domain, color, bg, signal, eg }) => (
             <div key={domain} className="hiw-reveal hiw-card" style={{
@@ -421,7 +421,7 @@ export default function HowItWorks() {
           <div style={{ fontSize: 16, marginTop: 1 }}>💡</div>
           <div>
             <strong style={{ fontSize: 13, color: 'var(--ink)' }}>Priority rule:</strong>
-            <span style={{ fontSize: 13, color: 'var(--ink-2)' }}> If both <code style={{ background: 'var(--warm)', padding: '1px 5px', borderRadius: 4 }}>debugging</code> and <code style={{ background: 'var(--warm)', padding: '1px 5px', borderRadius: 4 }}>coding</code> are present, Stage 1 always picks <strong>debugging</strong> — the more specific context. Fallback: if Stage 1 fails, domain defaults to <code style={{ background: 'var(--warm)', padding: '1px 5px', borderRadius: 4 }}>general</code> and Stage 2 proceeds without domain filtering.</span>
+            <span style={{ fontSize: 13, color: 'var(--ink-2)' }}> If both <code style={{ background: 'var(--warm)', padding: '1px 5px', borderRadius: 4 }}>debugging</code> and <code style={{ background: 'var(--warm)', padding: '1px 5px', borderRadius: 4 }}>coding</code> are present, Stage 1 always picks <strong>debugging</strong> - the more specific context. Fallback: if Stage 1 fails, domain defaults to <code style={{ background: 'var(--warm)', padding: '1px 5px', borderRadius: 4 }}>general</code> and Stage 2 proceeds without domain filtering.</span>
           </div>
         </div>
       </section>
@@ -431,7 +431,7 @@ export default function HowItWorks() {
         <div className="hiw-reveal" style={{ marginBottom: 32 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
             <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#C8102E', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, color: '#fff', flexShrink: 0 }}>2</div>
-            <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: 'var(--ink)' }}>Stage 2 — PEI Evaluator</h2>
+            <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: 'var(--ink)' }}>Stage 2 - PEI Evaluator</h2>
           </div>
           <p style={{ fontSize: 15, color: 'var(--ink-2)', lineHeight: 1.7, maxWidth: 700 }}>
             The evaluator agent receives the domain label from Stage 1, queries the vector knowledge base
@@ -459,7 +459,7 @@ export default function HowItWorks() {
           <div style={{ marginTop: 12 }}><span style={{ color: '#A78BFA' }}>INSTRUCTIONS:</span></div>
           <div style={{ paddingLeft: 16, color: '#9A8E88' }}>
             1. Retrieve the debugging rubric and exemplars from knowledge base<br/>
-            2. Score using PEI framework — scores are absolute, not relative to history<br/>
+            2. Score using PEI framework - scores are absolute, not relative to history<br/>
             3. Personalize suggestions using student's historical weak areas<br/>
             4. Flag if student is repeating a known red flag pattern<br/>
             5. Note if student shows improvement vs historical baseline
@@ -468,7 +468,7 @@ export default function HowItWorks() {
           <div style={{ paddingLeft: 16, color: '#9A8E88' }}>
             [Turn 1] USER: ...<br/>
             [Turn 2] USER: ...<br/>
-            [Turn 3] USER: (latest — weight most heavily for PSQ)
+            [Turn 3] USER: (latest - weight most heavily for PSQ)
           </div>
         </div>
 
@@ -476,9 +476,9 @@ export default function HowItWorks() {
           background: 'var(--white)', border: '1.5px solid var(--border)',
           borderRadius: 14, padding: '20px 24px', marginBottom: 20,
         }}>
-          <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--ink)', marginBottom: 12 }}>Vector Store Retrieval — What gets pulled in</div>
+          <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--ink)', marginBottom: 12 }}>Vector Store Retrieval - What gets pulled in</div>
           <div style={{ fontSize: 12, color: 'var(--ink-3)', marginBottom: 14 }}>
-            The domain-hinted prompt causes semantic retrieval of the right files naturally — no manual routing.
+            The domain-hinted prompt causes semantic retrieval of the right files naturally - no manual routing.
           </div>
           {[
             { score: '0.94', file: 'rubric_debugging.md', section: 'isolation & hypothesis section' },
@@ -492,7 +492,7 @@ export default function HowItWorks() {
               <div style={{ width: 38, fontSize: 12, fontWeight: 700, color: '#059669', fontFamily: 'monospace', flexShrink: 0 }}>{score}</div>
               <div style={{ flex: 1 }}>
                 <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)', fontFamily: 'monospace' }}>{file}</span>
-                <span style={{ fontSize: 12, color: 'var(--ink-3)' }}> — {section}</span>
+                <span style={{ fontSize: 12, color: 'var(--ink-3)' }}> - {section}</span>
               </div>
             </div>
           ))}
@@ -610,7 +610,7 @@ export default function HowItWorks() {
               The Knowledge Base
             </h2>
             <p style={{ fontSize: 15, color: 'var(--ink-3)', maxWidth: 580, margin: '0 auto' }}>
-              Stage 2 is not prompted with raw scoring rules — it retrieves them from a structured vector store
+              Stage 2 is not prompted with raw scoring rules - it retrieves them from a structured vector store
               at runtime. This grounds every evaluation in peer-reviewed rubrics and real exemplars.
             </p>
           </div>
@@ -657,7 +657,7 @@ export default function HowItWorks() {
               <div>
                 <div style={{ fontSize: 11, fontWeight: 600, color: '#C8102E', marginBottom: 4 }}>Bad</div>
                 {['doc1.pdf', 'rubric.md', 'data.txt'].map(f => (
-                  <div key={f} style={{ fontSize: 12, color: 'var(--ink-3)', fontFamily: 'monospace', marginBottom: 3 }}>✗ {f} — too generic for semantic search</div>
+                  <div key={f} style={{ fontSize: 12, color: 'var(--ink-3)', fontFamily: 'monospace', marginBottom: 3 }}>✗ {f} - too generic for semantic search</div>
                 ))}
               </div>
             </div>
@@ -673,7 +673,7 @@ export default function HowItWorks() {
           </h2>
           <p style={{ fontSize: 15, color: 'var(--ink-2)', lineHeight: 1.7, maxWidth: 640 }}>
             The evaluator automatically surfaces patterns that indicate a student is developing
-            unhealthy AI reliance habits — before they become entrenched.
+            unhealthy AI reliance habits - before they become entrenched.
           </p>
         </div>
 
@@ -681,8 +681,8 @@ export default function HowItWorks() {
           {[
             { title: 'Persistent Over-Reliance', trigger: 'RAS < 0.3 across 3+ consecutive turns', risk: 'Student accepts AI output without any critical evaluation' },
             { title: 'Multi-Turn Degradation', trigger: 'PEI drops >50% from turn 1 to turn 5', risk: 'Student loses focus or structure as conversation deepens' },
-            { title: 'Premature Acceptance', trigger: 'Incorrect AI suggestions accepted >40% of turns', risk: 'Student is not verifying — outputs go directly to production' },
-            { title: 'Zero Verification', trigger: 'No verification attempts across 5+ code generations', risk: 'Critical — especially in debugging and coding domains' },
+            { title: 'Premature Acceptance', trigger: 'Incorrect AI suggestions accepted >40% of turns', risk: 'Student is not verifying - outputs go directly to production' },
+            { title: 'Zero Verification', trigger: 'No verification attempts across 5+ code generations', risk: 'Critical - especially in debugging and coding domains' },
           ].map(({ title, trigger, risk }) => (
             <div key={title} className="hiw-reveal" style={{
               background: '#FFF5F5', border: '1.5px solid #FED7D7',
@@ -742,9 +742,9 @@ export default function HowItWorks() {
             </a>
             {' '}at Northeastern University<br />
             <strong style={{ color: '#C8C0B8' }}>Prof. John P. Wihbey</strong>
-            <span style={{ color: '#6A6460' }}> — Associate Professor &amp; Director, AIMES Lab · Special Advisor for Strategic AI Initiatives</span><br />
+            <span style={{ color: '#6A6460' }}> - Associate Professor &amp; Director, AIMES Lab · Special Advisor for Strategic AI Initiatives</span><br />
             <strong style={{ color: '#C8C0B8' }}>Yash Phalle</strong>
-            <span style={{ color: '#6A6460' }}> — Research Assistant, AIMES Lab · MS AI, Khoury College of Computer Sciences</span><br />
+            <span style={{ color: '#6A6460' }}> - Research Assistant, AIMES Lab · MS AI, Khoury College of Computer Sciences</span><br />
             <span style={{ fontStyle: 'italic' }}>A research initiative building AI-ready Huskies through real-time prompting feedback and evidence-based skill evaluation</span>
           </div>
         </div>

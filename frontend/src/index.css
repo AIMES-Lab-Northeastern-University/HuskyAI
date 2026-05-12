@@ -61,7 +61,7 @@
 }
 .live-dot { animation: livePulse 2s infinite; }
 
-/* Markdown in chat — light theme */
+/* Markdown in chat - light theme */
 .prose-chat pre {
   background: #EDEAE4;
   border: 1.5px solid #E7E0D8;

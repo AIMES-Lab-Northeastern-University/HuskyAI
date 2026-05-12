@@ -6,13 +6,13 @@ import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 function fmt(iso) {
-  if (!iso) return '—'
+  if (!iso) return '-'
   try { return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) }
   catch { return iso }
 }
 
 function fmtDate(iso) {
-  if (!iso) return '—'
+  if (!iso) return '-'
   try { return new Date(iso).toLocaleDateString(undefined, { dateStyle: 'medium' }) }
   catch { return iso }
 }
@@ -34,7 +34,7 @@ function StatTile({ label, value }) {
   return (
     <div className="bg-[#FDFCFB] rounded-[12px] p-4" style={TILE}>
       <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{label}</div>
-      <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '26px', color: '#16120E', marginTop: '4px' }}>{value ?? '—'}</div>
+      <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '26px', color: '#16120E', marginTop: '4px' }}>{value ?? '-'}</div>
     </div>
   )
 }
@@ -98,7 +98,7 @@ function UserActivityModal({ userId, onClose }) {
                   ['Chats', data.workspace.conversations],
                   ['Turns', data.workspace.turns_total],
                   ['Scored', data.workspace.eval_count],
-                  ['Avg PEI', data.workspace.avg_eval_pei != null ? data.workspace.avg_eval_pei.toFixed(1) : '—'],
+                  ['Avg PEI', data.workspace.avg_eval_pei != null ? data.workspace.avg_eval_pei.toFixed(1) : '-'],
                 ].map(([k, v]) => (
                   <div key={k} style={{ background: '#F7F3EE', borderRadius: '8px', padding: '10px 8px', textAlign: 'center', border: '1px solid #E7E0D8' }}>
                     <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '20px', color: '#16120E' }}>{v}</div>
@@ -113,7 +113,7 @@ function UserActivityModal({ userId, onClose }) {
                 {[
                   ['Started', data.challenge_sessions.sessions_started],
                   ['Completed', data.challenge_sessions.sessions_completed],
-                  ['Avg PEI', data.challenge_sessions.avg_pei != null ? data.challenge_sessions.avg_pei.toFixed(1) : '—'],
+                  ['Avg PEI', data.challenge_sessions.avg_pei != null ? data.challenge_sessions.avg_pei.toFixed(1) : '-'],
                 ].map(([k, v]) => (
                   <div key={k} style={{ background: '#FAFAF8', borderRadius: '8px', padding: '10px 8px', textAlign: 'center', border: '1px solid #EDE8E2' }}>
                     <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '20px', color: '#16120E' }}>{v}</div>
@@ -231,7 +231,7 @@ function ClassroomDetailModal({ classroomId, onClose }) {
                   ['Students', data.analytics.student_count],
                   ['Started', data.analytics.sessions_started],
                   ['Completed', data.analytics.sessions_completed],
-                  ['Avg PEI', data.analytics.avg_pei != null ? data.analytics.avg_pei.toFixed(1) : '—'],
+                  ['Avg PEI', data.analytics.avg_pei != null ? data.analytics.avg_pei.toFixed(1) : '-'],
                 ].map(([k, v]) => (
                   <div key={k} style={{ background: '#F7F3EE', borderRadius: '8px', padding: '10px 8px', textAlign: 'center', border: '1px solid #E7E0D8' }}>
                     <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '20px', color: '#16120E' }}>{v}</div>
@@ -451,12 +451,12 @@ export default function Admin() {
                           ['Conversations', ax.conversations],
                           ['Messages', ax.messages],
                           ['Eval rows', ax.eval_rows],
-                          ['Avg eval PEI', ax.avg_eval_pei != null ? Number(ax.avg_eval_pei).toFixed(1) : '—'],
+                          ['Avg eval PEI', ax.avg_eval_pei != null ? Number(ax.avg_eval_pei).toFixed(1) : '-'],
                           ['Student seats', ax.student_memberships],
                           ['New users (7d)', ax.users_joined_last_7_days],
                           ['Sessions started', ax.challenge_sessions_started],
                           ['Sessions done', ax.challenge_sessions_completed],
-                          ['Avg session PEI', ax.avg_challenge_session_pei != null ? Number(ax.avg_challenge_session_pei).toFixed(1) : '—'],
+                          ['Avg session PEI', ax.avg_challenge_session_pei != null ? Number(ax.avg_challenge_session_pei).toFixed(1) : '-'],
                           ['Active sections', ax.active_classrooms],
                           ['Inactive sections', ax.inactive_classrooms],
                         ].map(([label, n]) => <StatTile key={label} label={label} value={n} />)}
@@ -573,7 +573,7 @@ export default function Admin() {
               {!overviewLoading && overviewData?.classrooms?.length > 0 && (
                 <div className="bg-[#FDFCFB] rounded-[14px] overflow-hidden" style={{ ...TILE, maxWidth: '820px' }}>
                   <div style={{ padding: '12px 18px', borderBottom: '1px solid #F7F3EE', fontSize: '12px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
-                    Active sections — click to drill in
+                    Active sections - click to drill in
                   </div>
                   {overviewData.classrooms.map((row, i) => (
                     <div

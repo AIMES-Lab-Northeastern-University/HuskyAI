@@ -28,7 +28,7 @@ function PeiRing({ score }) {
       </svg>
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
         <span style={{ fontFamily: "'Instrument Serif', serif", fontSize: '28px', color: '#16120E', lineHeight: 1 }}>
-          {display != null ? display : '—'}
+          {display != null ? display : '-'}
         </span>
         <span style={{ fontSize: '10px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.5px', marginTop: '2px' }}>PEI Score</span>
       </div>
@@ -329,7 +329,7 @@ export default function Progress() {
                         PEI {item.pei}
                       </div>
                     ) : (
-                      <span style={{ fontSize: '11px', color: '#9A948E' }}>—</span>
+                      <span style={{ fontSize: '11px', color: '#9A948E' }}>-</span>
                     )}
                   </div>
                 ))}

@@ -362,7 +362,7 @@ export default function Settings() {
                         color: '#6B6560',
                         boxSizing: 'border-box',
                       }}>
-                        Demo — sign in to sync with your real classes
+                        Demo - sign in to sync with your real classes
                       </div>
                     ) : (
                       <div style={{
@@ -378,7 +378,7 @@ export default function Settings() {
                       }}>
                         {myClassrooms.length > 0
                           ? myClassrooms.map(c => `${c.name} (${c.role})`).join(' · ')
-                          : 'Not enrolled — join a class with the code above, or use the Classroom page.'}
+                          : 'Not enrolled - join a class with the code above, or use the Classroom page.'}
                       </div>
                     )}
                   </div>

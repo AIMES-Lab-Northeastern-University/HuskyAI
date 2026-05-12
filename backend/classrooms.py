@@ -178,6 +178,41 @@ async def join_classroom(
     return {"status": "joined", "classroom_id": room.id, "name": room.name}
 
 
+@router.post("/{classroom_id}/join-listed")
+async def join_listed_classroom(
+    classroom_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Join a section directly from the public directory. Only sections the
+    instructor marked listed_in_directory=True can be joined this way; unlisted
+    sections still require the private join code via POST /classrooms/join."""
+    room = await db.get(Classroom, classroom_id)
+    if not room or not room.is_active:
+        raise HTTPException(status_code=404, detail="Section not found")
+    if not room.listed_in_directory:
+        raise HTTPException(status_code=403, detail="This section is not open for direct join — ask the instructor for a join code")
+
+    existing = await db.execute(
+        select(ClassroomMembership).where(
+            ClassroomMembership.user_id == user_id,
+            ClassroomMembership.classroom_id == room.id,
+        )
+    )
+    if existing.scalar_one_or_none():
+        return {"status": "already_member", "classroom_id": room.id, "name": room.name}
+
+    db.add(
+        ClassroomMembership(
+            user_id=user_id,
+            classroom_id=room.id,
+            role="student",
+        )
+    )
+    await db.commit()
+    return {"status": "joined", "classroom_id": room.id, "name": room.name}
+
+
 @router.get("/me")
 async def list_my_classrooms(
     user_id: str = Depends(get_current_user),

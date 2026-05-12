@@ -1,4 +1,4 @@
-/** Static demo content — no API keys or DB required */
+/** Static demo content - no API keys or DB required */
 
 export const DEMO_USER = { name: 'Demo Student', email: 'demo@husky.edu' }
 
@@ -24,7 +24,7 @@ export const SAMPLE_EVAL = {
   ],
   red_flags: [],
   strengths: ['You asked a focused follow-up after the first reply.'],
-  turn_summary: 'Demo turn — sample evaluation for product tour.',
+  turn_summary: 'Demo turn - sample evaluation for product tour.',
 }
 
 export const DEMO_CHALLENGE_CONTEXTS = {
@@ -39,7 +39,7 @@ export const DEMO_CHALLENGE_CONTEXTS = {
   campaign: {
     title: 'Session 1: Audience & message',
     goal: 'Define who you are trying to reach and the core message.',
-    brief: 'Sample creative brief for the demo — outline stakeholders and constraints.',
+    brief: 'Sample creative brief for the demo - outline stakeholders and constraints.',
     seed_question: 'Who is the primary audience, and what behavior do you want to change?',
   },
   'data-story': {
@@ -64,7 +64,7 @@ export const DEMO_CHALLENGE_LIST = [
     id: 'demo-debug-app',
     title: 'Debug a Failing Web App',
     description:
-      'A production web application is broken. Practice triaging symptoms and using AI as a partner — sample challenge.',
+      'A production web application is broken. Practice triaging symptoms and using AI as a partner - sample challenge.',
     category: 'Technical',
     difficulty: 'Beginner',
     week: 1,
@@ -77,7 +77,7 @@ export const DEMO_CHALLENGE_LIST = [
     id: 'demo-campaign',
     title: 'Design a Public Awareness Campaign',
     description:
-      'Brainstorm and refine a multi-channel campaign with AI — sample creative challenge.',
+      'Brainstorm and refine a multi-channel campaign with AI - sample creative challenge.',
     category: 'Creative & Strategy',
     difficulty: 'Beginner',
     week: 2,
@@ -90,7 +90,7 @@ export const DEMO_CHALLENGE_LIST = [
     id: 'demo-data-story',
     title: 'Tell a Story with Data',
     description:
-      'Turn a dataset into a clear narrative and visuals — sample data literacy challenge.',
+      'Turn a dataset into a clear narrative and visuals - sample data literacy challenge.',
     category: 'Data & Analysis',
     difficulty: 'Intermediate',
     week: 3,
@@ -136,7 +136,7 @@ export function getDemoChallengeDetail(id) {
 
 export function cannedAssistantReply(userMessage) {
   return (
-    'Here is a **sample coach response** (demo mode — no live model):\n\n' +
+    'Here is a **sample coach response** (demo mode - no live model):\n\n' +
     '- Restate what you are trying to achieve in one sentence.\n' +
     '- List what you already know vs. what is unknown.\n' +
     '- Ask yourself what evidence would change your next step.\n\n' +

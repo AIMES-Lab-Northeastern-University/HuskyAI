@@ -69,7 +69,7 @@ function DemoClassroomView({ navigate, onLogout }) {
               }}>
                 <div>
                   <div style={{ fontSize: '13px', fontWeight: 600, color: '#fff', marginBottom: '2px' }}>
-                    Live comparison — Week 4
+                    Live comparison - Week 4
                   </div>
                   <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.5)' }}>
                     Section A vs. Partner Class
@@ -131,7 +131,7 @@ function DemoClassroomView({ navigate, onLogout }) {
                   <div>
                     <div style={{ fontSize: '11px', fontWeight: 700, color: '#D97706', marginBottom: '3px' }}>Class insight</div>
                     <div style={{ fontSize: '12px', color: '#92400E', lineHeight: 1.6 }}>
-                      Your class is 0.3 points behind the partner class this week. Focus on Refinement dimension — it has the largest gap and biggest potential impact on your PEI.
+                      Your class is 0.3 points behind the partner class this week. Focus on Refinement dimension - it has the largest gap and biggest potential impact on your PEI.
                     </div>
                   </div>
                 </div>
@@ -194,6 +194,13 @@ export default function Classroom() {
   const [creatingSection, setCreatingSection] = useState(false)
   const [createSectionMsg, setCreateSectionMsg] = useState('')
   const [createdJoinCode, setCreatedJoinCode] = useState('')
+  const [browseQuery, setBrowseQuery] = useState('')
+
+  const goBrowse = (e) => {
+    if (e) e.preventDefault()
+    const q = browseQuery.trim()
+    navigate(`${pathPrefix}/classroom/browse${q ? `?q=${encodeURIComponent(q)}` : ''}`)
+  }
 
   const needInstructorHint = Boolean(location.state?.needInstructor)
   const instructingClassrooms = classrooms.filter(c => c.role === 'instructor' || c.role === 'admin')
@@ -439,15 +446,7 @@ export default function Classroom() {
               Join with your instructor’s code
             </div>
             <p style={{ fontSize: '13px', color: '#4A4440', marginBottom: '12px', lineHeight: 1.55 }}>
-              Enter the code your instructor shared (letters and numbers). You can also{' '}
-              <button
-                type="button"
-                onClick={() => navigate(`${pathPrefix}/classroom/browse`)}
-                style={{ color: '#C8102E', fontWeight: 600, background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
-              >
-                browse listed sections
-              </button>
-              {' '}for names only — codes stay private until your instructor gives you one.
+              Enter the code your instructor shared (letters and numbers).
             </p>
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
               <input
@@ -489,6 +488,68 @@ export default function Classroom() {
                 {joinMsg}
               </div>
             )}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', margin: '18px 0 14px' }}>
+              <div style={{ flex: 1, height: '1px', background: '#E7E0D8' }} />
+              <span style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', letterSpacing: '0.08em' }}>OR</span>
+              <div style={{ flex: 1, height: '1px', background: '#E7E0D8' }} />
+            </div>
+
+            <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: '8px' }}>
+              Find an open section by name
+            </div>
+            <form onSubmit={goBrowse} style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+              <div style={{ position: 'relative', flex: '1 1 200px', minWidth: '180px' }}>
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#9A948E"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+                >
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+                <input
+                  type="search"
+                  value={browseQuery}
+                  onChange={e => setBrowseQuery(e.target.value)}
+                  placeholder="Search sections by name…"
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px 10px 34px',
+                    borderRadius: '8px',
+                    border: '1.5px solid #E7E0D8',
+                    fontSize: '14px',
+                    background: '#FDFCFB',
+                    outline: 'none',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+              <button
+                type="submit"
+                style={{
+                  background: '#16120E',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '8px',
+                  padding: '10px 18px',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                Browse sections
+              </button>
+            </form>
+            <p style={{ marginTop: '8px', fontSize: '12px', color: '#9A948E', lineHeight: 1.55 }}>
+              Listed sections only; you can join them directly. Unlisted sections still need a code.
+            </p>
           </div>
           )}
 
@@ -501,7 +562,7 @@ export default function Classroom() {
                 Create a section (you become the instructor)
               </div>
               <p style={{ fontSize: '13px', color: '#4A4440', marginBottom: '14px', lineHeight: 1.55 }}>
-                This is not the same as joining with a code — you’ll get a new join code to share with students. After creating, use <strong>Instructor</strong> in the sidebar to assign challenges.
+                This is not the same as joining with a code - you’ll get a new join code to share with students. After creating, use <strong>Instructor</strong> in the sidebar to assign challenges.
               </p>
               <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', fontSize: '13px', color: '#4A4440', cursor: 'pointer' }}>
                 <input
@@ -519,7 +580,7 @@ export default function Classroom() {
                   onChange={e => setNewSectionTest(e.target.checked)}
                   style={{ accentColor: '#C8102E' }}
                 />
-                Test section — auto-enable “try as student” for you so assigned challenges appear on your Challenges page
+                Test section - auto-enable “try as student” for you so assigned challenges appear on your Challenges page
               </label>
               <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
                 <input
