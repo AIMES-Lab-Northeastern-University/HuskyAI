@@ -327,7 +327,13 @@ export default function Workspace() {
         streamBuffer.current = ''; setStreaming('')
         break
       case 'eval_start': setIsEvaluating(true); break
-      case 'eval':       setIsEvaluating(false); setEvalData(data.data); setTurnCount(t => t + 1); break
+      case 'eval':
+        setIsEvaluating(false)
+        setEvalData(data.data)
+        setTurnCount(t => t + 1)
+        // Tell the Sidebar (and anyone else who cares) the Husky Score may have shifted
+        try { window.dispatchEvent(new CustomEvent('husky:eval')) } catch {}
+        break
       case 'eval_error': setIsEvaluating(false); break
       case 'error':
         setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)

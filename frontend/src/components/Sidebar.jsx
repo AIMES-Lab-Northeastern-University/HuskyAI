@@ -95,7 +95,10 @@ export default function Sidebar({ onLogout }) {
     return () => { cancelled = true }
   }, [pathPrefix, location.pathname])
 
-  // Live Husky Score (best PEI across challenges) + Challenges nav badge (in-progress count)
+  // Live Husky Score (avg of every per-turn PEI across the user's challenge work)
+  // and Challenges nav badge (in-progress count). Refreshes on:
+  //   - mount + route change
+  //   - 'husky:eval' window event dispatched after a Workspace eval
   useEffect(() => {
     if (pathPrefix) return
     const token = localStorage.getItem('token')
@@ -105,23 +108,45 @@ export default function Sidebar({ onLogout }) {
       return
     }
     let cancelled = false
-    ;(async () => {
+    let abort = null
+
+    const refresh = async () => {
       try {
-        const r = await fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() } })
-        if (!r.ok) return
-        const data = await r.json().catch(() => [])
-        if (cancelled || !Array.isArray(data)) return
-        const peis = data.map(c => c.best_pei).filter(p => p != null && !Number.isNaN(p))
-        setBestPei(peis.length ? Math.round(Math.max(...peis)) : null)
-        const inProgress = data.filter(
-          c => c.sessions_completed > 0 && c.sessions_completed < c.total_sessions,
-        ).length
-        setActiveCount(inProgress)
+        abort = new AbortController()
+        const [scoreR, listR] = await Promise.all([
+          fetch(`${API_URL}/challenges/me/husky-score`, { headers: { ...authHeaders() }, signal: abort.signal }),
+          fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() }, signal: abort.signal }),
+        ])
+        if (cancelled) return
+        if (scoreR.ok) {
+          const score = await scoreR.json().catch(() => null)
+          const v = score?.husky_score
+          setBestPei(v != null && !Number.isNaN(v) ? Math.round(Number(v)) : null)
+        }
+        if (listR.ok) {
+          const data = await listR.json().catch(() => [])
+          if (Array.isArray(data)) {
+            const inProgress = data.filter(
+              c => c.sessions_completed > 0 && c.sessions_completed < c.total_sessions,
+            ).length
+            setActiveCount(inProgress)
+          }
+        }
       } catch {
         // non-fatal: sidebar still renders
       }
-    })()
-    return () => { cancelled = true }
+    }
+
+    refresh()
+
+    const onEval = () => { if (!cancelled) refresh() }
+    window.addEventListener('husky:eval', onEval)
+
+    return () => {
+      cancelled = true
+      window.removeEventListener('husky:eval', onEval)
+      if (abort) try { abort.abort() } catch {}
+    }
   }, [pathPrefix, location.pathname])
 
   const navGroups = useMemo(

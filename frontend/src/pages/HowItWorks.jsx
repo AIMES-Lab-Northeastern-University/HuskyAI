@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom'
+import Sidebar from '../components/Sidebar'
 
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap');
@@ -141,6 +142,7 @@ import { useEffect, useRef } from 'react'
 export default function HowItWorks() {
   const navigate = useNavigate()
   const styleRef = useRef(false)
+  const isLoggedIn = typeof window !== 'undefined' && !!localStorage.getItem('token')
 
   useEffect(() => {
     if (!styleRef.current) {
@@ -161,36 +163,42 @@ export default function HowItWorks() {
   return (
     <div style={{ background: 'var(--cream)', minHeight: '100vh', fontFamily: "'DM Sans', sans-serif" }}>
 
-      {/* ── Navbar ── */}
-      <nav style={{
-        position: 'sticky', top: 0, zIndex: 100,
-        background: 'rgba(253,252,251,0.92)', backdropFilter: 'blur(12px)',
-        borderBottom: '1.5px solid var(--border)',
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '0 40px', height: '58px',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
-          onClick={() => navigate('/')}>
-          <div style={{
-            width: 32, height: 32, background: 'var(--red)', borderRadius: 9,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
-            <PawIcon size={16} color="white" />
-          </div>
-          <span style={{ fontFamily: "'Instrument Serif', serif", fontSize: 20, color: 'var(--ink)' }}>Husky AI</span>
-        </div>
+      {isLoggedIn && <Sidebar />}
 
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button className="hiw-back" onClick={() => navigate('/')}
-            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, color: 'var(--ink-3)', display: 'flex', alignItems: 'center', gap: 5, transition: 'color 0.15s' }}>
-            ← Back to Home
-          </button>
-          <button onClick={() => navigate('/login')}
-            style={{ background: 'var(--red)', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
-            Get Started
-          </button>
-        </div>
-      </nav>
+      <div style={{ marginLeft: isLoggedIn ? '220px' : 0 }}>
+
+      {!isLoggedIn && (
+        /* ── Navbar (public only) ── */
+        <nav style={{
+          position: 'sticky', top: 0, zIndex: 100,
+          background: 'rgba(253,252,251,0.92)', backdropFilter: 'blur(12px)',
+          borderBottom: '1.5px solid var(--border)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '0 40px', height: '58px',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
+            onClick={() => navigate('/')}>
+            <div style={{
+              width: 32, height: 32, background: 'var(--red)', borderRadius: 9,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <PawIcon size={16} color="white" />
+            </div>
+            <span style={{ fontFamily: "'Instrument Serif', serif", fontSize: 20, color: 'var(--ink)' }}>Husky AI</span>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button className="hiw-back" onClick={() => navigate('/')}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, color: 'var(--ink-3)', display: 'flex', alignItems: 'center', gap: 5, transition: 'color 0.15s' }}>
+              ← Back to Home
+            </button>
+            <button onClick={() => navigate('/login')}
+              style={{ background: 'var(--red)', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+              Get Started
+            </button>
+          </div>
+        </nav>
+      )}
 
       {/* ── Hero ── */}
       <section style={{ maxWidth: 820, margin: '0 auto', padding: '80px 24px 48px', textAlign: 'center' }}>
@@ -717,12 +725,12 @@ export default function HowItWorks() {
           <p style={{ fontSize: 16, color: '#9A8E88', maxWidth: 460, margin: '0 auto 32px', lineHeight: 1.65 }}>
             Every prompt you write is a data point. Start a challenge and watch your scores evolve in real time.
           </p>
-          <button onClick={() => navigate('/login')} style={{
+          <button onClick={() => navigate(isLoggedIn ? '/challenges' : '/login')} style={{
             background: 'var(--red)', color: '#fff', border: 'none',
             borderRadius: 10, padding: '14px 32px', fontSize: 15, fontWeight: 600,
             cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8,
           }}>
-            Get Started <ArrowRight size={15} />
+            {isLoggedIn ? 'Try a challenge' : 'Get Started'} <ArrowRight size={15} />
           </button>
         </div>
 
@@ -750,6 +758,7 @@ export default function HowItWorks() {
         </div>
       </section>
 
+      </div>
     </div>
   )
 }

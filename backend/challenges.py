@@ -26,6 +26,7 @@ from database import (
     Classroom,
     ClassroomChallenge,
     ClassroomMembership,
+    EvalResult,
     InstructorTestEnrollment,
     User,
     UserChallengeSession,
@@ -945,6 +946,39 @@ async def list_challenges(
         })
 
     return out
+
+
+@router.get("/me/husky-score")
+async def my_husky_score(
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Husky Score = average of every per-turn PEI across all the user's challenge
+    conversations (free practice excluded). Each turn weighs equally."""
+    stmt = (
+        select(
+            func.avg(EvalResult.pei),
+            func.count(EvalResult.id),
+            func.count(func.distinct(UserChallengeSession.id)),
+        )
+        .join(
+            UserChallengeSession,
+            UserChallengeSession.conversation_id == EvalResult.conversation_id,
+        )
+        .where(
+            UserChallengeSession.user_id == user_id,
+            EvalResult.pei.is_not(None),
+        )
+    )
+    row = (await db.execute(stmt)).one_or_none()
+    if not row:
+        return {"husky_score": None, "turns_counted": 0, "sessions_counted": 0}
+    avg_pei, turn_count, session_count = row
+    return {
+        "husky_score": round(float(avg_pei), 1) if avg_pei is not None else None,
+        "turns_counted": int(turn_count or 0),
+        "sessions_counted": int(session_count or 0),
+    }
 
 
 @router.post("", status_code=201)
