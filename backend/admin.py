@@ -5,11 +5,13 @@ Set PLATFORM_ADMIN_EMAILS=comma@emails in .env; synced on app startup.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -381,3 +383,86 @@ async def classroom_detail(
             "avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# PEI evaluator benchmark - admin tab
+# ---------------------------------------------------------------------------
+
+class RunBenchmarkBody(BaseModel):
+    evaluator: str  # "v1" | "v2" | "v3"
+    repeats: int
+
+
+@router.post("/benchmark/run")
+async def admin_benchmark_run(
+    body: RunBenchmarkBody,
+    _: str = Depends(require_platform_admin),
+):
+    """Stream benchmark progress as newline-delimited JSON events. Long-running
+    (2-10 min). The final event of type=done carries the full report; intermediate
+    events of type=progress arrive as each (case, repeat) finishes."""
+    evaluator = (body.evaluator or "").strip().lower()
+    if evaluator not in ("v1", "v2", "v3"):
+        raise HTTPException(status_code=400, detail="evaluator must be one of: v1, v2, v3")
+    try:
+        repeats = int(body.repeats)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="repeats must be an integer")
+    if repeats < 1 or repeats > 10:
+        raise HTTPException(status_code=400, detail="repeats must be between 1 and 10")
+
+    async def _stream():
+        try:
+            # Import lazily so admin module doesn't pay agent-SDK boot cost.
+            from scripts.run_eval_benchmark import run_benchmark_stream
+        except Exception as e:  # pragma: no cover
+            log.error("Could not import benchmark runner: %s", e, exc_info=True)
+            yield json.dumps({"type": "error", "error": f"Benchmark runner unavailable: {e}"}) + "\n"
+            return
+        try:
+            async for event in run_benchmark_stream(evaluator, repeats):
+                yield json.dumps(event) + "\n"
+        except Exception as e:
+            log.error("Benchmark run failed: %s", e, exc_info=True)
+            yield json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}) + "\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/x-ndjson",
+        headers={
+            # Disable buffering on proxies that respect these headers (nginx, etc.)
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/benchmark/reports")
+async def admin_benchmark_reports(
+    _: str = Depends(require_platform_admin),
+):
+    """List prior benchmark reports newest-first."""
+    try:
+        from scripts.run_eval_benchmark import list_reports
+    except Exception as e:
+        log.error("Could not import benchmark runner: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Benchmark runner unavailable: {e}")
+    return list_reports()
+
+
+@router.get("/benchmark/reports/{report_id}")
+async def admin_benchmark_report_detail(
+    report_id: str,
+    _: str = Depends(require_platform_admin),
+):
+    """Return the full report JSON for one prior run."""
+    try:
+        from scripts.run_eval_benchmark import load_report
+    except Exception as e:
+        log.error("Could not import benchmark runner: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Benchmark runner unavailable: {e}")
+    rep = load_report(report_id)
+    if rep is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return rep

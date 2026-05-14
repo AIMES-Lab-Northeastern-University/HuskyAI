@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 import InviteTemplate from './InviteTemplate'
+import AdminBenchmark from './AdminBenchmark'
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -397,6 +398,7 @@ export default function Admin() {
     { id: 'users', label: 'Users' },
     { id: 'classrooms', label: 'Classrooms' },
     { id: 'invite', label: 'Invite' },
+    { id: 'benchmark', label: 'Benchmark' },
   ]
 
   return (
@@ -567,6 +569,9 @@ export default function Admin() {
 
           {/* ── INVITE TAB ── */}
           {activeTab === 'invite' && <InviteTemplate />}
+
+          {/* ── BENCHMARK TAB ── */}
+          {activeTab === 'benchmark' && <AdminBenchmark />}
 
           {/* ── CLASSROOMS TAB ── */}
           {activeTab === 'classrooms' && (
