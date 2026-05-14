@@ -906,6 +906,11 @@ async def classroom_student_activity(
 DEMO_SECTION_NAME = "Husky Test Section"
 DEFAULT_SEED_JOIN_CODE = "HUSKYDMX"
 DEMO_CHALLENGE_TITLE = "Debug a Failing Web App"
+
+# --- Seeded pilot section (join code + all active challenges) for pilot invitations ---
+
+PILOT_SECTION_NAME = "HuskyAI Pilot"
+DEFAULT_PILOT_JOIN_CODE = "TRYHUSKY"
 SEED_INSTRUCTOR_EMAIL = os.getenv("SEED_INSTRUCTOR_EMAIL", "husky.test.instructor@example.com").strip().lower()
 SEED_INSTRUCTOR_NAME = os.getenv("SEED_INSTRUCTOR_NAME", "Husky Test Instructor").strip()
 SEED_INSTRUCTOR_PASSWORD = os.getenv("SEED_INSTRUCTOR_PASSWORD", "TestHusky_Demo1")
@@ -1004,4 +1009,98 @@ async def seed_demo_classroom() -> None:
             DEMO_CHALLENGE_TITLE,
             room.id,
             code,
+        )
+
+
+async def seed_pilot_classroom() -> None:
+    """Ensure a 'HuskyAI Pilot' section exists with every active challenge linked.
+    This is the section the Admin -> Invite email template points to by default."""
+    try:
+        code = _validate_seed_join_code(os.getenv("SEED_PILOT_CODE", DEFAULT_PILOT_JOIN_CODE))
+    except ValueError as e:
+        log.warning("seed_pilot_classroom skipped: %s", e)
+        return
+
+    async with AsyncSessionLocal() as db:
+        # Reuse the seeded test instructor as the owner
+        r_user = await db.execute(select(User).where(User.email == SEED_INSTRUCTOR_EMAIL))
+        instructor = r_user.scalar_one_or_none()
+        if not instructor:
+            log.warning(
+                "seed_pilot_classroom skipped: seed instructor %s missing - ensure seed_demo_classroom() ran first",
+                SEED_INSTRUCTOR_EMAIL,
+            )
+            return
+
+        r_room = await db.execute(select(Classroom).where(Classroom.join_code == code))
+        room = r_room.scalar_one_or_none()
+        if not room:
+            room = Classroom(
+                name=PILOT_SECTION_NAME,
+                join_code=code,
+                instructor_user_id=instructor.id,
+                listed_in_directory=True,
+                is_test_section=True,
+            )
+            db.add(room)
+            await db.flush()
+            db.add(
+                ClassroomMembership(
+                    user_id=instructor.id,
+                    classroom_id=room.id,
+                    role="instructor",
+                )
+            )
+            log.info("Created pilot classroom %r join_code=%s", PILOT_SECTION_NAME, code)
+        else:
+            # Keep the pilot listed and flagged as a test section even if it was edited
+            changed = False
+            if not room.listed_in_directory:
+                room.listed_in_directory = True
+                changed = True
+            if not getattr(room, "is_test_section", False):
+                room.is_test_section = True
+                changed = True
+            if changed:
+                await db.flush()
+
+        # Link every active challenge that isn't already linked to this room
+        r_existing = await db.execute(
+            select(ClassroomChallenge.challenge_id).where(ClassroomChallenge.classroom_id == room.id)
+        )
+        already_linked = {row[0] for row in r_existing.all()}
+
+        max_sort = await db.scalar(
+            select(func.coalesce(func.max(ClassroomChallenge.sort_order), -1)).where(
+                ClassroomChallenge.classroom_id == room.id
+            )
+        )
+        next_order = int(max_sort or -1) + 1
+
+        r_ch = await db.execute(
+            select(Challenge)
+            .where(Challenge.is_active == True)  # noqa: E712
+            .order_by(Challenge.week.asc().nulls_last(), Challenge.title)
+        )
+        added = 0
+        for ch in r_ch.scalars().all():
+            if ch.id in already_linked:
+                continue
+            db.add(
+                ClassroomChallenge(
+                    classroom_id=room.id,
+                    challenge_id=ch.id,
+                    sort_order=next_order,
+                )
+            )
+            next_order += 1
+            added += 1
+
+        await db.commit()
+        log.info(
+            "seed_pilot_classroom: classroom=%s code=%s linked_now=%d already_linked=%d",
+            room.id,
+            code,
+            added,
+            len(already_linked),
         )

@@ -200,7 +200,7 @@ function Message({ role, content }) {
 
 /* ─── Challenge brief banner ─── */
 function ChallengeBanner({ context, onUseSeed }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   if (!context) return null
   return (
     <div style={{
@@ -301,6 +301,16 @@ export default function Workspace() {
     switch (data.type) {
       case 'challenge_context':
         setChallengeContext(data.data)
+        break
+      case 'history':
+        if (Array.isArray(data.messages)) {
+          setMessages(
+            data.messages
+              .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
+              .map(m => ({ role: m.role, content: m.content })),
+          )
+        }
+        if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         break
       case 'typing':
         setIsTyping(true); setIsStreaming(false)

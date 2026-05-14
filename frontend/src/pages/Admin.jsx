@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import InviteTemplate from './InviteTemplate'
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -395,6 +396,7 @@ export default function Admin() {
     { id: 'overview', label: 'Overview' },
     { id: 'users', label: 'Users' },
     { id: 'classrooms', label: 'Classrooms' },
+    { id: 'invite', label: 'Invite' },
   ]
 
   return (
@@ -562,6 +564,9 @@ export default function Admin() {
               )}
             </>
           )}
+
+          {/* ── INVITE TAB ── */}
+          {activeTab === 'invite' && <InviteTemplate />}
 
           {/* ── CLASSROOMS TAB ── */}
           {activeTab === 'classrooms' && (

@@ -16,7 +16,7 @@ from sqlalchemy import select, update
 from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession, User
 from auth import router as auth_router, decode_token, pwd_context
 from challenges import router as challenges_router, seed_challenges
-from classrooms import router as classrooms_router, seed_demo_classroom
+from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
 
 _backend_dir = Path(__file__).resolve().parent
@@ -107,6 +107,7 @@ async def lifespan(app: FastAPI):
     log.info("Database initialized")
     await seed_challenges()
     await seed_demo_classroom()
+    await seed_pilot_classroom()
     yield
 
 
@@ -178,6 +179,31 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                     res.rowcount,
                     conversation_id,
                 )
+
+            # Roll the new PEI into the challenge session's best_pei so the Husky Score and
+            # challenge progress reflect the latest evaluation.
+            new_pei = scores.get("PEI")
+            if new_pei is not None:
+                from sqlalchemy import select as sa_select
+                ucs_q = await db.execute(
+                    sa_select(UserChallengeSession).where(
+                        UserChallengeSession.conversation_id == conversation_id
+                    )
+                )
+                ucs = ucs_q.scalar_one_or_none()
+                if ucs:
+                    try:
+                        pei_val = float(new_pei)
+                    except (TypeError, ValueError):
+                        pei_val = None
+                    if pei_val is not None:
+                        if ucs.best_pei is None or pei_val > ucs.best_pei:
+                            ucs.best_pei = pei_val
+                        if ucs.started_at is None:
+                            ucs.started_at = datetime.utcnow()
+                        if ucs.status == "not_started":
+                            ucs.status = "in_progress"
+
             await db.commit()
     except Exception as e:
         log.error(f"DB save failed for turn {turn_num}: {e}")
@@ -247,15 +273,12 @@ async def websocket_endpoint(
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
     conversation_id = None
+    conversation_history: list[dict] = []
+    resumed = False
     try:
         async with AsyncSessionLocal() as db:
-            conv = Conversation(user_id=user_id)
-            db.add(conv)
-            await db.commit()
-            await db.refresh(conv)
-            conversation_id = conv.id
-
-            # Link conversation to challenge session if applicable
+            # Resume an existing challenge-session conversation when possible so chat
+            # history is preserved across reconnects / page refreshes.
             if challenge_id and session_num:
                 from sqlalchemy import select as sa_select
                 result = await db.execute(
@@ -266,9 +289,45 @@ async def websocket_endpoint(
                     )
                 )
                 ucs = result.scalar_one_or_none()
-                if ucs and not ucs.conversation_id:
-                    ucs.conversation_id = conversation_id
-                    await db.commit()
+                if ucs and ucs.conversation_id:
+                    existing = await db.get(Conversation, ucs.conversation_id)
+                    if existing and existing.user_id == user_id:
+                        conversation_id = existing.id
+                        resumed = True
+                        # Treat the conversation as active again
+                        if existing.ended_at is not None:
+                            existing.ended_at = None
+                            await db.commit()
+                        # Hydrate server-side history so the model has full context
+                        mr = await db.execute(
+                            sa_select(Message)
+                            .where(Message.conversation_id == conversation_id)
+                            .order_by(Message.created_at)
+                        )
+                        for m in mr.scalars().all():
+                            conversation_history.append({"role": m.role, "content": m.content})
+
+            if not conversation_id:
+                conv = Conversation(user_id=user_id)
+                db.add(conv)
+                await db.commit()
+                await db.refresh(conv)
+                conversation_id = conv.id
+
+                # Link conversation to challenge session if applicable (first connect)
+                if challenge_id and session_num:
+                    from sqlalchemy import select as sa_select
+                    result = await db.execute(
+                        sa_select(UserChallengeSession).where(
+                            UserChallengeSession.user_id == user_id,
+                            UserChallengeSession.challenge_id == challenge_id,
+                            UserChallengeSession.session_number == session_num,
+                        )
+                    )
+                    ucs = result.scalar_one_or_none()
+                    if ucs and not ucs.conversation_id:
+                        ucs.conversation_id = conversation_id
+                        await db.commit()
     except Exception as e:
         log.error(f"Failed to create conversation record: {e}")
 
@@ -284,10 +343,20 @@ async def websocket_endpoint(
             }
         }))
 
-    conversation_history = []
+    # Replay any prior messages from a resumed conversation so the client UI rehydrates
+    if resumed and conversation_history:
+        await websocket.send_text(json.dumps({
+            "type": "history",
+            "messages": conversation_history,
+            "turn_count": len(conversation_history) // 2,
+        }))
+
     client_host = websocket.client.host if websocket.client else "unknown"
     mode = f"challenge={challenge_id}/session={session_num}" if challenge_id else "free"
-    log.info(f"[WS] User {user_id[:8]}... connected ({mode}) (conv: {conversation_id})")
+    log.info(
+        f"[WS] User {user_id[:8]}... connected ({mode}) (conv: {conversation_id}) "
+        f"resumed={resumed} prior_turns={len(conversation_history) // 2}"
+    )
 
     try:
         while True:

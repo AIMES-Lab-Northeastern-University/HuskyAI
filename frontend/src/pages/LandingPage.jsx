@@ -563,7 +563,7 @@ export default function LandingPage() {
                 className="lp-btn-primary"
                 onClick={() => navigate('/login?tab=register')}
               >
-                Get started with class code &rarr;
+                Get Started &rarr;
               </button>
               <button
                 type="button"
