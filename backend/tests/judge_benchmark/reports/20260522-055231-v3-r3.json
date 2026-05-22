@@ -1,0 +1,1925 @@
+{
+  "report_id": "20260522-055231-v3-r3",
+  "evaluator": "v3",
+  "repeats": 3,
+  "case_count": 20,
+  "started_at": "2026-05-22T05:39:59Z",
+  "ended_at": "2026-05-22T05:52:31Z",
+  "summary": {
+    "pei_mae": 4.93,
+    "psq_mae": 5.61,
+    "ccm_mae": 8.65,
+    "tsi_mae": 8.68,
+    "clm_mae": 5.08,
+    "ras_mae": 7.73,
+    "classification_accuracy": 0.9,
+    "leading_status_accuracy": 0.65,
+    "mean_pei_stddev": 1.51,
+    "max_pei_stddev": 4.31,
+    "error_rate": 0.0,
+    "by_domain": {
+      "coding": {
+        "case_count": 5,
+        "pei_mae": 4.75,
+        "classification_accuracy": 1.0
+      },
+      "debugging": {
+        "case_count": 5,
+        "pei_mae": 4.5,
+        "classification_accuracy": 1.0
+      },
+      "data": {
+        "case_count": 5,
+        "pei_mae": 5.91,
+        "classification_accuracy": 0.6
+      },
+      "casual": {
+        "case_count": 5,
+        "pei_mae": 4.59,
+        "classification_accuracy": 1.0
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "coding-001",
+      "domain": "coding",
+      "tier": "novice",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 12.0,
+        "CCM": 15.0,
+        "TSI": 15.0,
+        "CLM": 20.0,
+        "RAS": 50.0,
+        "PEI": 20.0,
+        "classification": "Novice",
+        "leading_status": "ai-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 14.5,
+            "CCM": 15.0,
+            "TSI": 5.0,
+            "CLM": 20.0,
+            "RAS": 12.0,
+            "PEI": 13.175,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 2.5,
+            "CCM": 0.0,
+            "TSI": -10.0,
+            "CLM": 0.0,
+            "RAS": -38.0,
+            "PEI": -6.82
+          },
+          "latency_ms": 11293,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 10.25,
+            "CCM": 15.0,
+            "TSI": 5.0,
+            "CLM": 20.0,
+            "RAS": 45.0,
+            "PEI": 17.0625,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -1.75,
+            "CCM": 0.0,
+            "TSI": -10.0,
+            "CLM": 0.0,
+            "RAS": -5.0,
+            "PEI": -2.94
+          },
+          "latency_ms": 14309,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 14.5,
+            "CCM": 40.0,
+            "TSI": 5.0,
+            "CLM": 20.0,
+            "RAS": 40.0,
+            "PEI": 23.625,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 2.5,
+            "CCM": 25.0,
+            "TSI": -10.0,
+            "CLM": 0.0,
+            "RAS": -10.0,
+            "PEI": 3.62
+          },
+          "latency_ms": 10598,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 17.95,
+        "predicted_pei_stddev": 4.31,
+        "pei_delta": 2.05,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "coding-002",
+      "domain": "coding",
+      "tier": "advanced",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 95.0,
+        "CCM": 80.0,
+        "TSI": 90.0,
+        "CLM": 85.0,
+        "RAS": 70.0,
+        "PEI": 85.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 88.0,
+            "CCM": 75.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 45.0,
+            "PEI": 75.5,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": -5.0,
+            "TSI": -10.0,
+            "CLM": -5.0,
+            "RAS": -25.0,
+            "PEI": -9.5
+          },
+          "latency_ms": 11872,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 80.0,
+            "TSI": 80.0,
+            "CLM": 85.0,
+            "RAS": 45.0,
+            "PEI": 77.25,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -8.0,
+            "CCM": 0.0,
+            "TSI": -10.0,
+            "CLM": 0.0,
+            "RAS": -25.0,
+            "PEI": -7.75
+          },
+          "latency_ms": 12184,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 80.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 55.0,
+            "PEI": 78.0,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -8.0,
+            "CCM": 0.0,
+            "TSI": -10.0,
+            "CLM": -5.0,
+            "RAS": -15.0,
+            "PEI": -7.0
+          },
+          "latency_ms": 12406,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 76.92,
+        "predicted_pei_stddev": 1.05,
+        "pei_delta": 8.08,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "coding-003",
+      "domain": "coding",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 78.0,
+        "CCM": 65.0,
+        "TSI": 60.0,
+        "CLM": 65.0,
+        "RAS": 60.0,
+        "PEI": 67.0,
+        "classification": "Intermediate",
+        "leading_status": "mixed"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 79.25,
+            "CCM": 75.0,
+            "TSI": 55.0,
+            "CLM": 75.0,
+            "RAS": 55.0,
+            "PEI": 69.0625,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 1.25,
+            "CCM": 10.0,
+            "TSI": -5.0,
+            "CLM": 10.0,
+            "RAS": -5.0,
+            "PEI": 2.06
+          },
+          "latency_ms": 10110,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 75.0,
+            "TSI": 30.0,
+            "CLM": 70.0,
+            "RAS": 45.0,
+            "PEI": 60.0625,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -5.75,
+            "CCM": 10.0,
+            "TSI": -30.0,
+            "CLM": 5.0,
+            "RAS": -15.0,
+            "PEI": -6.94
+          },
+          "latency_ms": 12429,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 75.75,
+            "CCM": 75.0,
+            "TSI": 30.0,
+            "CLM": 75.0,
+            "RAS": 45.0,
+            "PEI": 61.6875,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -2.25,
+            "CCM": 10.0,
+            "TSI": -30.0,
+            "CLM": 10.0,
+            "RAS": -15.0,
+            "PEI": -5.31
+          },
+          "latency_ms": 11679,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 63.6,
+        "predicted_pei_stddev": 3.92,
+        "pei_delta": 3.4,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "coding-004",
+      "domain": "coding",
+      "tier": "novice",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 30.0,
+        "CCM": 25.0,
+        "TSI": 22.0,
+        "CLM": 30.0,
+        "RAS": 50.0,
+        "PEI": 30.0,
+        "classification": "Novice",
+        "leading_status": "ai-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 20.0,
+            "CCM": 75.0,
+            "TSI": 10.0,
+            "CLM": 30.0,
+            "RAS": 45.0,
+            "PEI": 37.0,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -10.0,
+            "CCM": 50.0,
+            "TSI": -12.0,
+            "CLM": 0.0,
+            "RAS": -5.0,
+            "PEI": 7.0
+          },
+          "latency_ms": 11573,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 22.25,
+            "CCM": 50.0,
+            "TSI": 5.0,
+            "CLM": 40.0,
+            "RAS": 45.0,
+            "PEI": 31.8125,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -7.75,
+            "CCM": 25.0,
+            "TSI": -17.0,
+            "CLM": 10.0,
+            "RAS": -5.0,
+            "PEI": 1.81
+          },
+          "latency_ms": 11597,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 20.0,
+            "CCM": 50.0,
+            "TSI": 10.0,
+            "CLM": 30.0,
+            "RAS": 45.0,
+            "PEI": 30.75,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -10.0,
+            "CCM": 25.0,
+            "TSI": -12.0,
+            "CLM": 0.0,
+            "RAS": -5.0,
+            "PEI": 0.75
+          },
+          "latency_ms": 12978,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 33.19,
+        "predicted_pei_stddev": 2.73,
+        "pei_delta": 3.19,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "coding-005",
+      "domain": "coding",
+      "tier": "advanced",
+      "turn_type": "multi",
+      "golden": {
+        "PSQ": 92.0,
+        "CCM": 90.0,
+        "TSI": 88.0,
+        "CLM": 82.0,
+        "RAS": 82.0,
+        "PEI": 88.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 85.0,
+            "CCM": 80.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 75.0,
+            "PEI": 80.5,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": -10.0,
+            "TSI": -8.0,
+            "CLM": -2.0,
+            "RAS": -7.0,
+            "PEI": -7.5
+          },
+          "latency_ms": 14773,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 80.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 75.0,
+            "PEI": 81.0,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -5.0,
+            "CCM": -10.0,
+            "TSI": -8.0,
+            "CLM": -2.0,
+            "RAS": -7.0,
+            "PEI": -7.0
+          },
+          "latency_ms": 24239,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 80.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 78.0,
+            "PEI": 81.45,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -5.0,
+            "CCM": -10.0,
+            "TSI": -8.0,
+            "CLM": -2.0,
+            "RAS": -4.0,
+            "PEI": -6.55
+          },
+          "latency_ms": 12618,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 80.98,
+        "predicted_pei_stddev": 0.39,
+        "pei_delta": 7.02,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "debugging-001",
+      "domain": "debugging",
+      "tier": "novice",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 18.0,
+        "CCM": 18.0,
+        "TSI": 12.0,
+        "CLM": 22.0,
+        "RAS": 50.0,
+        "PEI": 21.0,
+        "classification": "Novice",
+        "leading_status": "ai-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 15.0,
+            "CCM": 10.0,
+            "TSI": 10.0,
+            "CLM": 25.0,
+            "RAS": 45.0,
+            "PEI": 18.75,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -3.0,
+            "CCM": -8.0,
+            "TSI": -2.0,
+            "CLM": 3.0,
+            "RAS": -5.0,
+            "PEI": -2.25
+          },
+          "latency_ms": 10064,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 15.0,
+            "CCM": 15.0,
+            "TSI": 10.0,
+            "CLM": 25.0,
+            "RAS": 35.0,
+            "PEI": 18.5,
+            "classification": "Novice",
+            "leading_status": "ai-led"
+          },
+          "deltas": {
+            "PSQ": -3.0,
+            "CCM": -3.0,
+            "TSI": -2.0,
+            "CLM": 3.0,
+            "RAS": -15.0,
+            "PEI": -2.5
+          },
+          "latency_ms": 7979,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 15.0,
+            "CCM": 15.0,
+            "TSI": 10.0,
+            "CLM": 25.0,
+            "RAS": 45.0,
+            "PEI": 20.0,
+            "classification": "Novice",
+            "leading_status": "ai-led"
+          },
+          "deltas": {
+            "PSQ": -3.0,
+            "CCM": -3.0,
+            "TSI": -2.0,
+            "CLM": 3.0,
+            "RAS": -5.0,
+            "PEI": -1.0
+          },
+          "latency_ms": 9440,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 19.08,
+        "predicted_pei_stddev": 0.66,
+        "pei_delta": 1.92,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "debugging-002",
+      "domain": "debugging",
+      "tier": "advanced",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 92.0,
+        "CCM": 78.0,
+        "TSI": 90.0,
+        "CLM": 88.0,
+        "RAS": 75.0,
+        "PEI": 85.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 85.0,
+            "CCM": 78.0,
+            "TSI": 85.0,
+            "CLM": 80.0,
+            "RAS": 68.0,
+            "PEI": 79.95,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": 0.0,
+            "TSI": -5.0,
+            "CLM": -8.0,
+            "RAS": -7.0,
+            "PEI": -5.05
+          },
+          "latency_ms": 11212,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 82.0,
+            "CCM": 78.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 68.0,
+            "PEI": 78.2,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -10.0,
+            "CCM": 0.0,
+            "TSI": -10.0,
+            "CLM": -8.0,
+            "RAS": -7.0,
+            "PEI": -6.8
+          },
+          "latency_ms": 10526,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 79.25,
+            "CCM": 75.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 68.0,
+            "PEI": 76.7625,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -12.75,
+            "CCM": -3.0,
+            "TSI": -10.0,
+            "CLM": -8.0,
+            "RAS": -7.0,
+            "PEI": -8.24
+          },
+          "latency_ms": 11321,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 78.3,
+        "predicted_pei_stddev": 1.3,
+        "pei_delta": 6.7,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "debugging-003",
+      "domain": "debugging",
+      "tier": "advanced",
+      "turn_type": "multi",
+      "golden": {
+        "PSQ": 72.0,
+        "CCM": 82.0,
+        "TSI": 70.0,
+        "CLM": 72.0,
+        "RAS": 80.0,
+        "PEI": 75.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 75.25,
+            "CCM": 80.0,
+            "TSI": 75.0,
+            "CLM": 75.0,
+            "RAS": 75.0,
+            "PEI": 76.3125,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": 3.25,
+            "CCM": -2.0,
+            "TSI": 5.0,
+            "CLM": 3.0,
+            "RAS": -5.0,
+            "PEI": 1.31
+          },
+          "latency_ms": 11341,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 68.25,
+            "CCM": 80.0,
+            "TSI": 78.0,
+            "CLM": 80.0,
+            "RAS": 78.0,
+            "PEI": 76.3625,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -3.75,
+            "CCM": -2.0,
+            "TSI": 8.0,
+            "CLM": 8.0,
+            "RAS": -2.0,
+            "PEI": 1.36
+          },
+          "latency_ms": 9759,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 78.25,
+            "CCM": 78.0,
+            "TSI": 75.0,
+            "CLM": 75.0,
+            "RAS": 75.0,
+            "PEI": 76.5625,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": 6.25,
+            "CCM": -4.0,
+            "TSI": 5.0,
+            "CLM": 3.0,
+            "RAS": -5.0,
+            "PEI": 1.56
+          },
+          "latency_ms": 9272,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 76.41,
+        "predicted_pei_stddev": 0.11,
+        "pei_delta": 1.41,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "debugging-004",
+      "domain": "debugging",
+      "tier": "novice",
+      "turn_type": "multi",
+      "golden": {
+        "PSQ": 15.0,
+        "CCM": 18.0,
+        "TSI": 12.0,
+        "CLM": 18.0,
+        "RAS": 30.0,
+        "PEI": 18.0,
+        "classification": "Novice",
+        "leading_status": "ai-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 22.25,
+            "CCM": 30.0,
+            "TSI": 10.0,
+            "CLM": 30.0,
+            "RAS": 40.0,
+            "PEI": 25.5625,
+            "classification": "Novice",
+            "leading_status": "ai-led"
+          },
+          "deltas": {
+            "PSQ": 7.25,
+            "CCM": 12.0,
+            "TSI": -2.0,
+            "CLM": 12.0,
+            "RAS": 10.0,
+            "PEI": 7.56
+          },
+          "latency_ms": 29965,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 18.25,
+            "CCM": 35.0,
+            "TSI": 15.0,
+            "CLM": 30.0,
+            "RAS": 40.0,
+            "PEI": 26.8125,
+            "classification": "Novice",
+            "leading_status": "ai-led"
+          },
+          "deltas": {
+            "PSQ": 3.25,
+            "CCM": 17.0,
+            "TSI": 3.0,
+            "CLM": 12.0,
+            "RAS": 10.0,
+            "PEI": 8.81
+          },
+          "latency_ms": 10686,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 18.0,
+            "CCM": 35.0,
+            "TSI": 15.0,
+            "CLM": 30.0,
+            "RAS": 40.0,
+            "PEI": 26.75,
+            "classification": "Novice",
+            "leading_status": "ai-led"
+          },
+          "deltas": {
+            "PSQ": 3.0,
+            "CCM": 17.0,
+            "TSI": 3.0,
+            "CLM": 12.0,
+            "RAS": 10.0,
+            "PEI": 8.75
+          },
+          "latency_ms": 8150,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 26.38,
+        "predicted_pei_stddev": 0.58,
+        "pei_delta": 8.38,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "debugging-005",
+      "domain": "debugging",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 78.0,
+        "CCM": 65.0,
+        "TSI": 72.0,
+        "CLM": 72.0,
+        "RAS": 65.0,
+        "PEI": 71.0,
+        "classification": "Advanced",
+        "leading_status": "mixed"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 75.25,
+            "CCM": 75.0,
+            "TSI": 75.0,
+            "CLM": 70.0,
+            "RAS": 68.0,
+            "PEI": 73.2625,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -2.75,
+            "CCM": 10.0,
+            "TSI": 3.0,
+            "CLM": -2.0,
+            "RAS": 3.0,
+            "PEI": 2.26
+          },
+          "latency_ms": 12642,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 74.25,
+            "CCM": 75.0,
+            "TSI": 75.0,
+            "CLM": 85.0,
+            "RAS": 72.0,
+            "PEI": 75.8625,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -3.75,
+            "CCM": 10.0,
+            "TSI": 3.0,
+            "CLM": 13.0,
+            "RAS": 7.0,
+            "PEI": 4.86
+          },
+          "latency_ms": 10272,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 74.25,
+            "CCM": 78.0,
+            "TSI": 78.0,
+            "CLM": 75.0,
+            "RAS": 75.0,
+            "PEI": 76.1625,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -3.75,
+            "CCM": 13.0,
+            "TSI": 6.0,
+            "CLM": 3.0,
+            "RAS": 10.0,
+            "PEI": 5.16
+          },
+          "latency_ms": 9939,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 75.1,
+        "predicted_pei_stddev": 1.3,
+        "pei_delta": 4.1,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "data-001",
+      "domain": "data",
+      "tier": "advanced",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 94.0,
+        "CCM": 78.0,
+        "TSI": 90.0,
+        "CLM": 88.0,
+        "RAS": 78.0,
+        "PEI": 86.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 79.25,
+            "CCM": 78.0,
+            "TSI": 78.0,
+            "CLM": 75.0,
+            "RAS": 68.0,
+            "PEI": 76.3625,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -14.75,
+            "CCM": 0.0,
+            "TSI": -12.0,
+            "CLM": -13.0,
+            "RAS": -10.0,
+            "PEI": -9.64
+          },
+          "latency_ms": 11665,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 85.0,
+            "CCM": 78.0,
+            "TSI": 78.0,
+            "CLM": 75.0,
+            "RAS": 65.0,
+            "PEI": 77.35,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -9.0,
+            "CCM": 0.0,
+            "TSI": -12.0,
+            "CLM": -13.0,
+            "RAS": -13.0,
+            "PEI": -8.65
+          },
+          "latency_ms": 12567,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 83.0,
+            "CCM": 78.0,
+            "TSI": 78.0,
+            "CLM": 75.0,
+            "RAS": 72.0,
+            "PEI": 77.89999999999999,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -11.0,
+            "CCM": 0.0,
+            "TSI": -12.0,
+            "CLM": -13.0,
+            "RAS": -6.0,
+            "PEI": -8.1
+          },
+          "latency_ms": 12915,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 77.2,
+        "predicted_pei_stddev": 0.64,
+        "pei_delta": 8.8,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "data-002",
+      "domain": "data",
+      "tier": "novice",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 8.0,
+        "CCM": 15.0,
+        "TSI": 8.0,
+        "CLM": 18.0,
+        "RAS": 50.0,
+        "PEI": 18.0,
+        "classification": "Novice",
+        "leading_status": "ai-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 10.75,
+            "CCM": 45.0,
+            "TSI": 10.0,
+            "CLM": 20.0,
+            "RAS": 40.0,
+            "PEI": 24.9375,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 2.75,
+            "CCM": 30.0,
+            "TSI": 2.0,
+            "CLM": 2.0,
+            "RAS": -10.0,
+            "PEI": 6.94
+          },
+          "latency_ms": 10103,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 10.25,
+            "CCM": 45.0,
+            "TSI": 15.0,
+            "CLM": 20.0,
+            "RAS": 35.0,
+            "PEI": 25.0625,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 2.25,
+            "CCM": 30.0,
+            "TSI": 7.0,
+            "CLM": 2.0,
+            "RAS": -15.0,
+            "PEI": 7.06
+          },
+          "latency_ms": 9529,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 15.25,
+            "CCM": 45.0,
+            "TSI": 10.0,
+            "CLM": 20.0,
+            "RAS": 35.0,
+            "PEI": 25.3125,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 7.25,
+            "CCM": 30.0,
+            "TSI": 2.0,
+            "CLM": 2.0,
+            "RAS": -15.0,
+            "PEI": 7.31
+          },
+          "latency_ms": 10853,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 25.1,
+        "predicted_pei_stddev": 0.16,
+        "pei_delta": 7.1,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "data-003",
+      "domain": "data",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 80.0,
+        "CCM": 65.0,
+        "TSI": 62.0,
+        "CLM": 75.0,
+        "RAS": 60.0,
+        "PEI": 70.0,
+        "classification": "Intermediate",
+        "leading_status": "mixed"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 83.25,
+            "CCM": 65.0,
+            "TSI": 70.0,
+            "CLM": 75.0,
+            "RAS": 55.0,
+            "PEI": 70.5625,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 3.25,
+            "CCM": 0.0,
+            "TSI": 8.0,
+            "CLM": 0.0,
+            "RAS": -5.0,
+            "PEI": 0.56
+          },
+          "latency_ms": 17829,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 83.0,
+            "CCM": 68.0,
+            "TSI": 70.0,
+            "CLM": 85.0,
+            "RAS": 72.0,
+            "PEI": 75.3,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": 3.0,
+            "CCM": 3.0,
+            "TSI": 8.0,
+            "CLM": 10.0,
+            "RAS": 12.0,
+            "PEI": 5.3
+          },
+          "latency_ms": 9971,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 75.0,
+            "TSI": 65.0,
+            "CLM": 75.0,
+            "RAS": 55.0,
+            "PEI": 69.3125,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -7.75,
+            "CCM": 10.0,
+            "TSI": 3.0,
+            "CLM": 0.0,
+            "RAS": -5.0,
+            "PEI": -0.69
+          },
+          "latency_ms": 18179,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 71.73,
+        "predicted_pei_stddev": 2.58,
+        "pei_delta": 1.73,
+        "classification_match_rate": 0.33,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "data-004",
+      "domain": "data",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 72.0,
+        "CCM": 68.0,
+        "TSI": 65.0,
+        "CLM": 70.0,
+        "RAS": 78.0,
+        "PEI": 70.0,
+        "classification": "Intermediate",
+        "leading_status": "mixed"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 75.0,
+            "TSI": 75.0,
+            "CLM": 75.0,
+            "RAS": 75.0,
+            "PEI": 74.3125,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 0.25,
+            "CCM": 7.0,
+            "TSI": 10.0,
+            "CLM": 5.0,
+            "RAS": -3.0,
+            "PEI": 4.31
+          },
+          "latency_ms": 10290,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 75.0,
+            "TSI": 75.0,
+            "CLM": 75.0,
+            "RAS": 68.0,
+            "PEI": 73.2625,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 0.25,
+            "CCM": 7.0,
+            "TSI": 10.0,
+            "CLM": 5.0,
+            "RAS": -10.0,
+            "PEI": 3.26
+          },
+          "latency_ms": 9787,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 63.5,
+            "CCM": 75.0,
+            "TSI": 75.0,
+            "CLM": 70.0,
+            "RAS": 75.0,
+            "PEI": 71.375,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -8.5,
+            "CCM": 7.0,
+            "TSI": 10.0,
+            "CLM": 0.0,
+            "RAS": -3.0,
+            "PEI": 1.38
+          },
+          "latency_ms": 12264,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 72.98,
+        "predicted_pei_stddev": 1.22,
+        "pei_delta": 2.98,
+        "classification_match_rate": 0.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "data-005",
+      "domain": "data",
+      "tier": "advanced",
+      "turn_type": "multi",
+      "golden": {
+        "PSQ": 92.0,
+        "CCM": 92.0,
+        "TSI": 90.0,
+        "CLM": 88.0,
+        "RAS": 88.0,
+        "PEI": 90.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 85.0,
+            "CCM": 78.0,
+            "TSI": 80.0,
+            "CLM": 85.0,
+            "RAS": 75.0,
+            "PEI": 80.75,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": -14.0,
+            "TSI": -10.0,
+            "CLM": -3.0,
+            "RAS": -13.0,
+            "PEI": -9.25
+          },
+          "latency_ms": 12443,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 85.0,
+            "CCM": 78.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 80.0,
+            "PEI": 80.75,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": -14.0,
+            "TSI": -10.0,
+            "CLM": -8.0,
+            "RAS": -8.0,
+            "PEI": -9.25
+          },
+          "latency_ms": 11756,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 80.0,
+            "TSI": 80.0,
+            "CLM": 80.0,
+            "RAS": 80.0,
+            "PEI": 81.75,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -5.0,
+            "CCM": -12.0,
+            "TSI": -10.0,
+            "CLM": -8.0,
+            "RAS": -8.0,
+            "PEI": -8.25
+          },
+          "latency_ms": 20203,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 81.08,
+        "predicted_pei_stddev": 0.47,
+        "pei_delta": 8.92,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "casual-001",
+      "domain": "casual",
+      "tier": "novice",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 12.0,
+        "CCM": 18.0,
+        "TSI": 10.0,
+        "CLM": 25.0,
+        "RAS": 45.0,
+        "PEI": 20.0,
+        "classification": "Novice",
+        "leading_status": "ai-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 15.0,
+            "CCM": 15.0,
+            "TSI": 12.0,
+            "CLM": 20.0,
+            "RAS": 45.0,
+            "PEI": 19.65,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 3.0,
+            "CCM": -3.0,
+            "TSI": 2.0,
+            "CLM": -5.0,
+            "RAS": 0.0,
+            "PEI": -0.35
+          },
+          "latency_ms": 7878,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 20.0,
+            "CCM": 50.0,
+            "TSI": 12.0,
+            "CLM": 20.0,
+            "RAS": 40.0,
+            "PEI": 28.9,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 8.0,
+            "CCM": 32.0,
+            "TSI": 2.0,
+            "CLM": -5.0,
+            "RAS": -5.0,
+            "PEI": 8.9
+          },
+          "latency_ms": 11721,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 20.0,
+            "CCM": 15.0,
+            "TSI": 12.0,
+            "CLM": 20.0,
+            "RAS": 45.0,
+            "PEI": 20.9,
+            "classification": "Novice",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": 8.0,
+            "CCM": -3.0,
+            "TSI": 2.0,
+            "CLM": -5.0,
+            "RAS": 0.0,
+            "PEI": 0.9
+          },
+          "latency_ms": 8160,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 23.15,
+        "predicted_pei_stddev": 4.1,
+        "pei_delta": 3.15,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "casual-002",
+      "domain": "casual",
+      "tier": "advanced",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 94.0,
+        "CCM": 80.0,
+        "TSI": 80.0,
+        "CLM": 88.0,
+        "RAS": 85.0,
+        "PEI": 86.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 78.0,
+            "TSI": 75.0,
+            "CLM": 80.0,
+            "RAS": 80.0,
+            "PEI": 80.25,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": -2.0,
+            "TSI": -5.0,
+            "CLM": -8.0,
+            "RAS": -5.0,
+            "PEI": -5.75
+          },
+          "latency_ms": 10065,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 87.0,
+            "CCM": 78.0,
+            "TSI": 75.0,
+            "CLM": 80.0,
+            "RAS": 80.0,
+            "PEI": 80.25,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -7.0,
+            "CCM": -2.0,
+            "TSI": -5.0,
+            "CLM": -8.0,
+            "RAS": -5.0,
+            "PEI": -5.75
+          },
+          "latency_ms": 16064,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 88.0,
+            "CCM": 78.0,
+            "TSI": 75.0,
+            "CLM": 80.0,
+            "RAS": 80.0,
+            "PEI": 80.5,
+            "classification": "Advanced",
+            "leading_status": "user-led"
+          },
+          "deltas": {
+            "PSQ": -6.0,
+            "CCM": -2.0,
+            "TSI": -5.0,
+            "CLM": -8.0,
+            "RAS": -5.0,
+            "PEI": -5.5
+          },
+          "latency_ms": 11478,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 80.33,
+        "predicted_pei_stddev": 0.12,
+        "pei_delta": 5.67,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "casual-003",
+      "domain": "casual",
+      "tier": "intermediate",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 80.0,
+        "CCM": 62.0,
+        "TSI": 60.0,
+        "CLM": 78.0,
+        "RAS": 60.0,
+        "PEI": 69.0,
+        "classification": "Intermediate",
+        "leading_status": "mixed"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 65.0,
+            "TSI": 60.0,
+            "CLM": 75.0,
+            "RAS": 72.0,
+            "PEI": 68.3625,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -7.75,
+            "CCM": 3.0,
+            "TSI": 0.0,
+            "CLM": -3.0,
+            "RAS": 12.0,
+            "PEI": -0.64
+          },
+          "latency_ms": 15203,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 69.25,
+            "CCM": 65.0,
+            "TSI": 70.0,
+            "CLM": 75.0,
+            "RAS": 55.0,
+            "PEI": 67.0625,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -10.75,
+            "CCM": 3.0,
+            "TSI": 10.0,
+            "CLM": -3.0,
+            "RAS": -5.0,
+            "PEI": -1.94
+          },
+          "latency_ms": 16741,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 65.0,
+            "TSI": 60.0,
+            "CLM": 75.0,
+            "RAS": 55.0,
+            "PEI": 65.8125,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -7.75,
+            "CCM": 3.0,
+            "TSI": 0.0,
+            "CLM": -3.0,
+            "RAS": -5.0,
+            "PEI": -3.19
+          },
+          "latency_ms": 24922,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 67.08,
+        "predicted_pei_stddev": 1.04,
+        "pei_delta": 1.92,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "casual-004",
+      "domain": "casual",
+      "tier": "intermediate",
+      "turn_type": "multi",
+      "golden": {
+        "PSQ": 75.0,
+        "CCM": 75.0,
+        "TSI": 60.0,
+        "CLM": 75.0,
+        "RAS": 75.0,
+        "PEI": 72.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 78.0,
+            "TSI": 70.0,
+            "CLM": 75.0,
+            "RAS": 70.0,
+            "PEI": 73.3125,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -2.75,
+            "CCM": 3.0,
+            "TSI": 10.0,
+            "CLM": 0.0,
+            "RAS": -5.0,
+            "PEI": 1.31
+          },
+          "latency_ms": 11467,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 78.0,
+            "TSI": 70.0,
+            "CLM": 75.0,
+            "RAS": 65.0,
+            "PEI": 72.5625,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -2.75,
+            "CCM": 3.0,
+            "TSI": 10.0,
+            "CLM": 0.0,
+            "RAS": -10.0,
+            "PEI": 0.56
+          },
+          "latency_ms": 13142,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 72.25,
+            "CCM": 80.0,
+            "TSI": 75.0,
+            "CLM": 75.0,
+            "RAS": 65.0,
+            "PEI": 74.0625,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -2.75,
+            "CCM": 5.0,
+            "TSI": 15.0,
+            "CLM": 0.0,
+            "RAS": -10.0,
+            "PEI": 2.06
+          },
+          "latency_ms": 12510,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 73.31,
+        "predicted_pei_stddev": 0.61,
+        "pei_delta": 1.31,
+        "classification_match_rate": 1.0,
+        "successful_runs": 3
+      }
+    },
+    {
+      "id": "casual-005",
+      "domain": "casual",
+      "tier": "advanced",
+      "turn_type": "single",
+      "golden": {
+        "PSQ": 95.0,
+        "CCM": 78.0,
+        "TSI": 78.0,
+        "CLM": 85.0,
+        "RAS": 75.0,
+        "PEI": 83.0,
+        "classification": "Advanced",
+        "leading_status": "user-led"
+      },
+      "runs": [
+        {
+          "run_index": 0,
+          "predicted": {
+            "PSQ": 75.25,
+            "CCM": 75.0,
+            "TSI": 75.0,
+            "CLM": 80.0,
+            "RAS": 68.0,
+            "PEI": 74.7625,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -19.75,
+            "CCM": -3.0,
+            "TSI": -3.0,
+            "CLM": -5.0,
+            "RAS": -7.0,
+            "PEI": -8.24
+          },
+          "latency_ms": 10581,
+          "error": null
+        },
+        {
+          "run_index": 1,
+          "predicted": {
+            "PSQ": 83.25,
+            "CCM": 75.0,
+            "TSI": 30.0,
+            "CLM": 75.0,
+            "RAS": 75.0,
+            "PEI": 68.0625,
+            "classification": "Intermediate",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -11.75,
+            "CCM": -3.0,
+            "TSI": -48.0,
+            "CLM": -10.0,
+            "RAS": 0.0,
+            "PEI": -14.94
+          },
+          "latency_ms": 9472,
+          "error": null
+        },
+        {
+          "run_index": 2,
+          "predicted": {
+            "PSQ": 85.0,
+            "CCM": 75.0,
+            "TSI": 55.0,
+            "CLM": 75.0,
+            "RAS": 75.0,
+            "PEI": 73.5,
+            "classification": "Advanced",
+            "leading_status": "mixed"
+          },
+          "deltas": {
+            "PSQ": -10.0,
+            "CCM": -3.0,
+            "TSI": -23.0,
+            "CLM": -10.0,
+            "RAS": 0.0,
+            "PEI": -9.5
+          },
+          "latency_ms": 14605,
+          "error": null
+        }
+      ],
+      "aggregate": {
+        "predicted_pei_mean": 72.11,
+        "predicted_pei_stddev": 2.91,
+        "pei_delta": 10.89,
+        "classification_match_rate": 0.67,
+        "successful_runs": 3
+      }
+    }
+  ]
+}

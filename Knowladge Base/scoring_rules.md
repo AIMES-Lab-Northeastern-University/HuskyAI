@@ -7,10 +7,14 @@
 - Premature acceptance rate > 40% = over-reliance red flag
 
 ## Edge Cases
-- Single-turn conversations: score CLM at 50 (neutral), insufficient data
-- First message in session: CCM scored at 50, no arc to measure yet
-- Debugging domain: weight TSI +10% (problem isolation is core skill)
-- Casual domain: weight TSI -10% (no code decomposition expected)
+- Single-turn conversations: score CLM based on ACTUAL structure quality (NOT a default of 50).
+  Well-structured single-turn = 70-90; adequate = 50-70; poor = 30-50; minimal = 10-30.
+- First message / single-turn: score CCM based on ACTUAL directive quality (NOT a default of 50).
+  Clear directive = 70-85; prior attempt + directed questions = 72-82; vague = 40-55.
+- Debugging domain: TSI may score higher because problem isolation is a core skill
+- Casual domain: TSI applies fully — do NOT reduce TSI for lack of code.
+  Brainstorming, writing planning, and theory questions with good decomposition score the same
+  as technical domains. Vague casual = low TSI; structured casual = high TSI.
 - New student (first session): calibrate suggestions toward building habits, not correcting patterns
 
 ## Score Anchors
