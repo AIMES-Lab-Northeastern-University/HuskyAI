@@ -276,9 +276,14 @@ export default function Workspace() {
   const [input, setInput]                 = useState('')
   const [challengeContext, setChallengeContext] = useState(null)
   const [briefExpanded, setBriefExpanded] = useState(true)
+  const [conversationId, setConversationId] = useState(null)
+  const [sessionEnded, setSessionEnded]   = useState(false)
+  const [endingSession, setEndingSession] = useState(false)
+  const [sessionScore, setSessionScore]   = useState(null)
 
   const wsRef              = useRef(null)
   const reconnectTimer     = useRef(null)
+  const sessionEndedRef    = useRef(false)
   const streamBuffer       = useRef('')
   const messagesEndRef     = useRef(null)
   const textareaRef        = useRef(null)
@@ -299,6 +304,13 @@ export default function Workspace() {
 
   const handleWsMessage = useCallback((data) => {
     switch (data.type) {
+      case 'session_init':
+        setConversationId(data.conversation_id)
+        break
+      case 'session_ended':
+        sessionEndedRef.current = true
+        setSessionEnded(true)
+        break
       case 'challenge_context':
         setChallengeContext(data.data)
         break
@@ -355,6 +367,7 @@ export default function Workspace() {
     ws.onclose = (e) => {
       setConnStatus('disconnected'); setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
       if (e.code === 4001) { handleLogout(); return }
+      if (sessionEndedRef.current) return
       reconnectTimer.current = setTimeout(connect, 3000)
     }
     ws.onerror = () => setConnStatus('error')
@@ -378,6 +391,30 @@ export default function Workspace() {
   }, [isDemo, demoChallengeSlug])
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent])
+
+  const handleEndSession = async () => {
+    if (!conversationId || sessionEnded || endingSession || isDemo) return
+    setEndingSession(true)
+    try {
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+      const resp = await fetch(`${apiBase}/conversations/${conversationId}/end`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (resp.ok) {
+        const data = await resp.json().catch(() => ({}))
+        sessionEndedRef.current = true
+        setSessionEnded(true)
+        setSessionScore(data.session_avg_pei ?? null)
+        clearTimeout(reconnectTimer.current)
+        wsRef.current?.close()
+      }
+    } catch (e) {
+      console.error('Failed to end session', e)
+    } finally {
+      setEndingSession(false)
+    }
+  }
 
   const handleSend = useCallback(() => {
     const content = input.trim()
@@ -460,6 +497,26 @@ export default function Workspace() {
             </div>
           )}
           <div className="ml-auto flex items-center gap-3">
+            {conversationId && !isDemo && (
+              <button
+                onClick={handleEndSession}
+                disabled={sessionEnded || endingSession}
+                style={{
+                  padding: '5px 14px',
+                  background: sessionEnded ? '#F7F3EE' : '#FDE8EC',
+                  color: sessionEnded ? '#9A948E' : '#C8102E',
+                  border: '1.5px solid',
+                  borderColor: sessionEnded ? '#E7E0D8' : '#F9BFCA',
+                  borderRadius: '8px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  cursor: sessionEnded || endingSession ? 'default' : 'pointer',
+                  opacity: endingSession ? 0.6 : 1,
+                }}
+              >
+                {sessionEnded ? 'Session Ended' : endingSession ? 'Ending…' : 'End Session'}
+              </button>
+            )}
             <div className="flex items-center gap-1.5 text-[12px] text-[#9A948E]">
               <div className="w-[6px] h-[6px] rounded-full" style={{ background: connDot[connStatus] }} />
               {isDemo
@@ -548,30 +605,51 @@ export default function Workspace() {
 
             {/* Input area */}
             <div className="flex-shrink-0 px-6 py-4 border-t border-[#E7E0D8] bg-[#FDFCFB]" style={{ borderTopWidth: '1.5px' }}>
-              <div className="flex gap-3 items-end bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3" style={{ borderWidth: '1.5px' }}>
-                <textarea
-                  ref={textareaRef}
-                  value={input}
-                  onChange={handleTextarea}
-                  onKeyDown={handleKeyDown}
-                  placeholder={challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)'}
-                  rows={1}
-                  className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
-                  style={{ fontFamily: "'DM Sans', sans-serif" }}
-                />
-                <button
-                  onClick={handleSend}
-                  disabled={!input.trim() || isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
-                  className="w-9 h-9 rounded-[9px] bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer"
-                >
-                  <svg className="w-4 h-4 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                  </svg>
-                </button>
-              </div>
-              <div className="text-[11px] text-[#9A948E] mt-2 text-center">
-                Powered by Gemini 2.5 Pro · Prompts are evaluated for learning purposes
-              </div>
+              {sessionEnded ? (
+                <div style={{
+                  background: '#F7F3EE',
+                  border: '1.5px solid #E7E0D8',
+                  borderRadius: '12px',
+                  padding: '14px 18px',
+                  textAlign: 'center',
+                  color: '#9A948E',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                }}>
+                  Session ended
+                  {sessionScore != null && (
+                    <span> · Session avg PEI: <strong style={{ color: '#C8102E' }}>{sessionScore}</strong></span>
+                  )}
+                  {' '}— saved to your Husky Score.
+                </div>
+              ) : (
+                <div className="flex gap-3 items-end bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3" style={{ borderWidth: '1.5px' }}>
+                  <textarea
+                    ref={textareaRef}
+                    value={input}
+                    onChange={handleTextarea}
+                    onKeyDown={handleKeyDown}
+                    placeholder={challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)'}
+                    rows={1}
+                    className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
+                    style={{ fontFamily: "'DM Sans', sans-serif" }}
+                  />
+                  <button
+                    onClick={handleSend}
+                    disabled={!input.trim() || isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
+                    className="w-9 h-9 rounded-[9px] bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer"
+                  >
+                    <svg className="w-4 h-4 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                    </svg>
+                  </button>
+                </div>
+              )}
+              {!sessionEnded && (
+                <div className="text-[11px] text-[#9A948E] mt-2 text-center">
+                  Powered by Gemini 2.5 Pro · Prompts are evaluated for learning purposes
+                </div>
+              )}
             </div>
           </div>
 

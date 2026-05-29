@@ -85,6 +85,7 @@ export default function Progress() {
 
   const [challenges, setChallenges] = useState([])
   const [loading, setLoading] = useState(!isDemo)
+  const [huskyScore, setHuskyScore] = useState(null)
 
   useEffect(() => {
     if (isDemo) return
@@ -96,9 +97,16 @@ export default function Progress() {
     let cancelled = false
     ;(async () => {
       try {
-        const r = await fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() } })
-        const data = await r.json().catch(() => [])
-        if (!cancelled && Array.isArray(data)) setChallenges(data)
+        const [challengesResp, huskyResp] = await Promise.all([
+          fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() } }),
+          fetch(`${API_URL}/me/husky-score`, { headers: { ...authHeaders() } }),
+        ])
+        const challengeData = await challengesResp.json().catch(() => [])
+        const huskyData = await huskyResp.json().catch(() => ({}))
+        if (!cancelled) {
+          if (Array.isArray(challengeData)) setChallenges(challengeData)
+          setHuskyScore(huskyData)
+        }
       } catch {
         if (!cancelled) setChallenges([])
       } finally {
@@ -170,14 +178,16 @@ export default function Progress() {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '24px' }}>
 
             <div className="bg-[#FDFCFB] rounded-[14px] p-5" style={{ borderWidth: '1.5px', borderStyle: 'solid', borderColor: '#E7E0D8', textAlign: 'center' }}>
-              <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '14px' }}>Your PEI Score</div>
-              <PeiRing score={isDemo ? 68 : live.bestPei} />
+              <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '14px' }}>Husky Score</div>
+              <PeiRing score={isDemo ? 68 : huskyScore?.husky_score ?? null} />
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
                 {isDemo ? (
                   <span style={{ fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px', background: '#FEF3E8', color: '#F97316' }}>Developing</span>
                 ) : (
                   <span style={{ fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px', background: '#F7F3EE', color: '#6B6560' }}>
-                    {live.bestPei != null ? 'From your best session' : 'No score yet'}
+                    {huskyScore?.husky_score != null
+                      ? `Avg of ${huskyScore.sessions_counted} session${huskyScore.sessions_counted !== 1 ? 's' : ''}`
+                      : 'End a session to earn your score'}
                   </span>
                 )}
               </div>
