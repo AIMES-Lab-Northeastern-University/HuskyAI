@@ -132,6 +132,7 @@ class UserChallengeSession(Base):
     session_number: Mapped[int] = mapped_column(Integer, nullable=False)
     conversation_id: Mapped[str | None] = mapped_column(String, ForeignKey("conversations.id"), nullable=True)
     best_pei: Mapped[float | None] = mapped_column(Float, nullable=True)
+    session_avg_pei: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="not_started")
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -196,6 +197,12 @@ async def init_db():
                     "is_test_section BOOLEAN NOT NULL DEFAULT false"
                 )
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE user_challenge_sessions ADD COLUMN IF NOT EXISTS "
+                    "session_avg_pei FLOAT"
+                )
+            )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             for stmt, ok_fragments in (
@@ -208,6 +215,7 @@ async def init_db():
                 ("ALTER TABLE classrooms ADD COLUMN listed_in_directory INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE users ADD COLUMN is_platform_admin INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE classrooms ADD COLUMN is_test_section INTEGER DEFAULT 0", ("duplicate column", "already exists")),
+                ("ALTER TABLE user_challenge_sessions ADD COLUMN session_avg_pei REAL", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))

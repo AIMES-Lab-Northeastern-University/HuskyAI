@@ -6,16 +6,16 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
-from evaluator import evaluate_conversation
-from sqlalchemy import select, update
+from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
+from sqlalchemy import select, update, func
 
 from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession, User
 from auth import router as auth_router, decode_token, pwd_context
-from challenges import router as challenges_router, seed_challenges
+from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
 
@@ -275,6 +275,7 @@ async def websocket_endpoint(
     conversation_id = None
     conversation_history: list[dict] = []
     resumed = False
+    session_is_completed = False
     try:
         async with AsyncSessionLocal() as db:
             # Resume an existing challenge-session conversation when possible so chat
@@ -294,8 +295,9 @@ async def websocket_endpoint(
                     if existing and existing.user_id == user_id:
                         conversation_id = existing.id
                         resumed = True
-                        # Treat the conversation as active again
-                        if existing.ended_at is not None:
+                        session_is_completed = ucs.status == "completed"
+                        # Only reopen the conversation if it was not explicitly ended
+                        if existing.ended_at is not None and not session_is_completed:
                             existing.ended_at = None
                             await db.commit()
                         # Hydrate server-side history so the model has full context
@@ -331,6 +333,13 @@ async def websocket_endpoint(
     except Exception as e:
         log.error(f"Failed to create conversation record: {e}")
 
+    # Always send conversation_id so the client can call the end-session REST endpoint
+    if conversation_id:
+        await websocket.send_text(json.dumps({
+            "type": "session_init",
+            "conversation_id": conversation_id,
+        }))
+
     # Send session context to client immediately if challenge mode
     if session_data:
         await websocket.send_text(json.dumps({
@@ -350,6 +359,10 @@ async def websocket_endpoint(
             "messages": conversation_history,
             "turn_count": len(conversation_history) // 2,
         }))
+
+    # Tell the client the session is locked if it was explicitly ended
+    if session_is_completed:
+        await websocket.send_text(json.dumps({"type": "session_ended"}))
 
     client_host = websocket.client.host if websocket.client else "unknown"
     mode = f"challenge={challenge_id}/session={session_num}" if challenge_id else "free"
@@ -490,6 +503,49 @@ async def websocket_endpoint(
             pass
         if conversation_id:
             await _close_conversation(conversation_id)
+
+
+@app.post("/conversations/{conversation_id}/end")
+async def end_conversation(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Mark a conversation as ended, calculate session avg PEI, and store it on the linked challenge session."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    result = await db.execute(
+        select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
+            EvalResult.conversation_id == conversation_id,
+            EvalResult.pei.is_not(None),
+        )
+    )
+    row = result.one_or_none()
+    avg_pei = row[0] if row else None
+    turn_count = row[1] if row else 0
+
+    conv.ended_at = datetime.utcnow()
+
+    ucs_result = await db.execute(
+        select(UserChallengeSession).where(
+            UserChallengeSession.conversation_id == conversation_id,
+            UserChallengeSession.user_id == user_id,
+        )
+    )
+    ucs = ucs_result.scalar_one_or_none()
+    if ucs:
+        if avg_pei is not None:
+            ucs.session_avg_pei = round(float(avg_pei), 2)
+        ucs.status = "completed"
+        ucs.completed_at = datetime.utcnow()
+
+    await db.commit()
+    return {
+        "session_avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,
+        "turns": int(turn_count or 0),
+    }
 
 
 if __name__ == "__main__":

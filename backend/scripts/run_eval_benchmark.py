@@ -23,12 +23,18 @@ import asyncio
 import json
 import os
 import re
+import ssl
 import statistics
 import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Disable SSL certificate verification globally — required on Windows / Python 3.14
+# where the system certificate store may not include the required CA chain.
+ssl._create_default_https_context = ssl._create_unverified_context
+os.environ.setdefault("PYTHONHTTPSVERIFY", "0")
 
 # --- sys.path bootstrap (mirrors scripts/verify_external_ai.py) -----------------
 _backend = Path(__file__).resolve().parents[1]

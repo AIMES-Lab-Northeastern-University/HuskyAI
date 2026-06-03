@@ -953,30 +953,24 @@ async def my_husky_score(
     user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Husky Score = average of every per-turn PEI across all the user's challenge
-    conversations (free practice excluded). Each turn weighs equally."""
+    """Husky Score = average of per-session avg PEI across all the user's ended challenge sessions."""
     stmt = (
         select(
-            func.avg(EvalResult.pei),
-            func.count(EvalResult.id),
-            func.count(func.distinct(UserChallengeSession.id)),
-        )
-        .join(
-            UserChallengeSession,
-            UserChallengeSession.conversation_id == EvalResult.conversation_id,
+            func.avg(UserChallengeSession.session_avg_pei),
+            func.count(UserChallengeSession.id),
         )
         .where(
             UserChallengeSession.user_id == user_id,
-            EvalResult.pei.is_not(None),
+            UserChallengeSession.session_avg_pei.is_not(None),
         )
     )
     row = (await db.execute(stmt)).one_or_none()
     if not row:
         return {"husky_score": None, "turns_counted": 0, "sessions_counted": 0}
-    avg_pei, turn_count, session_count = row
+    avg_pei, session_count = row
     return {
         "husky_score": round(float(avg_pei), 1) if avg_pei is not None else None,
-        "turns_counted": int(turn_count or 0),
+        "turns_counted": int(session_count or 0),
         "sessions_counted": int(session_count or 0),
     }
 
