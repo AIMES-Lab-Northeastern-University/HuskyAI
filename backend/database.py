@@ -99,6 +99,10 @@ class EvalResult(Base):
     classification: Mapped[str | None] = mapped_column(String(64), nullable=True)
     leading_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     full_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Snapshot of the user's research consent at the moment this turn was scored.
+    # Consent is captured per turn (the export unit) so it is immune to mid-session
+    # toggles and resumed conversations. The export's consent filter reads this.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -203,6 +207,12 @@ async def init_db():
                     "session_avg_pei FLOAT"
                 )
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
+                    "consent_research BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             for stmt, ok_fragments in (
@@ -216,6 +226,7 @@ async def init_db():
                 ("ALTER TABLE users ADD COLUMN is_platform_admin INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE classrooms ADD COLUMN is_test_section INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN session_avg_pei REAL", ("duplicate column", "already exists")),
+                ("ALTER TABLE eval_results ADD COLUMN consent_research INTEGER DEFAULT 0", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))
