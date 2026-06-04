@@ -72,6 +72,7 @@ class TokenResponse(BaseModel):
     email: str
     is_platform_admin: bool = False
     consent_research: bool = False
+    research_acknowledged: bool = False
 
 
 class MeResponse(BaseModel):
@@ -80,10 +81,14 @@ class MeResponse(BaseModel):
     email: str
     is_platform_admin: bool = False
     consent_research: bool = False
+    research_acknowledged: bool = False
 
 
 class UpdateMeRequest(BaseModel):
-    consent_research: bool
+    # Settings toggle sends consent_research; the blocking acceptance gate sends
+    # accept_research_notice. Both are optional so either flow can call PATCH /me.
+    consent_research: bool | None = None
+    accept_research_notice: bool | None = None
 
 
 def create_token(user_id: str) -> str:
@@ -120,6 +125,7 @@ async def register(req: RegisterRequest):
         email=user.email,
         is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
         consent_research=bool(getattr(user, "consent_research", False)),
+        research_acknowledged=getattr(user, "research_ack_at", None) is not None,
     )
 
 
@@ -137,6 +143,7 @@ async def login(req: LoginRequest):
         email=user.email,
         is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
         consent_research=bool(getattr(user, "consent_research", False)),
+        research_acknowledged=getattr(user, "research_ack_at", None) is not None,
     )
 
 
@@ -162,18 +169,28 @@ async def me(user_id: str = Depends(_bearer_user_id)):
             email=u.email,
             is_platform_admin=bool(getattr(u, "is_platform_admin", False)),
             consent_research=bool(getattr(u, "consent_research", False)),
+            research_acknowledged=getattr(u, "research_ack_at", None) is not None,
         )
 
 
 @router.patch("/me", response_model=MeResponse)
 async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id)):
-    """Update the caller's research-consent flag. Governs FUTURE turns only —
-    each turn snapshots this value when it is scored (see _save_turn)."""
+    """Update the caller's research settings. Two flows:
+      - accept_research_notice=True: the one-time blocking acceptance. Stamps
+        research_ack_at and turns consent on.
+      - consent_research=<bool>: the Settings toggle, to opt out/in later.
+    Consent governs FUTURE turns only — each turn snapshots it when scored
+    (see _save_turn)."""
     async with AsyncSessionLocal() as db:
         u = await db.get(User, user_id)
         if not u:
             raise HTTPException(status_code=404, detail="User not found")
-        u.consent_research = bool(req.consent_research)
+        if req.accept_research_notice:
+            if u.research_ack_at is None:
+                u.research_ack_at = datetime.utcnow()
+            u.consent_research = True
+        elif req.consent_research is not None:
+            u.consent_research = bool(req.consent_research)
         await db.commit()
         await db.refresh(u)
         return MeResponse(
@@ -182,4 +199,5 @@ async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id
             email=u.email,
             is_platform_admin=bool(getattr(u, "is_platform_admin", False)),
             consent_research=bool(u.consent_research),
+            research_acknowledged=u.research_ack_at is not None,
         )

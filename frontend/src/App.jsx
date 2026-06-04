@@ -14,12 +14,13 @@ import HowItWorks from './pages/HowItWorks'
 import DemoLayout from './pages/DemoLayout'
 import RequireInstructor from './components/RequireInstructor'
 import RequirePlatformAdmin from './components/RequirePlatformAdmin'
+import ConsentGate from './components/ConsentGate'
 import Admin from './pages/Admin'
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
   if (!token) return <Navigate to="/login" replace />
-  return children
+  return <ConsentGate>{children}</ConsentGate>
 }
 
 export default function App() {

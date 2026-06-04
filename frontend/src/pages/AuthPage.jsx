@@ -96,6 +96,9 @@ export default function AuthPage() {
           is_platform_admin: Boolean(data.is_platform_admin),
         }),
       )
+      // Seed the research-notice gate from this login, so it reflects whoever
+      // just signed in (prevents a prior user's acknowledgement leaking over).
+      localStorage.setItem('research_ack', data.research_acknowledged ? 'true' : 'false')
       if (tab === 'register' && role === 'instructor') {
         // Auto-create a default section so instructor role is live immediately
         try {
