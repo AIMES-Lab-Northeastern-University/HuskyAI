@@ -289,7 +289,7 @@ export default function HowItWorks() {
 
           </div>
           <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--ink-3)', fontStyle: 'italic' }}>
-            A research initiative building AI-ready Huskies through real-time prompting feedback and evidence-based skill evaluation
+            A research initiative building AI-ready professionals through real-time prompting feedback and evidence-based skill evaluation
           </div>
         </div>
       </section>
@@ -753,7 +753,7 @@ export default function HowItWorks() {
             <span style={{ color: '#6A6460' }}> - Associate Professor &amp; Director, AIMES Lab · Special Advisor for Strategic AI Initiatives</span><br />
             <strong style={{ color: '#C8C0B8' }}>Yash Phalle</strong>
             <span style={{ color: '#6A6460' }}> - Research Assistant, AIMES Lab · MS AI, Khoury College of Computer Sciences</span><br />
-            <span style={{ fontStyle: 'italic' }}>A research initiative building AI-ready Huskies through real-time prompting feedback and evidence-based skill evaluation</span>
+            <span style={{ fontStyle: 'italic' }}>A research initiative building AI-ready professionals through real-time prompting feedback and evidence-based skill evaluation</span>
           </div>
         </div>
       </section>

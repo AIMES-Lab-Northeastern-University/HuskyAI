@@ -182,7 +182,7 @@ export default function Sidebar({ onLogout }) {
           </div>
           <span className="font-serif text-[19px] text-[#16120E]">Husky AI</span>
         </div>
-        <div className="text-[10px] text-[#9A948E] italic pl-[42px]">Be an AI-Ready Husky!</div>
+        <div className="text-[10px] text-[#9A948E] italic pl-[42px]">Be an AI-Ready professional!</div>
       </div>
 
       {/* Nav */}
