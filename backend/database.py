@@ -120,6 +120,10 @@ class Challenge(Base):
     week: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_sessions: Mapped[int] = mapped_column(Integer, default=3)
     sessions_data: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # Timed-session settings (challenge-level, apply to all of its sessions).
+    # NULL = untimed / no minimum, so existing challenges are unaffected.
+    time_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="published", nullable=False)  # draft | published
     created_by_user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True, index=True)
@@ -143,6 +147,10 @@ class UserChallengeSession(Base):
     status: Mapped[str] = mapped_column(String(32), default="not_started")
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Snapshot of the challenge's timer settings, captured when this session
+    # starts, so later instructor edits don't disrupt an in-progress attempt.
+    time_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class ClassroomMembership(Base):
@@ -237,6 +245,14 @@ async def init_db():
                 await conn.execute(
                     text("UPDATE users SET consent_research = true WHERE consent_research = false")
                 )
+            # Timed-session settings (nullable = untimed; existing rows unaffected).
+            for _tbl in ("challenges", "user_challenge_sessions"):
+                await conn.execute(
+                    text(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS time_limit_minutes INTEGER")
+                )
+                await conn.execute(
+                    text(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS min_turns INTEGER")
+                )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             # Detect whether research_ack_at already exists, to gate the one-time backfill.
@@ -255,6 +271,10 @@ async def init_db():
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN session_avg_pei REAL", ("duplicate column", "already exists")),
                 ("ALTER TABLE eval_results ADD COLUMN consent_research INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE users ADD COLUMN research_ack_at DATETIME", ("duplicate column", "already exists")),
+                ("ALTER TABLE challenges ADD COLUMN time_limit_minutes INTEGER", ("duplicate column", "already exists")),
+                ("ALTER TABLE challenges ADD COLUMN min_turns INTEGER", ("duplicate column", "already exists")),
+                ("ALTER TABLE user_challenge_sessions ADD COLUMN time_limit_minutes INTEGER", ("duplicate column", "already exists")),
+                ("ALTER TABLE user_challenge_sessions ADD COLUMN min_turns INTEGER", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))

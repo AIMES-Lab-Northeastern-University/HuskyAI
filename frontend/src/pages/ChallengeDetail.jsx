@@ -188,6 +188,13 @@ export default function ChallengeDetail() {
                     {challenge.week && (
                       <span style={{ fontSize: '11px', fontWeight: 600, padding: '3px 10px', borderRadius: '20px', background: '#F7F3EE', color: '#9A948E', border: '1px solid #E7E0D8' }}>Week {challenge.week}</span>
                     )}
+                    {(challenge.time_limit_minutes != null || challenge.min_turns != null) && (
+                      <span style={{ fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '20px', background: '#FEF3E8', color: '#C2410C', border: '1px solid #FED7AA' }}>
+                        {challenge.time_limit_minutes != null ? `⏱ ${challenge.time_limit_minutes} min` : ''}
+                        {challenge.time_limit_minutes != null && challenge.min_turns != null ? ' · ' : ''}
+                        {challenge.min_turns != null ? `${challenge.min_turns} turns min` : ''}
+                      </span>
+                    )}
                   </div>
                   <h1 style={{ fontSize: '22px', fontWeight: 600, color: '#16120E', fontFamily: "'Instrument Serif', serif", margin: 0, lineHeight: 1.3 }}>
                     {challenge.title}

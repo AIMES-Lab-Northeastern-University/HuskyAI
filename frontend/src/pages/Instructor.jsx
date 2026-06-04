@@ -83,12 +83,19 @@ export default function Instructor() {
   const [createDifficulty, setCreateDifficulty] = useState('Beginner')
   const [createWeek, setCreateWeek] = useState('')
   const [createTotalSessions, setCreateTotalSessions] = useState(3)
+  // Timed-session settings for the create form. Off by default = untimed.
+  const [createTimed, setCreateTimed] = useState(false)
+  const [createTimeLimit, setCreateTimeLimit] = useState(15)
+  const [createMinTurns, setCreateMinTurns] = useState(5)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [editTitle, setEditTitle] = useState('')
   const [editDesc, setEditDesc] = useState('')
+  const [editTimed, setEditTimed] = useState(false)
+  const [editTimeLimit, setEditTimeLimit] = useState(15)
+  const [editMinTurns, setEditMinTurns] = useState(5)
   const [actionMsg, setActionMsg] = useState('')
   const [testToggleSaving, setTestToggleSaving] = useState(false)
   const [renamingSection, setRenamingSection] = useState(false)
@@ -372,7 +379,12 @@ export default function Instructor() {
       const r = await fetch(`${API_URL}/challenges/${challengeId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ title, description }),
+        body: JSON.stringify({
+          title,
+          description,
+          time_limit_minutes: editTimed ? editTimeLimit : null,
+          min_turns: editTimed ? editMinTurns : null,
+        }),
       })
       const d = await r.json().catch(() => ({}))
       if (!r.ok) {
@@ -461,6 +473,8 @@ export default function Instructor() {
           difficulty: createDifficulty,
           week: weekNum,
           total_sessions: createTotalSessions,
+          time_limit_minutes: createTimed ? createTimeLimit : null,
+          min_turns: createTimed ? createMinTurns : null,
           is_active: publish,
         }),
       })
@@ -1370,6 +1384,29 @@ export default function Instructor() {
                                           rows={3}
                                           style={{ ...inputStyle, resize: 'vertical' }}
                                         />
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#4A4440', cursor: 'pointer' }}>
+                                          <input type="checkbox" checked={editTimed} onChange={e => setEditTimed(e.target.checked)} />
+                                          Timed session
+                                        </label>
+                                        {editTimed && (
+                                          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                                            <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                              Time limit
+                                              <input type="number" min={1} max={120} value={editTimeLimit}
+                                                onChange={e => setEditTimeLimit(Number(e.target.value))}
+                                                style={{ ...inputStyle, flex: '0 0 72px' }} /> min
+                                            </label>
+                                            <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                              Min turns
+                                              <input type="number" min={1} max={50} value={editMinTurns}
+                                                onChange={e => setEditMinTurns(Number(e.target.value))}
+                                                style={{ ...inputStyle, flex: '0 0 72px' }} />
+                                            </label>
+                                            <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%' }}>
+                                              Applies to sessions started after you save; in-progress attempts keep their original settings.
+                                            </span>
+                                          </div>
+                                        )}
                                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                                           <button
                                             type="button"
@@ -1392,6 +1429,8 @@ export default function Instructor() {
                                         <div style={{ fontSize: '13px', fontWeight: 600, color: '#16120E' }}>{c.title}</div>
                                         <div style={{ fontSize: '11px', color: '#9A948E', marginTop: '2px' }}>
                                           {b.week} · {c.category} · {c.difficulty} · order {typeof c.sort_order === 'number' ? c.sort_order : i} · {c.total_sessions} session{c.total_sessions !== 1 ? 's' : ''}
+                                          {c.time_limit_minutes != null ? ` · ⏱ ${c.time_limit_minutes}m` : ''}
+                                          {c.min_turns != null ? ` · min ${c.min_turns} turns` : ''}
                                         </div>
                                       </>
                                     )}
@@ -1416,6 +1455,9 @@ export default function Instructor() {
                                             setEditingId(c.id)
                                             setEditTitle(c.title)
                                             setEditDesc(c.description || '')
+                                            setEditTimed(c.time_limit_minutes != null || c.min_turns != null)
+                                            setEditTimeLimit(c.time_limit_minutes ?? 15)
+                                            setEditMinTurns(c.min_turns ?? 5)
                                           }}
                                           style={btnSm}
                                         >
@@ -1517,6 +1559,34 @@ export default function Instructor() {
                             ))}
                           </select>
                         </div>
+                        {/* Timed session (optional) */}
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#4A4440', cursor: 'pointer' }}>
+                          <input type="checkbox" checked={createTimed} onChange={e => setCreateTimed(e.target.checked)} />
+                          Timed session
+                        </label>
+                        {createTimed && (
+                          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                            <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              Time limit
+                              <input
+                                type="number" min={1} max={120} value={createTimeLimit}
+                                onChange={e => setCreateTimeLimit(Number(e.target.value))}
+                                style={{ ...inputStyle, flex: '0 0 80px' }}
+                              /> min
+                            </label>
+                            <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              Min turns
+                              <input
+                                type="number" min={1} max={50} value={createMinTurns}
+                                onChange={e => setCreateMinTurns(Number(e.target.value))}
+                                style={{ ...inputStyle, flex: '0 0 80px' }}
+                              />
+                            </label>
+                            <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%', lineHeight: 1.5 }}>
+                              Auto-ends at the time limit. Students can end early only after the minimum turns. Applies to sessions started after you save.
+                            </span>
+                          </div>
+                        )}
                         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                           <button
                             type="button"
