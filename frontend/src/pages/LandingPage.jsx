@@ -551,7 +551,7 @@ export default function LandingPage() {
             <h1 style={s.heroH1}>
               Be an<br />
               <em style={s.heroH1Em}>AI-Ready</em><br />
-              Husky.
+              professional.
             </h1>
             <p style={s.heroSub}>
               Husky AI is your personal coach for learning how to think with AI - not just use it.
