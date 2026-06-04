@@ -41,6 +41,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # When the user accepted the research-use notice. NULL = not yet acknowledged,
+    # which is what triggers the blocking acceptance gate on login.
+    research_ack_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
@@ -213,8 +216,32 @@ async def init_db():
                     "consent_research BOOLEAN NOT NULL DEFAULT false"
                 )
             )
+            # research_ack_at + one-time consent backfill. The backfill (make ALL
+            # pre-existing data research-usable) must run exactly once, so we gate
+            # it on whether the column already existed before this deploy.
+            _had_ack = (
+                await conn.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name='users' AND column_name='research_ack_at'"
+                    )
+                )
+            ).first() is not None
+            await conn.execute(
+                text("ALTER TABLE users ADD COLUMN IF NOT EXISTS research_ack_at TIMESTAMP")
+            )
+            if not _had_ack:
+                await conn.execute(
+                    text("UPDATE eval_results SET consent_research = true WHERE consent_research = false")
+                )
+                await conn.execute(
+                    text("UPDATE users SET consent_research = true WHERE consent_research = false")
+                )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
+            # Detect whether research_ack_at already exists, to gate the one-time backfill.
+            _cols = (await conn.execute(text("PRAGMA table_info(users)"))).fetchall()
+            _had_ack = any(row[1] == "research_ack_at" for row in _cols)
             for stmt, ok_fragments in (
                 ("ALTER TABLE users ADD COLUMN consent_research INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE conversations ADD COLUMN classroom_id VARCHAR", ("duplicate column", "already exists")),
@@ -227,6 +254,7 @@ async def init_db():
                 ("ALTER TABLE classrooms ADD COLUMN is_test_section INTEGER DEFAULT 0", ("duplicate column", "already exists")),
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN session_avg_pei REAL", ("duplicate column", "already exists")),
                 ("ALTER TABLE eval_results ADD COLUMN consent_research INTEGER DEFAULT 0", ("duplicate column", "already exists")),
+                ("ALTER TABLE users ADD COLUMN research_ack_at DATETIME", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))
@@ -236,3 +264,8 @@ async def init_db():
                         import logging
 
                         logging.getLogger("database").warning("SQLite migrate: %s — %s", stmt, e)
+            # One-time backfill: make ALL pre-existing data research-usable. Runs
+            # only on the first deploy that introduces research_ack_at.
+            if not _had_ack:
+                await conn.execute(text("UPDATE eval_results SET consent_research = 1 WHERE consent_research = 0"))
+                await conn.execute(text("UPDATE users SET consent_research = 1 WHERE consent_research = 0"))

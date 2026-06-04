@@ -454,7 +454,7 @@ export default function Admin() {
 
   // export tab
   const [exportFmt, setExportFmt] = useState('json')
-  const [exportConsentOnly, setExportConsentOnly] = useState(false)
+  const [exportConsentOnly, setExportConsentOnly] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [exportMsg, setExportMsg] = useState('')
 
@@ -768,8 +768,9 @@ export default function Admin() {
                   <span>
                     Only include students who consented to research use
                     <span style={{ display: 'block', fontSize: '12px', color: '#9A948E', marginTop: '2px' }}>
-                      No students have consented yet — with this on, the export will currently be empty.
-                      Leave off to export all turns for now.
+                      On by default. Every user accepts the research notice on signup, so this
+                      excludes only people who later opted out in their Settings. Turn off to
+                      include those opt-outs too.
                     </span>
                   </span>
                 </label>

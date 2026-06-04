@@ -698,12 +698,14 @@ async def _gather_export_rows(db: AsyncSession, consent_only: bool) -> list[dict
 @router.get("/export/conversations")
 async def export_conversations(
     fmt: str = Query("json", alias="format"),
-    consent_only: bool = Query(False),
+    consent_only: bool = Query(True),
     _: str = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """De-identified per-turn export for research / model training.
-    `format` = json | csv. `consent_only` limits to consent_research=true users."""
+    `format` = json | csv. `consent_only` (default True) limits to consented
+    turns — every user now accepts the research notice on signup and pre-existing
+    data is backfilled as consented, so only explicit Settings opt-outs are excluded."""
     fmt = (fmt or "json").strip().lower()
     if fmt not in ("json", "csv"):
         raise HTTPException(status_code=400, detail="format must be 'json' or 'csv'")
