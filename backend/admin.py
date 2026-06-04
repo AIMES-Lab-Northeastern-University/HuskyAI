@@ -5,17 +5,21 @@ Set PLATFORM_ADMIN_EMAILS=comma@emails in .env; synced on app startup.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from anonymize import pseudonymize, scrub
 from auth import decode_token
 from database import (
     AsyncSessionLocal,
@@ -29,6 +33,46 @@ from database import (
     User,
     UserChallengeSession,
 )
+
+_KNOWN_DOMAINS = {"coding", "debugging", "data_analysis", "casual", "creative"}
+
+
+def _parse_domain(domain_raw) -> Optional[str]:
+    """Extract just the domain LABEL from the evaluator's `domain_raw`, which
+    comes in several shapes (JSON blob, 'domain: casual, ...', 'casual, 0.8, ...').
+    We deliberately keep only the label and discard the reasoning text — that
+    reasoning paraphrases the student's message and would leak content."""
+    if not domain_raw:
+        return None
+    s = str(domain_raw).strip()
+    label = None
+    if s.startswith("{"):
+        try:
+            label = json.loads(s).get("domain")
+        except Exception:
+            label = None
+    if not label:
+        m = re.search(r"domain\"?\s*[:=]\s*\"?([a-z_]+)", s, re.IGNORECASE)
+        if m:
+            label = m.group(1)
+    if not label:
+        label = re.split(r"[,\n]", s, 1)[0]  # e.g. "casual, 0.8, ..." -> "casual"
+    label = (label or "").strip().strip('"').lower()
+    return label or None
+
+
+# Order of the evaluator `breakdown` sub-metrics as flat CSV columns.
+_BREAKDOWN_KEYS = [
+    "initiative_ratio",
+    "verb_specificity",
+    "context_completeness",
+    "decomposition_depth",
+    "focus_clarity",
+    "constraint_defined",
+    "chunk_size_appropriate",
+    "correct_reliance_rate",
+    "verification_frequency",
+]
 
 log = logging.getLogger("admin")
 
@@ -295,6 +339,84 @@ async def user_activity(
 
 
 # ---------------------------------------------------------------------------
+# Per-conversation drill-down (full transcript + per-turn evaluation)
+# ---------------------------------------------------------------------------
+
+@router.get("/conversations/{conversation_id}")
+async def conversation_detail(
+    conversation_id: str,
+    _: str = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Full transcript of one conversation interleaved with each turn's PEI
+    scores and the evaluator's feedback. Admin-only; shows raw content."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    owner = await db.get(User, conv.user_id)
+
+    mr = await db.execute(
+        select(Message.role, Message.content, Message.created_at)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at)
+    )
+    # Pair messages into (user, assistant) turns in chronological order.
+    pairs: list[tuple[Optional[str], Optional[str]]] = []
+    pending_user: Optional[str] = None
+    for role, content, _created in mr.all():
+        if role == "user":
+            if pending_user is not None:
+                pairs.append((pending_user, None))
+            pending_user = content
+        elif role == "assistant":
+            pairs.append((pending_user, content))
+            pending_user = None
+    if pending_user is not None:
+        pairs.append((pending_user, None))
+
+    er = await db.execute(
+        select(EvalResult)
+        .where(EvalResult.conversation_id == conversation_id)
+        .order_by(EvalResult.turn_number)
+    )
+    evals = er.scalars().all()
+
+    turns = []
+    for i, (user_msg, asst_msg) in enumerate(pairs):
+        ev = evals[i] if i < len(evals) else None
+        fr = ev.full_result if (ev and isinstance(ev.full_result, dict)) else {}
+        turns.append({
+            "turn": ev.turn_number if ev else i + 1,
+            "prompt": user_msg,
+            "response": asst_msg,
+            "scores": None if not ev else {
+                "pei": ev.pei, "psq": ev.psq, "ccm": ev.ccm,
+                "tsi": ev.tsi, "clm": ev.clm, "ras": ev.ras,
+            },
+            "classification": ev.classification if ev else None,
+            "leading_status": ev.leading_status if ev else None,
+            "domain": _parse_domain(fr.get("domain_raw")) if fr else None,
+            "strengths": fr.get("strengths") if fr else None,
+            "suggestions": fr.get("suggestions") if fr else None,
+            "red_flags": fr.get("red_flags") if fr else None,
+        })
+
+    return {
+        "id": conv.id,
+        "started_at": conv.started_at.isoformat() if conv.started_at else None,
+        "ended_at": conv.ended_at.isoformat() if conv.ended_at else None,
+        "turn_count": conv.turn_count,
+        "user": {
+            "id": owner.id if owner else conv.user_id,
+            "name": owner.name if owner else None,
+            "email": owner.email if owner else None,
+        },
+        "turns": turns,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-classroom drill-down
 # ---------------------------------------------------------------------------
 
@@ -466,3 +588,166 @@ async def admin_benchmark_report_detail(
     if rep is None:
         raise HTTPException(status_code=404, detail="Report not found")
     return rep
+
+
+# ---------------------------------------------------------------------------
+# Anonymized research / model-training export
+#
+# Emits one row per *scored turn* (student prompt + assistant reply + PEI and
+# sub-scores). Identity is replaced by stable pseudonyms and PII inside the text
+# is scrubbed (see anonymize.py). NO name / email / user-id ever leaves the DB.
+#
+# `consent_only` defaults to False for now (no users have consent_research=true
+# yet). Once a consent checkbox is wired up, callers flip it to True and the
+# export is automatically limited to opted-in students — no code change needed.
+# ---------------------------------------------------------------------------
+
+async def _gather_export_rows(db: AsyncSession, consent_only: bool) -> list[dict]:
+    """Build the de-identified per-turn records. Pure data assembly — both the
+    JSON and CSV responses are rendered from this."""
+    # user_id -> (name, email, consent) so we can scrub each author's own
+    # identifiers out of their text and (optionally) filter by consent.
+    ur = await db.execute(select(User.id, User.name, User.email, User.consent_research))
+    user_info = {row[0]: (row[1], row[2], bool(row[3])) for row in ur.all()}
+
+    # Conversations that actually have scored turns.
+    er = await db.execute(
+        select(EvalResult).order_by(EvalResult.conversation_id, EvalResult.turn_number)
+    )
+    evals = er.scalars().all()
+    conv_ids = sorted({e.conversation_id for e in evals})
+    if not conv_ids:
+        return []
+
+    # Bulk-load conversation metadata + messages for just those conversations.
+    cr = await db.execute(
+        select(Conversation.id, Conversation.user_id, Conversation.started_at)
+        .where(Conversation.id.in_(conv_ids))
+    )
+    conv_meta = {row[0]: {"user_id": row[1], "started_at": row[2]} for row in cr.all()}
+
+    mr = await db.execute(
+        select(Message.conversation_id, Message.role, Message.content, Message.created_at)
+        .where(Message.conversation_id.in_(conv_ids))
+        .order_by(Message.conversation_id, Message.created_at)
+    )
+    msgs_by_conv: dict[str, list[tuple[str, str]]] = {}
+    for cid, role, content, _created in mr.all():
+        msgs_by_conv.setdefault(cid, []).append((role, content))
+
+    # Per conversation, evals in turn order. We match them to message pairs
+    # positionally (resumed sessions don't always start at turn 1, so the
+    # turn_number value is not a reliable index — but ordering is).
+    evals_by_conv: dict[str, list[EvalResult]] = {}
+    for e in evals:
+        evals_by_conv.setdefault(e.conversation_id, []).append(e)
+    for lst in evals_by_conv.values():
+        lst.sort(key=lambda e: e.turn_number)
+
+    rows: list[dict] = []
+    for cid in conv_ids:
+        meta = conv_meta.get(cid)
+        if not meta:
+            continue
+        name, email, _consent = user_info.get(meta["user_id"], (None, None, False))
+
+        student_pseudonym = pseudonymize(meta["user_id"], "anon")
+        conv_pseudonym = pseudonymize(cid, "conv")
+        started = meta["started_at"]
+        week = started.strftime("%G-W%V") if started else None
+
+        # Pair messages into (user, assistant) turns in chronological order.
+        pairs: list[tuple[Optional[str], Optional[str]]] = []
+        pending_user: Optional[str] = None
+        for role, content in msgs_by_conv.get(cid, []):
+            if role == "user":
+                if pending_user is not None:  # two users in a row — flush the first
+                    pairs.append((pending_user, None))
+                pending_user = content
+            elif role == "assistant":
+                pairs.append((pending_user, content))
+                pending_user = None
+        if pending_user is not None:
+            pairs.append((pending_user, None))
+
+        turn_evals = evals_by_conv.get(cid, [])
+        # Match scored turns to message pairs positionally, in order.
+        for ev, (user_msg, asst_msg) in zip(turn_evals, pairs):
+            # Per-turn consent snapshot: only export turns the student consented to.
+            if consent_only and not bool(getattr(ev, "consent_research", False)):
+                continue
+            fr = ev.full_result if isinstance(ev.full_result, dict) else {}
+            breakdown = fr.get("breakdown", {}) if isinstance(fr, dict) else {}
+            rows.append({
+                "student_pseudonym": student_pseudonym,
+                "conversation_pseudonym": conv_pseudonym,
+                "turn": ev.turn_number,
+                "week": week,
+                "domain": _parse_domain(fr.get("domain_raw")),
+                "classification": ev.classification,
+                "leading_status": ev.leading_status,
+                "pei": ev.pei, "psq": ev.psq, "ccm": ev.ccm,
+                "tsi": ev.tsi, "clm": ev.clm, "ras": ev.ras,
+                "breakdown": {k: breakdown.get(k) for k in _BREAKDOWN_KEYS},
+                "prompt": scrub(user_msg, name, email),
+                "response": scrub(asst_msg, name, email),
+            })
+    return rows
+
+
+@router.get("/export/conversations")
+async def export_conversations(
+    fmt: str = Query("json", alias="format"),
+    consent_only: bool = Query(False),
+    _: str = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """De-identified per-turn export for research / model training.
+    `format` = json | csv. `consent_only` limits to consent_research=true users."""
+    fmt = (fmt or "json").strip().lower()
+    if fmt not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="format must be 'json' or 'csv'")
+
+    rows = await _gather_export_rows(db, consent_only)
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+
+    if fmt == "json":
+        payload = {
+            "schema_version": 1,
+            "exported_at": datetime.utcnow().isoformat() + "Z",
+            "pii_scrubbed": True,
+            "consent_only": consent_only,
+            "turn_count": len(rows),
+            "turns": rows,
+        }
+        body = json.dumps(payload, indent=2, default=str)
+        return StreamingResponse(
+            iter([body]),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="huskyai-export-{stamp}.json"'},
+        )
+
+    # CSV: flatten breakdown sub-metrics into their own columns.
+    cols = (
+        ["student_pseudonym", "conversation_pseudonym", "turn", "week", "domain",
+         "classification", "leading_status", "pei", "psq", "ccm", "tsi", "clm", "ras"]
+        + _BREAKDOWN_KEYS
+        + ["prompt", "response"]
+    )
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(cols)
+    for r in rows:
+        bd = r["breakdown"]
+        writer.writerow(
+            [r["student_pseudonym"], r["conversation_pseudonym"], r["turn"], r["week"],
+             r["domain"], r["classification"], r["leading_status"],
+             r["pei"], r["psq"], r["ccm"], r["tsi"], r["clm"], r["ras"]]
+            + [bd.get(k) for k in _BREAKDOWN_KEYS]
+            + [r["prompt"], r["response"]]
+        )
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="huskyai-export-{stamp}.csv"'},
+    )

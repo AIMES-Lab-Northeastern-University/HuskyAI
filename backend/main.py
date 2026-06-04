@@ -155,6 +155,13 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
             db.add(Message(conversation_id=conversation_id, role="user", content=user_msg))
             db.add(Message(conversation_id=conversation_id, role="assistant", content=assistant_msg))
             scores = eval_data.get("scores", {})
+            # Snapshot the user's research consent at this instant (per-turn, so it
+            # survives mid-session toggles and resumed conversations).
+            consent_now = False
+            conv = await db.get(Conversation, conversation_id)
+            if conv:
+                owner = await db.get(User, conv.user_id)
+                consent_now = bool(owner.consent_research) if owner else False
             db.add(EvalResult(
                 conversation_id=conversation_id,
                 turn_number=turn_num,
@@ -167,6 +174,7 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                 classification=eval_data.get("classification"),
                 leading_status=eval_data.get("leading_status"),
                 full_result=eval_data,
+                consent_research=consent_now,
             ))
             res = await db.execute(
                 update(Conversation)

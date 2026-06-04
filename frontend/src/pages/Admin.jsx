@@ -43,7 +43,7 @@ function StatTile({ label, value }) {
 
 // ─── UserActivityModal ───────────────────────────────────────────────────────
 
-function UserActivityModal({ userId, onClose }) {
+function UserActivityModal({ userId, onClose, onOpenConversation }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
@@ -140,7 +140,7 @@ function UserActivityModal({ userId, onClose }) {
 
               {/* recent conversations */}
               <div style={{ fontSize: '10px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '8px' }}>
-                Recent conversations (last 20, metadata only)
+                Recent conversations (last 20) — click to open
               </div>
               {data.recent_conversations.length === 0 ? (
                 <p style={{ fontSize: '13px', color: '#6B6560', margin: 0 }}>No conversations yet.</p>
@@ -152,14 +152,24 @@ function UserActivityModal({ userId, onClose }) {
                         <th style={{ padding: '7px 10px', fontWeight: 700 }}>Started</th>
                         <th style={{ padding: '7px 10px', fontWeight: 700, textAlign: 'center' }}>Turns</th>
                         <th style={{ padding: '7px 10px', fontWeight: 700, color: '#9A948E', fontSize: '10px' }}>ID</th>
+                        <th style={{ padding: '7px 10px' }} />
                       </tr>
                     </thead>
                     <tbody>
                       {data.recent_conversations.map(c => (
-                        <tr key={c.id} style={{ borderTop: '1px solid #F0EBE5' }}>
+                        <tr
+                          key={c.id}
+                          onClick={() => c.turn_count > 0 && onOpenConversation?.(c.id)}
+                          style={{ borderTop: '1px solid #F0EBE5', cursor: c.turn_count > 0 ? 'pointer' : 'default' }}
+                          onMouseEnter={e => { if (c.turn_count > 0) e.currentTarget.style.background = '#FAFAF8' }}
+                          onMouseLeave={e => e.currentTarget.style.background = ''}
+                        >
                           <td style={{ padding: '7px 10px', color: '#16120E' }}>{fmt(c.started_at)}</td>
                           <td style={{ padding: '7px 10px', textAlign: 'center', color: '#4A4440' }}>{c.turn_count}</td>
                           <td style={{ padding: '7px 10px', color: '#9A948E', fontFamily: 'monospace', fontSize: '10px' }}>{c.id.slice(0, 8)}</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right', color: '#9A948E' }}>
+                            {c.turn_count > 0 ? '›' : ''}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -304,6 +314,119 @@ function ClassroomDetailModal({ classroomId, onClose }) {
   )
 }
 
+// ─── ConversationModal ───────────────────────────────────────────────────────
+
+function ScorePill({ label, value }) {
+  return (
+    <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '6px', background: '#F7F3EE', border: '1px solid #E7E0D8', color: '#4A4440' }}>
+      <span style={{ fontWeight: 700, color: '#16120E' }}>{label}</span> {value != null ? Number(value).toFixed(0) : '-'}
+    </span>
+  )
+}
+
+function ConversationModal({ conversationId, onClose }) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const r = await fetch(`${API_URL}/admin/conversations/${conversationId}`, { headers: { ...authHeaders() } })
+        const d = await r.json().catch(() => ({}))
+        if (!cancelled) {
+          if (r.ok) setData(d)
+          else setErr(formatApiErrorDetail(d.detail))
+        }
+      } catch { if (!cancelled) setErr('Network error') }
+      finally { if (!cancelled) setLoading(false) }
+    })()
+    return () => { cancelled = true }
+  }, [conversationId])
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, background: 'rgba(22,18,14,0.55)', zIndex: 60, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div
+        className="bg-[#FDFCFB] rounded-[16px] shadow-xl overflow-y-auto"
+        style={{ ...TILE, width: '100%', maxWidth: '720px', maxHeight: '90vh' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ padding: '18px 22px', borderBottom: '1px solid #F0EBE5', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', position: 'sticky', top: 0, background: '#FDFCFB', zIndex: 1 }}>
+          <div>
+            <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#16120E' }}>Conversation</div>
+            <div style={{ fontSize: '13px', color: '#6B6560', marginTop: '3px' }}>
+              {data?.user?.name || '—'} {data?.user?.email && <span style={{ color: '#9A948E' }}>· {data.user.email}</span>}
+              {data && <span style={{ color: '#9A948E' }}> · {fmt(data.started_at)} · {data.turn_count} turns</span>}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ border: 'none', background: '#F7F3EE', borderRadius: '8px', width: '34px', height: '34px', cursor: 'pointer', fontSize: '18px', color: '#4A4440' }}>×</button>
+        </div>
+
+        <div style={{ padding: '20px 22px' }}>
+          {loading && <div style={{ fontSize: '14px', color: '#9A948E' }}>Loading…</div>}
+          {err && <div style={{ fontSize: '13px', color: '#C8102E' }}>{err}</div>}
+          {!loading && !err && data?.turns?.map((t, i) => (
+            <div key={i} style={{ marginBottom: '22px', paddingBottom: '18px', borderBottom: i < data.turns.length - 1 ? '1px solid #F0EBE5' : 'none' }}>
+              <div style={{ fontSize: '10px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '8px' }}>
+                Turn {t.turn}{t.domain ? ` · ${t.domain}` : ''}{t.classification ? ` · ${t.classification}` : ''}
+              </div>
+
+              {/* user prompt */}
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
+                <div style={{ maxWidth: '85%', background: '#16120E', color: '#FDFCFB', borderRadius: '12px 12px 2px 12px', padding: '9px 13px', fontSize: '13px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {t.prompt || <em style={{ opacity: 0.6 }}>(no prompt)</em>}
+                </div>
+              </div>
+              {/* assistant response */}
+              {t.response != null && (
+                <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: '10px' }}>
+                  <div style={{ maxWidth: '85%', background: '#F7F3EE', color: '#16120E', borderRadius: '12px 12px 12px 2px', padding: '9px 13px', fontSize: '13px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', border: '1px solid #E7E0D8' }}>
+                    {t.response}
+                  </div>
+                </div>
+              )}
+
+              {/* scores */}
+              {t.scores && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '4px' }}>
+                  <ScorePill label="PEI" value={t.scores.pei} />
+                  <ScorePill label="PSQ" value={t.scores.psq} />
+                  <ScorePill label="CCM" value={t.scores.ccm} />
+                  <ScorePill label="TSI" value={t.scores.tsi} />
+                  <ScorePill label="CLM" value={t.scores.clm} />
+                  <ScorePill label="RAS" value={t.scores.ras} />
+                </div>
+              )}
+
+              {/* feedback */}
+              {(t.strengths?.length || t.suggestions?.length || t.red_flags?.length) ? (
+                <div style={{ marginTop: '10px', display: 'grid', gap: '6px' }}>
+                  {t.strengths?.length > 0 && (
+                    <div style={{ fontSize: '12px', color: '#15803D' }}><strong>Strengths:</strong> {t.strengths.join('; ')}</div>
+                  )}
+                  {t.suggestions?.length > 0 && (
+                    <div style={{ fontSize: '12px', color: '#6B6560' }}><strong>Suggestions:</strong> {t.suggestions.join('; ')}</div>
+                  )}
+                  {t.red_flags?.length > 0 && (
+                    <div style={{ fontSize: '12px', color: '#C8102E' }}><strong>Red flags:</strong> {t.red_flags.join('; ')}</div>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          ))}
+          {!loading && !err && (!data?.turns || data.turns.length === 0) && (
+            <p style={{ fontSize: '13px', color: '#6B6560' }}>No turns in this conversation.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Main Admin component ───────────────────────────────────────────────────
 
 export default function Admin() {
@@ -327,6 +450,13 @@ export default function Admin() {
   // modals
   const [drillUserId, setDrillUserId] = useState(null)
   const [drillClassroomId, setDrillClassroomId] = useState(null)
+  const [drillConversationId, setDrillConversationId] = useState(null)
+
+  // export tab
+  const [exportFmt, setExportFmt] = useState('json')
+  const [exportConsentOnly, setExportConsentOnly] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [exportMsg, setExportMsg] = useState('')
 
   const handleLogout = () => {
     localStorage.removeItem('token')
@@ -387,6 +517,36 @@ export default function Admin() {
     finally { setPromotingId(null) }
   }
 
+  // Download the anonymized export. Uses fetch (not a plain link) so we can send
+  // the auth header, then triggers a browser download from the blob.
+  const downloadExport = async () => {
+    setExporting(true)
+    setExportMsg('')
+    try {
+      const url = `${API_URL}/admin/export/conversations?format=${exportFmt}&consent_only=${exportConsentOnly}`
+      const r = await fetch(url, { headers: { ...authHeaders() } })
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}))
+        setExportMsg(formatApiErrorDetail(d.detail) || 'Export failed')
+        return
+      }
+      const blob = await r.blob()
+      const cd = r.headers.get('Content-Disposition') || ''
+      const m = cd.match(/filename="?([^"]+)"?/)
+      const filename = m ? m[1] : `huskyai-export.${exportFmt}`
+      const objUrl = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objUrl
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(objUrl)
+      setExportMsg(`Downloaded ${filename}`)
+    } catch { setExportMsg('Network error') }
+    finally { setExporting(false) }
+  }
+
   const counts = overviewData?.counts
   const ax = overviewData?.analytics
   const filteredUsers = users.filter(u =>
@@ -397,6 +557,7 @@ export default function Admin() {
     { id: 'overview', label: 'Overview' },
     { id: 'users', label: 'Users' },
     { id: 'classrooms', label: 'Classrooms' },
+    { id: 'export', label: 'Export' },
     { id: 'invite', label: 'Invite' },
     { id: 'benchmark', label: 'Benchmark' },
   ]
@@ -567,6 +728,76 @@ export default function Admin() {
             </>
           )}
 
+          {/* ── EXPORT TAB ── */}
+          {activeTab === 'export' && (
+            <div style={{ maxWidth: '640px' }}>
+              <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '24px', color: '#16120E', marginBottom: '6px' }}>
+                Anonymized data export
+              </div>
+              <p style={{ fontSize: '13px', color: '#6B6560', lineHeight: 1.6, marginBottom: '18px' }}>
+                One row per scored turn (student prompt + assistant reply + PEI and sub-scores).
+                Identity is replaced by stable pseudonyms (<code>anon-xxxx</code> / <code>conv-xxxx</code>)
+                and PII inside the text (emails, phone numbers, NUIDs, names) is scrubbed.
+                <strong> No name, email, or user id is ever included.</strong>
+              </p>
+
+              <div className="bg-[#FDFCFB] rounded-[12px] p-5" style={TILE}>
+                {/* format */}
+                <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>Format</div>
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '18px' }}>
+                  {[['json', 'JSON (nested turns)'], ['csv', 'CSV (scores table)']].map(([v, lbl]) => (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => setExportFmt(v)}
+                      style={{
+                        padding: '8px 14px', borderRadius: '8px', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                        background: exportFmt === v ? '#16120E' : 'transparent',
+                        color: exportFmt === v ? '#fff' : '#4A4440',
+                        border: exportFmt === v ? 'none' : '1.5px solid #E7E0D8',
+                      }}
+                    >
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+
+                {/* consent */}
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: '9px', fontSize: '13px', color: '#4A4440', cursor: 'pointer', marginBottom: '6px' }}>
+                  <input type="checkbox" checked={exportConsentOnly} onChange={e => setExportConsentOnly(e.target.checked)} style={{ marginTop: '2px' }} />
+                  <span>
+                    Only include students who consented to research use
+                    <span style={{ display: 'block', fontSize: '12px', color: '#9A948E', marginTop: '2px' }}>
+                      No students have consented yet — with this on, the export will currently be empty.
+                      Leave off to export all turns for now.
+                    </span>
+                  </span>
+                </label>
+
+                <div style={{ marginTop: '18px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <button
+                    type="button"
+                    onClick={downloadExport}
+                    disabled={exporting}
+                    style={{ padding: '9px 18px', borderRadius: '8px', border: 'none', background: '#C8102E', color: '#fff', fontSize: '13px', fontWeight: 700, cursor: 'pointer', opacity: exporting ? 0.6 : 1 }}
+                  >
+                    {exporting ? 'Preparing…' : 'Download export'}
+                  </button>
+                  {exportMsg && (
+                    <span style={{ fontSize: '13px', color: exportMsg.includes('error') || exportMsg.includes('failed') ? '#C8102E' : '#15803D' }}>
+                      {exportMsg}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <p style={{ fontSize: '12px', color: '#9A948E', lineHeight: 1.6, marginTop: '14px' }}>
+                Scrubbing is best-effort — free text can still carry PII a pattern won't catch.
+                Spot-check a sample before sharing externally. See <code>docs/data-anonymization.md</code>.
+              </p>
+            </div>
+          )}
+
           {/* ── INVITE TAB ── */}
           {activeTab === 'invite' && <InviteTemplate />}
 
@@ -615,8 +846,15 @@ export default function Admin() {
       </div>
 
       {/* modals */}
-      {drillUserId && <UserActivityModal userId={drillUserId} onClose={() => setDrillUserId(null)} />}
+      {drillUserId && (
+        <UserActivityModal
+          userId={drillUserId}
+          onClose={() => setDrillUserId(null)}
+          onOpenConversation={(cid) => setDrillConversationId(cid)}
+        />
+      )}
       {drillClassroomId && <ClassroomDetailModal classroomId={drillClassroomId} onClose={() => setDrillClassroomId(null)} />}
+      {drillConversationId && <ConversationModal conversationId={drillConversationId} onClose={() => setDrillConversationId(null)} />}
     </div>
   )
 }

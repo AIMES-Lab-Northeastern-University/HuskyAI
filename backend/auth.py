@@ -71,6 +71,7 @@ class TokenResponse(BaseModel):
     name: str
     email: str
     is_platform_admin: bool = False
+    consent_research: bool = False
 
 
 class MeResponse(BaseModel):
@@ -78,6 +79,11 @@ class MeResponse(BaseModel):
     name: str
     email: str
     is_platform_admin: bool = False
+    consent_research: bool = False
+
+
+class UpdateMeRequest(BaseModel):
+    consent_research: bool
 
 
 def create_token(user_id: str) -> str:
@@ -113,6 +119,7 @@ async def register(req: RegisterRequest):
         name=user.name,
         email=user.email,
         is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
+        consent_research=bool(getattr(user, "consent_research", False)),
     )
 
 
@@ -129,6 +136,7 @@ async def login(req: LoginRequest):
         name=user.name,
         email=user.email,
         is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
+        consent_research=bool(getattr(user, "consent_research", False)),
     )
 
 
@@ -153,4 +161,25 @@ async def me(user_id: str = Depends(_bearer_user_id)):
             name=u.name,
             email=u.email,
             is_platform_admin=bool(getattr(u, "is_platform_admin", False)),
+            consent_research=bool(getattr(u, "consent_research", False)),
+        )
+
+
+@router.patch("/me", response_model=MeResponse)
+async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id)):
+    """Update the caller's research-consent flag. Governs FUTURE turns only —
+    each turn snapshots this value when it is scored (see _save_turn)."""
+    async with AsyncSessionLocal() as db:
+        u = await db.get(User, user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="User not found")
+        u.consent_research = bool(req.consent_research)
+        await db.commit()
+        await db.refresh(u)
+        return MeResponse(
+            user_id=u.id,
+            name=u.name,
+            email=u.email,
+            is_platform_admin=bool(getattr(u, "is_platform_admin", False)),
+            consent_research=bool(u.consent_research),
         )

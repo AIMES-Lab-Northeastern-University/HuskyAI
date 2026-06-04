@@ -94,6 +94,48 @@ export default function Settings() {
   const [classCode, setClassCode] = useState('')
   const [joinMsg, setJoinMsg] = useState('')
   const [joining, setJoining] = useState(false)
+  const [consentResearch, setConsentResearch] = useState(false)
+  const [consentSaving, setConsentSaving] = useState(false)
+  const [consentMsg, setConsentMsg] = useState('')
+
+  // Load current research-consent state (not applicable in demo mode).
+  useEffect(() => {
+    if (isDemo) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const r = await fetch(`${API_URL}/auth/me`, { headers: { ...authHeaders() } })
+        const d = await r.json().catch(() => ({}))
+        if (!cancelled && r.ok) setConsentResearch(!!d.consent_research)
+      } catch { /* leave default */ }
+    })()
+    return () => { cancelled = true }
+  }, [isDemo])
+
+  const toggleConsent = async (val) => {
+    if (isDemo) { setConsentMsg('Sign in to change this.'); return }
+    setConsentResearch(val)          // optimistic
+    setConsentSaving(true)
+    setConsentMsg('')
+    try {
+      const r = await fetch(`${API_URL}/auth/me`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ consent_research: val }),
+      })
+      const d = await r.json().catch(() => ({}))
+      if (r.ok) {
+        setConsentResearch(!!d.consent_research)
+        setConsentMsg('Saved')
+      } else {
+        setConsentResearch(!val)     // revert
+        setConsentMsg('Could not save — try again')
+      }
+    } catch {
+      setConsentResearch(!val)       // revert
+      setConsentMsg('Network error')
+    } finally { setConsentSaving(false) }
+  }
 
   const loadMyClassrooms = useCallback(async () => {
     if (isDemo) return
@@ -412,6 +454,30 @@ export default function Settings() {
                     />
                   </div>
                 ))}
+              </div>
+
+              {/* Research & Data section */}
+              <div className="bg-[#FDFCFB] rounded-[14px] p-5" style={{ borderWidth: '1.5px', borderStyle: 'solid', borderColor: '#E7E0D8' }}>
+                <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '14px' }}>Research &amp; Data</div>
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px' }}>
+                  <div>
+                    <div style={{ fontSize: '13px', fontWeight: 500, color: '#16120E' }}>Use my conversations for research</div>
+                    <div style={{ fontSize: '12px', color: '#9A948E', marginTop: '4px', lineHeight: 1.6, maxWidth: '460px' }}>
+                      Allow my chats and prompt scores to help improve HuskyAI and train models.
+                      Exported data is anonymized — your name and email are never included.
+                      This applies to conversations going forward; you can turn it off anytime.
+                      To remove data already collected, contact your instructor.
+                    </div>
+                    {consentMsg && (
+                      <div style={{ fontSize: '12px', marginTop: '8px', color: consentMsg === 'Saved' ? '#16A34A' : '#C8102E' }}>
+                        {consentMsg}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ opacity: consentSaving ? 0.6 : 1 }}>
+                    <Toggle checked={consentResearch} onChange={toggleConsent} />
+                  </div>
+                </div>
               </div>
 
               {/* Danger zone */}
