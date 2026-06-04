@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -228,6 +228,40 @@ async def _close_conversation(conversation_id: str):
         log.error(f"Failed to close conversation: {e}")
 
 
+async def _finalize_session(conversation_id: str) -> float | None:
+    """End a conversation and finalize its linked challenge session (avg PEI +
+    completed). Used for timer auto-end. Safe to call repeatedly. Returns the
+    session average PEI rounded to 1 dp, or None."""
+    try:
+        async with AsyncSessionLocal() as db:
+            conv = await db.get(Conversation, conversation_id)
+            if not conv:
+                return None
+            avg_pei = (await db.execute(
+                select(func.avg(EvalResult.pei)).where(
+                    EvalResult.conversation_id == conversation_id,
+                    EvalResult.pei.is_not(None),
+                )
+            )).scalar()
+            if conv.ended_at is None:
+                conv.ended_at = datetime.utcnow()
+            ucs = (await db.execute(
+                select(UserChallengeSession).where(
+                    UserChallengeSession.conversation_id == conversation_id
+                )
+            )).scalar_one_or_none()
+            if ucs:
+                if avg_pei is not None:
+                    ucs.session_avg_pei = round(float(avg_pei), 2)
+                ucs.status = "completed"
+                ucs.completed_at = datetime.utcnow()
+            await db.commit()
+            return round(float(avg_pei), 1) if avg_pei is not None else None
+    except Exception as e:
+        log.error(f"Failed to finalize session: {e}")
+        return None
+
+
 async def _build_system_prompt(challenge_id: str | None, session_num: int | None) -> tuple[str, dict | None]:
     """Return (system_prompt, session_data_dict) for the given challenge/session."""
     if not challenge_id:
@@ -284,6 +318,10 @@ async def websocket_endpoint(
     conversation_history: list[dict] = []
     resumed = False
     session_is_completed = False
+    # Timed-session snapshot (from the UserChallengeSession). None = untimed.
+    session_time_limit = None
+    session_min_turns = None
+    session_started_at = None
     try:
         async with AsyncSessionLocal() as db:
             # Resume an existing challenge-session conversation when possible so chat
@@ -298,6 +336,10 @@ async def websocket_endpoint(
                     )
                 )
                 ucs = result.scalar_one_or_none()
+                if ucs:
+                    session_time_limit = ucs.time_limit_minutes
+                    session_min_turns = ucs.min_turns
+                    session_started_at = ucs.started_at
                 if ucs and ucs.conversation_id:
                     existing = await db.get(Conversation, ucs.conversation_id)
                     if existing and existing.user_id == user_id:
@@ -335,17 +377,43 @@ async def websocket_endpoint(
                         )
                     )
                     ucs = result.scalar_one_or_none()
+                    if ucs:
+                        session_time_limit = ucs.time_limit_minutes
+                        session_min_turns = ucs.min_turns
+                        session_started_at = ucs.started_at
                     if ucs and not ucs.conversation_id:
                         ucs.conversation_id = conversation_id
                         await db.commit()
     except Exception as e:
         log.error(f"Failed to create conversation record: {e}")
 
+    # Timed-session deadline (None = untimed). Anchored to the server-side start time.
+    session_deadline = (
+        session_started_at + timedelta(minutes=session_time_limit)
+        if (session_started_at and session_time_limit) else None
+    )
+    # Lazy finalize: a session left open past its deadline is ended on next connect.
+    if conversation_id and session_deadline and not session_is_completed and datetime.utcnow() >= session_deadline:
+        await _finalize_session(conversation_id)
+        session_is_completed = True
+
+    # Server-computed remaining time so the client never has to parse timestamps
+    # or worry about clock skew. Recomputed fresh on every (re)connect, so refresh
+    # resumes the same countdown.
+    remaining_seconds = (
+        max(0, int((session_deadline - datetime.utcnow()).total_seconds()))
+        if session_deadline else None
+    )
+
     # Always send conversation_id so the client can call the end-session REST endpoint
     if conversation_id:
         await websocket.send_text(json.dumps({
             "type": "session_init",
             "conversation_id": conversation_id,
+            "time_limit_minutes": session_time_limit,
+            "min_turns": session_min_turns,
+            "remaining_seconds": remaining_seconds,
+            "turn_count": len(conversation_history) // 2,
         }))
 
     # Send session context to client immediately if challenge mode
@@ -391,6 +459,14 @@ async def websocket_endpoint(
             user_content = data.get("content", "").strip()
             if not user_content:
                 log.warning("[WS] Received empty message content, skipping")
+                continue
+
+            # Server-side timer enforcement: once past the deadline, refuse new
+            # messages and finalize the session (defends against client tampering).
+            if session_deadline and datetime.utcnow() >= session_deadline:
+                await _finalize_session(conversation_id)
+                await websocket.send_text(json.dumps({"type": "session_ended"}))
+                log.info(f"[WS] Message rejected, session past deadline (conv: {conversation_id})")
                 continue
 
             turn = len(conversation_history) // 2 + 1
@@ -524,6 +600,29 @@ async def end_conversation(
     if not conv or conv.user_id != user_id:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    ucs_result = await db.execute(
+        select(UserChallengeSession).where(
+            UserChallengeSession.conversation_id == conversation_id,
+            UserChallengeSession.user_id == user_id,
+        )
+    )
+    ucs = ucs_result.scalar_one_or_none()
+
+    # Min-turns gate: block an early manual end until the minimum turns are met,
+    # unless the timer has already expired (the timer is a hard cap that wins).
+    if ucs and ucs.min_turns:
+        turns_done = conv.turn_count or 0
+        past_deadline = bool(
+            ucs.time_limit_minutes
+            and ucs.started_at
+            and datetime.utcnow() >= ucs.started_at + timedelta(minutes=ucs.time_limit_minutes)
+        )
+        if turns_done < ucs.min_turns and not past_deadline:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Send at least {ucs.min_turns} turns before ending (you have {turns_done}).",
+            )
+
     result = await db.execute(
         select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
             EvalResult.conversation_id == conversation_id,
@@ -536,13 +635,6 @@ async def end_conversation(
 
     conv.ended_at = datetime.utcnow()
 
-    ucs_result = await db.execute(
-        select(UserChallengeSession).where(
-            UserChallengeSession.conversation_id == conversation_id,
-            UserChallengeSession.user_id == user_id,
-        )
-    )
-    ucs = ucs_result.scalar_one_or_none()
     if ucs:
         if avg_pei is not None:
             ucs.session_avg_pei = round(float(avg_pei), 2)

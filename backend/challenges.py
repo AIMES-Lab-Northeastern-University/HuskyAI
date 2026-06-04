@@ -766,6 +766,9 @@ class CreateChallengeBody(BaseModel):
     difficulty: str = Field(default="Beginner", max_length=64)
     week: Optional[int] = None
     total_sessions: int = Field(default=1, ge=1, le=6)
+    # Timed-session settings (optional; null = untimed / no minimum).
+    time_limit_minutes: Optional[int] = Field(None, ge=1, le=120)
+    min_turns: Optional[int] = Field(None, ge=1, le=50)
     is_active: Optional[bool] = None  # None → publish immediately (default); False → save as draft
 
 
@@ -775,6 +778,10 @@ class UpdateChallengeBody(BaseModel):
     category: Optional[str] = Field(None, max_length=120)
     difficulty: Optional[str] = Field(None, max_length=64)
     week: Optional[int] = None
+    # null clears the setting (untimed). "Field set vs unset" is checked via
+    # model_fields_set so an explicit null can distinguish from "not provided".
+    time_limit_minutes: Optional[int] = Field(None, ge=1, le=120)
+    min_turns: Optional[int] = Field(None, ge=1, le=50)
     is_active: Optional[bool] = None
 
 
@@ -939,6 +946,8 @@ async def list_challenges(
             "difficulty": ch.difficulty,
             "week": ch.week,
             "total_sessions": ch.total_sessions,
+            "time_limit_minutes": ch.time_limit_minutes,
+            "min_turns": ch.min_turns,
             "sessions_completed": completed,
             "best_pei": best_pei,
             "is_active": bool(ch.is_active),
@@ -998,6 +1007,8 @@ async def create_challenge(
         week=body.week,
         total_sessions=body.total_sessions,
         sessions_data=sessions_data,
+        time_limit_minutes=body.time_limit_minutes,
+        min_turns=body.min_turns,
         is_active=body.is_active if body.is_active is not None else True,
         status="draft" if body.is_active is False else "published",
         created_by_user_id=user_id,
@@ -1029,14 +1040,7 @@ async def update_challenge(
     user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if (
-        body.title is None
-        and body.description is None
-        and body.category is None
-        and body.difficulty is None
-        and body.week is None
-        and body.is_active is None
-    ):
+    if not body.model_fields_set:
         raise HTTPException(status_code=400, detail="Provide at least one field to update")
 
     ch = await db.get(Challenge, challenge_id)
@@ -1058,6 +1062,11 @@ async def update_challenge(
         ch.difficulty = body.difficulty.strip() or "Beginner"
     if body.week is not None:
         ch.week = body.week
+    # Timer fields: applied when explicitly present (an explicit null clears them).
+    if "time_limit_minutes" in body.model_fields_set:
+        ch.time_limit_minutes = body.time_limit_minutes
+    if "min_turns" in body.model_fields_set:
+        ch.min_turns = body.min_turns
     if body.is_active is not None:
         ch.is_active = body.is_active
     await db.commit()
@@ -1067,6 +1076,8 @@ async def update_challenge(
         "title": ch.title,
         "is_active": bool(ch.is_active),
         "week": ch.week,
+        "time_limit_minutes": ch.time_limit_minutes,
+        "min_turns": ch.min_turns,
     }
 
 
@@ -1126,6 +1137,8 @@ async def get_challenge(
         "difficulty": ch.difficulty,
         "week": ch.week,
         "total_sessions": ch.total_sessions,
+        "time_limit_minutes": ch.time_limit_minutes,
+        "min_turns": ch.min_turns,
         "sessions": sessions_out,
     }
 
@@ -1181,6 +1194,11 @@ async def start_session(
             session_number=session_number,
             status="in_progress",
             started_at=datetime.utcnow(),
+            # Snapshot the challenge's timer settings now, so later instructor
+            # edits don't change the rules mid-attempt. The countdown is anchored
+            # to started_at + time_limit_minutes.
+            time_limit_minutes=ch.time_limit_minutes,
+            min_turns=ch.min_turns,
         )
         db.add(session_record)
         await db.commit()
@@ -1188,6 +1206,8 @@ async def start_session(
     elif session_record.status == "not_started":
         session_record.status = "in_progress"
         session_record.started_at = datetime.utcnow()
+        session_record.time_limit_minutes = ch.time_limit_minutes
+        session_record.min_turns = ch.min_turns
         await db.commit()
 
     sd = ch.sessions_data[session_number - 1]
@@ -1201,6 +1221,9 @@ async def start_session(
         "brief": sd["brief"],
         "seed_question": sd["seed_question"],
         "conversation_id": session_record.conversation_id,
+        "time_limit_minutes": session_record.time_limit_minutes,
+        "min_turns": session_record.min_turns,
+        "started_at": session_record.started_at.isoformat() if session_record.started_at else None,
     }
 
 

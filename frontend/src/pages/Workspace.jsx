@@ -87,6 +87,12 @@ function DimBar({ code, value = 0, max = 100 }) {
   )
 }
 
+/* Format a millisecond remainder as M:SS for the session countdown. */
+function fmtClock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
 /* ─── Eval Panel ─── */
 function EvalSidebar({ evalData, isEvaluating, turnCount }) {
   const pei = evalData?.scores?.PEI ?? 0
@@ -280,10 +286,17 @@ export default function Workspace() {
   const [sessionEnded, setSessionEnded]   = useState(false)
   const [endingSession, setEndingSession] = useState(false)
   const [sessionScore, setSessionScore]   = useState(null)
+  // Timed-session state. minTurns / deadlineMs are null when the challenge is untimed.
+  const [minTurns, setMinTurns]           = useState(null)
+  const [deadlineMs, setDeadlineMs]       = useState(null)
+  const [remainingMs, setRemainingMs]     = useState(null)
+  const [timeWarning, setTimeWarning]     = useState(false)
 
   const wsRef              = useRef(null)
   const reconnectTimer     = useRef(null)
   const sessionEndedRef    = useRef(false)
+  const warnedRef          = useRef(false)
+  const autoEndRef         = useRef(false)
   const streamBuffer       = useRef('')
   const messagesEndRef     = useRef(null)
   const textareaRef        = useRef(null)
@@ -306,6 +319,19 @@ export default function Workspace() {
     switch (data.type) {
       case 'session_init':
         setConversationId(data.conversation_id)
+        setMinTurns(typeof data.min_turns === 'number' ? data.min_turns : null)
+        if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
+        if (typeof data.remaining_seconds === 'number') {
+          // Anchor the countdown to the client clock at connect; the server still
+          // enforces the real cutoff, so small skew is harmless.
+          warnedRef.current = false
+          setTimeWarning(false)
+          setDeadlineMs(Date.now() + data.remaining_seconds * 1000)
+          setRemainingMs(data.remaining_seconds * 1000)
+        } else {
+          setDeadlineMs(null)
+          setRemainingMs(null)
+        }
         break
       case 'session_ended':
         sessionEndedRef.current = true
@@ -392,9 +418,11 @@ export default function Workspace() {
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent])
 
-  const handleEndSession = async () => {
-    if (!conversationId || sessionEnded || endingSession || isDemo) return
+  const handleEndSession = async ({ auto = false } = {}) => {
+    if (isDemo || !conversationId) return
+    if (!auto && (sessionEnded || endingSession)) return
     setEndingSession(true)
+    let ok = false
     try {
       const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000'
       const resp = await fetch(`${apiBase}/conversations/${conversationId}/end`, {
@@ -403,18 +431,47 @@ export default function Workspace() {
       })
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}))
-        sessionEndedRef.current = true
-        setSessionEnded(true)
         setSessionScore(data.session_avg_pei ?? null)
-        clearTimeout(reconnectTimer.current)
-        wsRef.current?.close()
+        ok = true
       }
     } catch (e) {
       console.error('Failed to end session', e)
     } finally {
       setEndingSession(false)
     }
+    // Lock on success; on a timer auto-end also lock even if the request hiccuped
+    // (the server enforces the cutoff regardless, so the UI must reflect it).
+    if (ok || auto) {
+      sessionEndedRef.current = true
+      setSessionEnded(true)
+      clearTimeout(reconnectTimer.current)
+      wsRef.current?.close()
+    }
   }
+
+  // Live countdown for timed sessions: tick each second, warn at 1 minute, auto-end at 0.
+  useEffect(() => {
+    if (!deadlineMs || sessionEnded || isDemo) return
+    let cancelled = false
+    const tick = () => {
+      if (cancelled) return
+      const rem = deadlineMs - Date.now()
+      setRemainingMs(rem)
+      if (rem <= 60000 && rem > 0 && !warnedRef.current) {
+        warnedRef.current = true
+        setTimeWarning(true)
+      }
+      if (rem <= 0 && !autoEndRef.current) {
+        autoEndRef.current = true
+        handleEndSession({ auto: true })
+      }
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => { cancelled = true; clearInterval(id) }
+    // handleEndSession is intentionally excluded; the autoEndRef guard makes it fire once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deadlineMs, sessionEnded, isDemo])
 
   const handleSend = useCallback(() => {
     const content = input.trim()
@@ -497,26 +554,56 @@ export default function Workspace() {
             </div>
           )}
           <div className="ml-auto flex items-center gap-3">
-            {conversationId && !isDemo && (
-              <button
-                onClick={handleEndSession}
-                disabled={sessionEnded || endingSession}
+            {/* Live countdown chip (timed sessions only) */}
+            {!isDemo && !sessionEnded && remainingMs != null && (
+              <div
                 style={{
-                  padding: '5px 14px',
-                  background: sessionEnded ? '#F7F3EE' : '#FDE8EC',
-                  color: sessionEnded ? '#9A948E' : '#C8102E',
-                  border: '1.5px solid',
-                  borderColor: sessionEnded ? '#E7E0D8' : '#F9BFCA',
-                  borderRadius: '8px',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  cursor: sessionEnded || endingSession ? 'default' : 'pointer',
-                  opacity: endingSession ? 0.6 : 1,
+                  display: 'flex', alignItems: 'center', gap: '5px',
+                  padding: '4px 10px', borderRadius: '8px',
+                  fontSize: '12px', fontWeight: 700, fontVariantNumeric: 'tabular-nums',
+                  background: timeWarning ? '#FEF3E8' : '#F7F3EE',
+                  color: timeWarning ? '#C2410C' : '#6B6560',
+                  border: `1px solid ${timeWarning ? '#FED7AA' : '#E7E0D8'}`,
                 }}
+                title={timeWarning ? 'Session ends soon' : 'Time remaining in this session'}
               >
-                {sessionEnded ? 'Session Ended' : endingSession ? 'Ending…' : 'End Session'}
-              </button>
+                <span aria-hidden>⏱</span>{fmtClock(remainingMs)}
+              </div>
             )}
+            {conversationId && !isDemo && (() => {
+              const minTurnsMet = minTurns == null || turnCount >= minTurns
+              const turnsLeft = minTurns != null ? Math.max(0, minTurns - turnCount) : 0
+              const disabled = sessionEnded || endingSession || !minTurnsMet
+              return (
+                <button
+                  onClick={() => handleEndSession()}
+                  disabled={disabled}
+                  title={!minTurnsMet && !sessionEnded
+                    ? `Send ${turnsLeft} more turn${turnsLeft !== 1 ? 's' : ''} to end`
+                    : undefined}
+                  style={{
+                    padding: '5px 14px',
+                    background: disabled ? '#F7F3EE' : '#FDE8EC',
+                    color: disabled ? '#9A948E' : '#C8102E',
+                    border: '1.5px solid',
+                    borderColor: disabled ? '#E7E0D8' : '#F9BFCA',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: disabled ? 'default' : 'pointer',
+                    opacity: endingSession ? 0.6 : 1,
+                  }}
+                >
+                  {sessionEnded
+                    ? 'Session Ended'
+                    : endingSession
+                      ? 'Ending…'
+                      : !minTurnsMet
+                        ? `End Session (${turnCount}/${minTurns})`
+                        : 'End Session'}
+                </button>
+              )
+            })()}
             <div className="flex items-center gap-1.5 text-[12px] text-[#9A948E]">
               <div className="w-[6px] h-[6px] rounded-full" style={{ background: connDot[connStatus] }} />
               {isDemo

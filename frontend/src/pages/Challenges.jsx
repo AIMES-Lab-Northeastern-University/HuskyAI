@@ -52,6 +52,10 @@ export default function Challenges() {
   const [createDifficulty, setCreateDifficulty] = useState('Beginner')
   const [createWeek, setCreateWeek] = useState('')
   const [createTotalSessions, setCreateTotalSessions] = useState(3)
+  // Timed-session settings for the create form. Off by default = untimed.
+  const [createTimed, setCreateTimed] = useState(false)
+  const [createTimeLimit, setCreateTimeLimit] = useState(15)
+  const [createMinTurns, setCreateMinTurns] = useState(5)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
@@ -142,6 +146,8 @@ export default function Challenges() {
           difficulty: createDifficulty,
           week: weekNum,
           total_sessions: createTotalSessions,
+          time_limit_minutes: createTimed ? createTimeLimit : null,
+          min_turns: createTimed ? createMinTurns : null,
           is_active: publish,
         }),
       })
@@ -518,6 +524,30 @@ export default function Challenges() {
                       <input type="range" min={1} max={10} value={createTotalSessions} onChange={e => setCreateTotalSessions(Number(e.target.value))} style={{ flex: 1 }} />
                     </div>
                   </div>
+                  {/* Timed session (optional) */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#4A4440', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={createTimed} onChange={e => setCreateTimed(e.target.checked)} />
+                    Timed session
+                  </label>
+                  {createTimed && (
+                    <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        Time limit
+                        <input type="number" min={1} max={120} value={createTimeLimit}
+                          onChange={e => setCreateTimeLimit(Number(e.target.value))}
+                          style={{ ...inputStyle, flex: '0 0 80px' }} /> min
+                      </label>
+                      <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        Min turns
+                        <input type="number" min={1} max={50} value={createMinTurns}
+                          onChange={e => setCreateMinTurns(Number(e.target.value))}
+                          style={{ ...inputStyle, flex: '0 0 80px' }} />
+                      </label>
+                      <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%', lineHeight: 1.5 }}>
+                        Auto-ends at the time limit. Students can end early only after the minimum turns. Applies to sessions started after you save.
+                      </span>
+                    </div>
+                  )}
                   {createMsg && <div style={{ fontSize: '12px', color: createMsg.includes('published') || createMsg.includes('saved') ? '#16A34A' : '#C8102E' }}>{createMsg}</div>}
                   <div style={{ display: 'flex', gap: '10px' }}>
                     <button
