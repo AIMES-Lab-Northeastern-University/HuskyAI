@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
+import SessionAnalysisCard from '../components/SessionAnalysisCard'
 import { getDemoChallengeDetail, demoSlugForChallengeId } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -34,6 +35,60 @@ export default function ChallengeDetail() {
   const [error, setError] = useState('')
   const [starting, setStarting] = useState(null)   // session number being started
   const [completing, setCompleting] = useState(null) // session number being marked complete
+  // Post-session analysis modal (revisit a completed session's analysis).
+  const [analysisOpen, setAnalysisOpen] = useState(false)
+  const [analysisData, setAnalysisData] = useState(null)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+
+  const [analysisConvId, setAnalysisConvId] = useState(null)
+
+  const pollAnalysis = async (conversationId) => {
+    const token = localStorage.getItem('token')
+    setAnalysisLoading(true)
+    // Usually ready for a completed session; poll briefly in case it's still generating.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const resp = await fetch(`${API_URL}/conversations/${conversationId}/analysis`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (resp.ok) {
+          const data = await resp.json().catch(() => ({}))
+          setAnalysisData(data)
+          if (data && (data.status === 'ready' || data.status === 'failed' || data.status === 'none')) {
+            setAnalysisLoading(false)
+            return
+          }
+        }
+      } catch (e) {
+        console.error('Failed to fetch session analysis', e)
+      }
+      await new Promise((r) => setTimeout(r, 3000))
+    }
+    setAnalysisLoading(false)
+  }
+
+  const openAnalysis = (conversationId) => {
+    if (!conversationId) return
+    setAnalysisData(null)
+    setAnalysisConvId(conversationId)
+    setAnalysisOpen(true)
+    pollAnalysis(conversationId)
+  }
+
+  const handleRetryAnalysis = async () => {
+    if (!analysisConvId) return
+    const token = localStorage.getItem('token')
+    setAnalysisData({ status: 'pending' })
+    try {
+      await fetch(`${API_URL}/conversations/${analysisConvId}/analysis/retry`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    } catch (e) {
+      console.error('Failed to retry analysis', e)
+    }
+    pollAnalysis(analysisConvId)
+  }
 
   const handleLogout = () => {
     if (isDemo) {
@@ -413,6 +468,25 @@ export default function ChallengeDetail() {
                                 Review session
                               </button>
                             )}
+
+                            {/* completed: View analysis (real sessions with a saved conversation) */}
+                            {session.status === 'completed' && !isDemo && session.conversation_id && (
+                              <button
+                                onClick={() => openAnalysis(session.conversation_id)}
+                                style={{
+                                  padding: '8px 20px',
+                                  background: '#C8102E',
+                                  color: '#fff',
+                                  border: 'none',
+                                  borderRadius: '8px',
+                                  fontSize: '13px',
+                                  fontWeight: 600,
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                View analysis
+                              </button>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -425,6 +499,41 @@ export default function ChallengeDetail() {
           </div>
         </div>
       </div>
+
+      {/* Post-session analysis modal */}
+      {analysisOpen && (
+        <div
+          onClick={() => setAnalysisOpen(false)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(22,18,14,0.42)', backdropFilter: 'blur(4px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '24px',
+            animation: 'fadeIn 0.2s ease',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: '#FDFCFB', borderRadius: '16px', border: '1.5px solid #E7E0D8',
+              width: '100%', maxWidth: '560px', maxHeight: '85vh', overflowY: 'auto',
+              padding: '26px 28px', boxShadow: '0 24px 60px rgba(0,0,0,0.22)',
+              animation: 'modalPop 0.28s cubic-bezier(0.22,1,0.36,1)',
+            }}
+          >
+            <style>{`@keyframes fadeIn{from{opacity:0}to{opacity:1}}@keyframes modalPop{from{opacity:0;transform:translateY(12px) scale(0.98)}to{opacity:1;transform:none}}`}</style>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '4px' }}>
+              <button
+                type="button"
+                onClick={() => setAnalysisOpen(false)}
+                aria-label="Close"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', color: '#9A948E', lineHeight: 1 }}
+              >
+                ×
+              </button>
+            </div>
+            <SessionAnalysisCard analysis={analysisData} loading={analysisLoading} onRetry={handleRetryAnalysis} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -151,6 +151,12 @@ class UserChallengeSession(Base):
     # starts, so later instructor edits don't disrupt an in-progress attempt.
     time_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Post-session analysis: an LLM-written synthesis of the whole session,
+    # generated once in the background when the session is marked completed.
+    # JSON shape: {status: "pending"|"ready"|"failed", session_pei, level,
+    # dimension_averages, strongest_dimension, weakest_dimension, trend,
+    # narrative, takeaways, strengths, turns_analyzed, generated_at, model}.
+    session_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class ClassroomMembership(Base):
@@ -253,6 +259,13 @@ async def init_db():
                 await conn.execute(
                     text(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS min_turns INTEGER")
                 )
+            # Post-session analysis blob (nullable; generated lazily on completion).
+            await conn.execute(
+                text(
+                    "ALTER TABLE user_challenge_sessions ADD COLUMN IF NOT EXISTS "
+                    "session_analysis JSON"
+                )
+            )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             # Detect whether research_ack_at already exists, to gate the one-time backfill.
@@ -275,6 +288,7 @@ async def init_db():
                 ("ALTER TABLE challenges ADD COLUMN min_turns INTEGER", ("duplicate column", "already exists")),
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN time_limit_minutes INTEGER", ("duplicate column", "already exists")),
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN min_turns INTEGER", ("duplicate column", "already exists")),
+                ("ALTER TABLE user_challenge_sessions ADD COLUMN session_analysis JSON", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))
