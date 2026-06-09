@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
+from session_analysis import analyze_session
 from sqlalchemy import select, update, func
 
 from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession, User
@@ -87,6 +89,66 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 
+# --- Post-session analysis: background-task plumbing ---------------------------
+# A "pending" analysis older than this is treated as orphaned (e.g. the worker
+# process died mid-generation) and gets regenerated rather than wedged forever.
+_ANALYSIS_STALE_SECONDS = 300
+
+# Strong references to in-flight background tasks. asyncio only keeps weak refs
+# to tasks, so without this the GC can collect one mid-run (e.g. while it's
+# awaiting the LLM) and the analysis silently never completes.
+_analysis_tasks: set = set()
+
+
+def _pending_blob() -> dict:
+    """The 'analysis is generating' marker, timestamped so we can detect a stall."""
+    return {"status": "pending", "pending_at": datetime.utcnow().isoformat()}
+
+
+def _pending_is_stale(blob: dict | None) -> bool:
+    pa = (blob or {}).get("pending_at")
+    if not pa:
+        return True  # legacy pending rows (no timestamp) -> regenerate
+    try:
+        started = datetime.fromisoformat(pa)
+    except ValueError:
+        return True
+    return (datetime.utcnow() - started).total_seconds() > _ANALYSIS_STALE_SECONDS
+
+
+def _spawn_analysis(conversation_id: str, user_id: str):
+    """Fire-and-forget the analysis generator while holding a strong task ref."""
+    task = asyncio.create_task(_generate_session_analysis(conversation_id, user_id))
+    _analysis_tasks.add(task)
+    task.add_done_callback(_analysis_tasks.discard)
+
+
+async def _resweep_stuck_analyses():
+    """Startup sweep: re-queue any sessions left 'pending' by a previous process
+    (a deploy/crash mid-generation would otherwise wedge them permanently)."""
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(UserChallengeSession).where(
+                    UserChallengeSession.conversation_id.is_not(None),
+                    UserChallengeSession.session_analysis.is_not(None),
+                )
+            )).scalars().all()
+            requeued = 0
+            for ucs in rows:
+                blob = ucs.session_analysis or {}
+                if blob.get("status") == "pending":
+                    # Refresh the timestamp so concurrent pollers don't double-fire.
+                    ucs.session_analysis = _pending_blob()
+                    _spawn_analysis(ucs.conversation_id, ucs.user_id)
+                    requeued += 1
+            if requeued:
+                await db.commit()
+                log.info(f"[SESSION-ANALYSIS] re-queued {requeued} stuck pending analyses on startup")
+    except Exception as e:
+        log.error(f"[SESSION-ANALYSIS] startup sweep failed: {type(e).__name__}: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     env = os.getenv("ENVIRONMENT", "").strip().lower()
@@ -108,6 +170,7 @@ async def lifespan(app: FastAPI):
     await seed_challenges()
     await seed_demo_classroom()
     await seed_pilot_classroom()
+    await _resweep_stuck_analyses()
     yield
 
 
@@ -250,12 +313,19 @@ async def _finalize_session(conversation_id: str) -> float | None:
                     UserChallengeSession.conversation_id == conversation_id
                 )
             )).scalar_one_or_none()
+            schedule_analysis = False
             if ucs:
                 if avg_pei is not None:
                     ucs.session_avg_pei = round(float(avg_pei), 2)
                 ucs.status = "completed"
                 ucs.completed_at = datetime.utcnow()
+                # Same background post-session analysis as the manual /end path.
+                if (ucs.session_analysis or {}).get("status") not in ("ready", "pending"):
+                    ucs.session_analysis = _pending_blob()
+                    schedule_analysis = True
             await db.commit()
+            if schedule_analysis:
+                _spawn_analysis(conversation_id, conv.user_id)
             return round(float(avg_pei), 1) if avg_pei is not None else None
     except Exception as e:
         log.error(f"Failed to finalize session: {e}")
@@ -589,6 +659,87 @@ async def websocket_endpoint(
             await _close_conversation(conversation_id)
 
 
+async def _generate_session_analysis(conversation_id: str, user_id: str):
+    """
+    Background task: build the post-session analysis for a completed session and
+    store it on UserChallengeSession.session_analysis. Opens its own DB session
+    (the request's session is already closed by the time this runs). Idempotent:
+    skips if a "ready" analysis already exists; records {"status": "failed"} so
+    the UI can stop polling and the next /end call can retry.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            ucs_q = await db.execute(
+                select(UserChallengeSession).where(
+                    UserChallengeSession.conversation_id == conversation_id,
+                    UserChallengeSession.user_id == user_id,
+                )
+            )
+            ucs = ucs_q.scalar_one_or_none()
+            if ucs is None:
+                return
+            if (ucs.session_analysis or {}).get("status") == "ready":
+                return
+
+            msgs = (await db.execute(
+                select(Message)
+                .where(Message.conversation_id == conversation_id)
+                .order_by(Message.created_at, Message.id)
+            )).scalars().all()
+            transcript = [{"role": m.role, "content": m.content} for m in msgs]
+
+            # Order positionally by creation time (turn_number is unreliable across
+            # resumed sessions); enumerate to give each turn a stable display index.
+            evals = (await db.execute(
+                select(EvalResult)
+                .where(EvalResult.conversation_id == conversation_id)
+                .order_by(EvalResult.created_at, EvalResult.id)
+            )).scalars().all()
+            per_turn = []
+            for i, e in enumerate(evals, start=1):
+                fr = e.full_result or {}
+                per_turn.append({
+                    "turn": i,
+                    "pei": e.pei,
+                    "scores": {"PSQ": e.psq, "CCM": e.ccm, "TSI": e.tsi, "CLM": e.clm, "RAS": e.ras},
+                    "classification": e.classification,
+                    "turn_summary": fr.get("turn_summary") or "",
+                    # The concrete per-turn feedback the evaluator already produced.
+                    # The session analyst consolidates these into session takeaways
+                    # instead of inventing generic advice from scratch.
+                    "suggestions": fr.get("suggestions") or [],
+                    "red_flags": fr.get("red_flags") or [],
+                })
+
+            challenge_ctx = None
+            ch = await db.get(Challenge, ucs.challenge_id)
+            if ch is not None:
+                challenge_ctx = {"title": ch.title, "objective": ch.description}
+
+            analysis = await analyze_session(transcript, per_turn, challenge_ctx)
+
+            # Re-fetch inside this session to attach the result to a live row.
+            ucs.session_analysis = analysis
+            await db.commit()
+            log.info(f"[SESSION-ANALYSIS] stored for conversation {conversation_id[:8]}...")
+    except Exception as e:
+        log.error(f"[SESSION-ANALYSIS] failed for {conversation_id[:8]}...: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            async with AsyncSessionLocal() as db2:
+                ucs_q = await db2.execute(
+                    select(UserChallengeSession).where(
+                        UserChallengeSession.conversation_id == conversation_id,
+                        UserChallengeSession.user_id == user_id,
+                    )
+                )
+                ucs = ucs_q.scalar_one_or_none()
+                if ucs is not None and (ucs.session_analysis or {}).get("status") != "ready":
+                    ucs.session_analysis = {"status": "failed"}
+                    await db2.commit()
+        except Exception:
+            pass
+
+
 @app.post("/conversations/{conversation_id}/end")
 async def end_conversation(
     conversation_id: str,
@@ -635,17 +786,97 @@ async def end_conversation(
 
     conv.ended_at = datetime.utcnow()
 
+    schedule_analysis = False
     if ucs:
         if avg_pei is not None:
             ucs.session_avg_pei = round(float(avg_pei), 2)
         ucs.status = "completed"
         ucs.completed_at = datetime.utcnow()
+        # Kick off the post-session analysis in the background unless one is
+        # already done or in flight. Mark it "pending" now so the UI can poll.
+        prior_status = (ucs.session_analysis or {}).get("status")
+        if prior_status not in ("ready", "pending"):
+            ucs.session_analysis = _pending_blob()
+            schedule_analysis = True
 
     await db.commit()
+
+    if schedule_analysis:
+        _spawn_analysis(conversation_id, user_id)
+
     return {
         "session_avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,
         "turns": int(turn_count or 0),
+        "analysis_status": (ucs.session_analysis or {}).get("status") if ucs else None,
     }
+
+
+@app.get("/conversations/{conversation_id}/analysis")
+async def get_session_analysis(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Return the stored post-session analysis for a session (the frontend polls
+    this after /end until status is 'ready' or 'failed')."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    ucs_q = await db.execute(
+        select(UserChallengeSession).where(
+            UserChallengeSession.conversation_id == conversation_id,
+            UserChallengeSession.user_id == user_id,
+        )
+    )
+    ucs = ucs_q.scalar_one_or_none()
+    if ucs is None or not ucs.session_analysis:
+        return {"status": "none"}
+
+    # Self-heal: if generation has been "pending" too long (worker died, deploy
+    # mid-flight), re-queue it. Refresh the timestamp first so rapid polling
+    # doesn't fire the task repeatedly within the staleness window.
+    if ucs.session_analysis.get("status") == "pending" and _pending_is_stale(ucs.session_analysis):
+        ucs.session_analysis = _pending_blob()
+        await db.commit()
+        _spawn_analysis(conversation_id, user_id)
+        log.info(f"[SESSION-ANALYSIS] re-queued stale pending for {conversation_id[:8]}...")
+
+    return ucs.session_analysis
+
+
+@app.post("/conversations/{conversation_id}/analysis/retry")
+async def retry_session_analysis(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Manually re-trigger generation (powers the 'Try again' button on a failed
+    analysis). No-op if one is already ready or freshly generating."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    ucs_q = await db.execute(
+        select(UserChallengeSession).where(
+            UserChallengeSession.conversation_id == conversation_id,
+            UserChallengeSession.user_id == user_id,
+        )
+    )
+    ucs = ucs_q.scalar_one_or_none()
+    if ucs is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    blob = ucs.session_analysis or {}
+    status = blob.get("status")
+    # Re-run unless it's already done or actively generating (a stale pending is fair game).
+    if status == "ready" or (status == "pending" and not _pending_is_stale(blob)):
+        return {"status": status}
+
+    ucs.session_analysis = _pending_blob()
+    await db.commit()
+    _spawn_analysis(conversation_id, user_id)
+    return {"status": "pending"}
 
 
 if __name__ == "__main__":

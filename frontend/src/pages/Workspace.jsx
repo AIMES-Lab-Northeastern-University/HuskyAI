@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams, Navigate, useLocation } from 'react-route
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
+import SessionAnalysisCard from '../components/SessionAnalysisCard'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
@@ -286,6 +287,10 @@ export default function Workspace() {
   const [sessionEnded, setSessionEnded]   = useState(false)
   const [endingSession, setEndingSession] = useState(false)
   const [sessionScore, setSessionScore]   = useState(null)
+  // Post-session analysis (generated in the background on the server; polled after /end).
+  const [showAnalysis, setShowAnalysis]   = useState(false)
+  const [analysis, setAnalysis]           = useState(null)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
   // Timed-session state. minTurns / deadlineMs are null when the challenge is untimed.
   const [minTurns, setMinTurns]           = useState(null)
   const [deadlineMs, setDeadlineMs]       = useState(null)
@@ -418,6 +423,49 @@ export default function Workspace() {
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent])
 
+  // Poll the post-session analysis until it's ready or failed (it generates in
+  // the background on the server). Capped so a stuck job doesn't poll forever.
+  const pollAnalysis = useCallback(async (convId) => {
+    if (isDemo || !convId) return
+    const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+    setAnalysisLoading(true)
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        const resp = await fetch(`${apiBase}/conversations/${convId}/analysis`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (resp.ok) {
+          const data = await resp.json().catch(() => ({}))
+          if (data && (data.status === 'ready' || data.status === 'failed')) {
+            setAnalysis(data)
+            setAnalysisLoading(false)
+            return
+          }
+          setAnalysis(data)
+        }
+      } catch (e) {
+        console.error('Failed to fetch session analysis', e)
+      }
+      await new Promise((r) => setTimeout(r, 3000))
+    }
+    setAnalysisLoading(false)
+  }, [isDemo, token])
+
+  const handleRetryAnalysis = useCallback(async () => {
+    if (isDemo || !conversationId) return
+    const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+    setAnalysis({ status: 'pending' })
+    try {
+      await fetch(`${apiBase}/conversations/${conversationId}/analysis/retry`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    } catch (e) {
+      console.error('Failed to retry analysis', e)
+    }
+    pollAnalysis(conversationId)
+  }, [isDemo, conversationId, token, pollAnalysis])
+
   const handleEndSession = async ({ auto = false } = {}) => {
     if (isDemo || !conversationId) return
     if (!auto && (sessionEnded || endingSession)) return
@@ -433,6 +481,9 @@ export default function Workspace() {
         const data = await resp.json().catch(() => ({}))
         setSessionScore(data.session_avg_pei ?? null)
         ok = true
+        // Surface the analysis panel and start polling for the background result.
+        setShowAnalysis(true)
+        pollAnalysis(conversationId)
       }
     } catch (e) {
       console.error('Failed to end session', e)
@@ -708,6 +759,18 @@ export default function Workspace() {
                     <span> · Session avg PEI: <strong style={{ color: '#C8102E' }}>{sessionScore}</strong></span>
                   )}
                   {' '}— saved to your Husky Score.
+                  <div style={{ marginTop: '10px' }}>
+                    <button
+                      type="button"
+                      onClick={() => setShowAnalysis(true)}
+                      style={{
+                        background: '#C8102E', color: '#fff', border: 'none', borderRadius: '8px',
+                        padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                      }}
+                    >
+                      View session analysis
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <div className="flex gap-3 items-end bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3" style={{ borderWidth: '1.5px' }}>
@@ -746,6 +809,41 @@ export default function Workspace() {
           </div>
         </div>
       </div>
+
+      {/* Post-session analysis modal */}
+      {showAnalysis && !isDemo && (
+        <div
+          onClick={() => setShowAnalysis(false)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(22,18,14,0.42)', backdropFilter: 'blur(4px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '24px',
+            animation: 'fadeIn 0.2s ease',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: '#FDFCFB', borderRadius: '16px', border: '1.5px solid #E7E0D8',
+              width: '100%', maxWidth: '560px', maxHeight: '85vh', overflowY: 'auto',
+              padding: '26px 28px', boxShadow: '0 24px 60px rgba(0,0,0,0.22)',
+              animation: 'modalPop 0.28s cubic-bezier(0.22,1,0.36,1)',
+            }}
+          >
+            <style>{`@keyframes fadeIn{from{opacity:0}to{opacity:1}}@keyframes modalPop{from{opacity:0;transform:translateY(12px) scale(0.98)}to{opacity:1;transform:none}}`}</style>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '4px' }}>
+              <button
+                type="button"
+                onClick={() => setShowAnalysis(false)}
+                aria-label="Close"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', color: '#9A948E', lineHeight: 1 }}
+              >
+                ×
+              </button>
+            </div>
+            <SessionAnalysisCard analysis={analysis} loading={analysisLoading} onRetry={handleRetryAnalysis} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
