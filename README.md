@@ -15,7 +15,7 @@ Web application for Northeastern students to practice prompting with a chat mode
 7. [Database schema](#database-schema)
 8. [API surface (summary)](#api-surface-summary)
 9. [Running locally](#running-locally)
-10. [Deploying to Railway](#deploying-to-railway)
+10. [Deploying to Railway](#deployed-to-railway)
 11. [Environment variables](#environment-variables)
 
 ---
