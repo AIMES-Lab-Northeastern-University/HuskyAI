@@ -1,5 +1,7 @@
 import os
+import io
 import json
+import base64
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -15,7 +17,7 @@ from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
 from sqlalchemy import select, update, func
 
-from database import init_db, AsyncSessionLocal, Conversation, Message, EvalResult, Challenge, UserChallengeSession, User
+from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User
 from auth import router as auth_router, decode_token, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
@@ -202,21 +204,130 @@ async def health_check():
     return {"status": "ok"}
 
 
+# --- Attachment handling (multimodal doc/image upload) -----------------------
+# Minimal pass-through: files arrive on the WS message as base64, are turned into
+# Gemini Parts, and ride along with the turn. Documents Gemini reads natively
+# (PDF, images, plain text) are sent as raw bytes; .docx is extracted to text
+# (Gemini can't parse the .docx binary). Nothing is persisted to the DB yet.
+
+_MAX_ATTACH_BYTES = 15 * 1024 * 1024  # 15 MB per file (pre-base64)
+_MAX_ATTACH_COUNT = 5
+
+# MIME types Gemini understands when handed the raw bytes.
+_NATIVE_ATTACH_MIME = {
+    "application/pdf",
+    "text/plain", "text/markdown", "text/csv", "text/html",
+    "image/png", "image/jpeg", "image/webp", "image/gif",
+}
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _extract_docx_text(raw: bytes) -> str:
+    """Pull visible text (paragraphs + tables) from .docx bytes via python-docx."""
+    import docx  # imported lazily so the dep is only needed when a .docx arrives
+
+    document = docx.Document(io.BytesIO(raw))
+    parts = [p.text for p in document.paragraphs if p.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
+
+def _attachment_to_parts(att: dict) -> list:
+    """Turn one {filename, mime_type, data(base64)} dict into Gemini Part(s)."""
+    filename = (att.get("filename") or "file").strip()
+    mime = (att.get("mime_type") or "").split(";")[0].strip().lower()
+    try:
+        raw = base64.b64decode(att.get("data", ""), validate=False)
+    except Exception:
+        log.warning(f"[attach] bad base64 for {filename!r}, skipping")
+        return []
+    if not raw:
+        return []
+
+    if mime == _DOCX_MIME or filename.lower().endswith(".docx"):
+        try:
+            text = _extract_docx_text(raw)
+        except Exception as e:
+            log.warning(f"[attach] docx extract failed for {filename!r}: {e}")
+            return [types.Part(text=f'[Attached document "{filename}" could not be read.]')]
+        return [types.Part(text=(
+            f'The user attached a document named "{filename}". Its contents:\n\n'
+            f'{text}\n\n----- END OF "{filename}" -----'
+        ))]
+
+    if mime in _NATIVE_ATTACH_MIME:
+        return [types.Part.from_bytes(data=raw, mime_type=mime)]
+
+    # Unknown type: best-effort decode as UTF-8 text, else give up gracefully.
+    try:
+        text = raw.decode("utf-8")
+        return [types.Part(text=f'The user attached a file named "{filename}". Its contents:\n\n{text}')]
+    except Exception:
+        log.warning(f"[attach] unsupported type {mime!r} for {filename!r}, skipping")
+        return [types.Part(text=f'[Attached file "{filename}" has an unsupported type and was not read.]')]
+
+
+def _build_attachment_parts(attachments) -> list:
+    parts = []
+    for att in attachments or []:
+        parts.extend(_attachment_to_parts(att))
+    return parts
+
+
+def _sanitize_attachments(attachments) -> list:
+    """Cap count and per-file size before we do any decoding/model work."""
+    clean = []
+    for att in (attachments or [])[:_MAX_ATTACH_COUNT]:
+        b64 = att.get("data", "") or ""
+        approx_bytes = (len(b64) * 3) // 4  # base64 -> raw size estimate
+        if approx_bytes > _MAX_ATTACH_BYTES:
+            log.warning(f"[attach] {att.get('filename')!r} ~{approx_bytes} bytes exceeds limit, skipping")
+            continue
+        clean.append(att)
+    return clean
+
+
 def _build_gemini_history(conversation_history: list) -> list:
     history = []
     for msg in conversation_history:
         role = "user" if msg["role"] == "user" else "model"
-        history.append(
-            types.Content(role=role, parts=[types.Part(text=msg["content"])])
-        )
+        parts = []
+        if role == "user":
+            parts.extend(_build_attachment_parts(msg.get("attachments")))
+        parts.append(types.Part(text=msg["content"]))
+        history.append(types.Content(role=role, parts=parts))
     return history
 
 
-async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int):
+async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None):
     try:
         async with AsyncSessionLocal() as db:
-            db.add(Message(conversation_id=conversation_id, role="user", content=user_msg))
+            user_message = Message(conversation_id=conversation_id, role="user", content=user_msg)
+            db.add(user_message)
             db.add(Message(conversation_id=conversation_id, role="assistant", content=assistant_msg))
+            # Persist uploaded files, linked to this user message, so they survive
+            # reconnects/refreshes and can be replayed when the conversation resumes.
+            if attachments:
+                await db.flush()  # assign user_message.id before linking attachments
+                for att in attachments:
+                    try:
+                        raw = base64.b64decode(att.get("data", ""), validate=False)
+                    except Exception:
+                        continue
+                    if not raw:
+                        continue
+                    db.add(Attachment(
+                        conversation_id=conversation_id,
+                        message_id=user_message.id,
+                        filename=(att.get("filename") or "file")[:512],
+                        mime_type=(att.get("mime_type") or "application/octet-stream")[:255],
+                        size_bytes=len(raw),
+                        data=raw,
+                    ))
             scores = eval_data.get("scores", {})
             # Snapshot the user's research consent at this instant (per-turn, so it
             # survives mid-session toggles and resumed conversations).
@@ -429,8 +540,29 @@ async def websocket_endpoint(
                             .where(Message.conversation_id == conversation_id)
                             .order_by(Message.created_at)
                         )
-                        for m in mr.scalars().all():
-                            conversation_history.append({"role": m.role, "content": m.content})
+                        msgs = mr.scalars().all()
+                        # Reload persisted attachments and re-attach them to their
+                        # user messages so the model regains the file context.
+                        ar = await db.execute(
+                            sa_select(Attachment)
+                            .where(Attachment.conversation_id == conversation_id)
+                        )
+                        atts_by_msg: dict[str, list] = {}
+                        for a in ar.scalars().all():
+                            atts_by_msg.setdefault(a.message_id, []).append(a)
+                        for m in msgs:
+                            item = {"role": m.role, "content": m.content}
+                            mas = atts_by_msg.get(m.id)
+                            if mas:
+                                item["attachments"] = [
+                                    {
+                                        "filename": a.filename,
+                                        "mime_type": a.mime_type,
+                                        "data": base64.b64encode(a.data).decode(),
+                                    }
+                                    for a in mas
+                                ]
+                            conversation_history.append(item)
 
             if not conversation_id:
                 conv = Conversation(user_id=user_id)
@@ -501,11 +633,23 @@ async def websocket_endpoint(
             }
         }))
 
-    # Replay any prior messages from a resumed conversation so the client UI rehydrates
+    # Replay any prior messages from a resumed conversation so the client UI rehydrates.
+    # Strip attachment bytes — the client only needs filenames to redraw the chips.
     if resumed and conversation_history:
+        client_history = [
+            {
+                "role": m["role"],
+                "content": m["content"],
+                "attachments": [
+                    {"name": a.get("filename") or a.get("name")}
+                    for a in m.get("attachments", [])
+                ],
+            }
+            for m in conversation_history
+        ]
         await websocket.send_text(json.dumps({
             "type": "history",
-            "messages": conversation_history,
+            "messages": client_history,
             "turn_count": len(conversation_history) // 2,
         }))
 
@@ -530,9 +674,13 @@ async def websocket_endpoint(
                 continue
 
             user_content = data.get("content", "").strip()
-            if not user_content:
-                log.warning("[WS] Received empty message content, skipping")
+            attachments = _sanitize_attachments(data.get("attachments"))
+            if not user_content and not attachments:
+                log.warning("[WS] Received empty message (no text, no attachments), skipping")
                 continue
+            # If only files were sent, give the model a default instruction.
+            if not user_content:
+                user_content = "Please take a look at the attached file(s)."
 
             # Server-side timer enforcement: once past the deadline, refuse new
             # messages and finalize the session (defends against client tampering).
@@ -548,11 +696,21 @@ async def websocket_endpoint(
             log.info(f"[TURN {turn}] User ({len(user_content)} chars): {preview!r}{ellipsis}")
 
             gemini_history = _build_gemini_history(conversation_history)
+            turn_parts = _build_attachment_parts(attachments)
+            turn_parts.append(types.Part(text=user_content))
             contents = gemini_history + [
-                types.Content(role="user", parts=[types.Part(text=user_content)])
+                types.Content(role="user", parts=turn_parts)
             ]
+            if attachments:
+                names = ", ".join(a.get("filename", "file") for a in attachments)
+                log.info(f"[TURN {turn}] User attached {len(attachments)} file(s): {names}")
 
-            conversation_history.append({"role": "user", "content": user_content})
+            # Keep attachments on the in-memory history item so the model retains
+            # the file context across later turns of this session. (Not persisted:
+            # on reconnect the file is gone, which is fine for this first pass.)
+            conversation_history.append(
+                {"role": "user", "content": user_content, "attachments": attachments}
+            )
 
             await websocket.send_text(json.dumps({"type": "typing"}))
             log.debug(f"[TURN {turn}] Sent 'typing' signal to client")
@@ -639,7 +797,7 @@ async def websocket_endpoint(
                 log.debug(f"[TURN {turn}] Red flags:   {eval_result.get('red_flags', [])}")
                 # Persist before notifying the client so a fast disconnect cannot cancel the save.
                 if conversation_id:
-                    await _save_turn(conversation_id, user_content, full_response, eval_result, turn)
+                    await _save_turn(conversation_id, user_content, full_response, eval_result, turn, attachments)
                 await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
             except Exception as e:
                 log.error(f"[TURN {turn}] Eval error: {type(e).__name__}: {e}", exc_info=True)

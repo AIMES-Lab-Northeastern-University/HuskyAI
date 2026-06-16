@@ -174,7 +174,7 @@ function EvalSidebar({ evalData, isEvaluating, turnCount }) {
 }
 
 /* ─── Message bubble ─── */
-function Message({ role, content }) {
+function Message({ role, content, attachments }) {
   const isUser = role === 'user'
   return (
     <div className={`flex gap-3 message-enter ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -191,8 +191,20 @@ function Message({ role, content }) {
           ? 'bg-[#EDEAE4] border-[#E7E0D8] text-[#16120E] rounded-br-[4px]'
           : 'bg-[#FDFCFB] border-[#E7E0D8] text-[#16120E] rounded-bl-[4px]'
       }`} style={{ borderWidth: '1.5px' }}>
+        {Array.isArray(attachments) && attachments.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {attachments.map((a, i) => (
+              <span key={i} className="inline-flex items-center gap-1 px-2 py-1 rounded-[8px] bg-[#FDFCFB] border border-[#D8D0C6] text-[11px] text-[#4A4440]" style={{ borderWidth: '1px' }}>
+                <svg className="w-3 h-3 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+                {a.name}
+              </span>
+            ))}
+          </div>
+        )}
         {isUser
-          ? <p>{content}</p>
+          ? (content ? <p>{content}</p> : null)
           : <div className="prose-chat"><ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown></div>
         }
       </div>
@@ -281,6 +293,7 @@ export default function Workspace() {
   const [connStatus, setConnStatus]       = useState('disconnected')
   const [turnCount, setTurnCount]         = useState(0)
   const [input, setInput]                 = useState('')
+  const [attachments, setAttachments]     = useState([]) // [{ name, mime, data(base64), size }]
   const [challengeContext, setChallengeContext] = useState(null)
   const [briefExpanded, setBriefExpanded] = useState(true)
   const [conversationId, setConversationId] = useState(null)
@@ -306,8 +319,38 @@ export default function Workspace() {
   const streamBuffer       = useRef('')
   const messagesEndRef     = useRef(null)
   const textareaRef        = useRef(null)
+  const fileInputRef       = useRef(null)
 
   const userInitials = user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : 'U'
+
+  /* ─── File attachments (doc/image upload) ─── */
+  const ATTACH_ACCEPT = '.pdf,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.gif'
+  const MAX_ATTACH_BYTES = 15 * 1024 * 1024 // keep in sync with backend
+
+  const addFiles = (fileList) => {
+    Array.from(fileList || []).forEach((file) => {
+      if (file.size > MAX_ATTACH_BYTES) {
+        alert(`"${file.name}" is too large (max 15 MB).`)
+        return
+      }
+      const reader = new FileReader()
+      reader.onload = () => {
+        const base64 = String(reader.result || '').split(',')[1] || ''
+        setAttachments((prev) => [
+          ...prev,
+          { name: file.name, mime: file.type || 'application/octet-stream', data: base64, size: file.size },
+        ])
+      }
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const handleFileInput = (e) => {
+    addFiles(e.target.files)
+    e.target.value = '' // allow re-picking the same file
+  }
+
+  const removeAttachment = (idx) => setAttachments((prev) => prev.filter((_, i) => i !== idx))
 
   const handleLogout = () => {
     if (isDemo) {
@@ -351,7 +394,11 @@ export default function Workspace() {
           setMessages(
             data.messages
               .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
-              .map(m => ({ role: m.role, content: m.content })),
+              .map(m => ({
+                role: m.role,
+                content: m.content,
+                attachments: Array.isArray(m.attachments) && m.attachments.length ? m.attachments : undefined,
+              })),
           )
         }
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
@@ -528,10 +575,13 @@ export default function Workspace() {
 
   const handleSend = useCallback(() => {
     const content = input.trim()
-    if (!content || isStreaming || isTyping || isEvaluating) return
+    const hasFiles = attachments.length > 0
+    if ((!content && !hasFiles) || isStreaming || isTyping || isEvaluating) return
+    // Lightweight chips for the message bubble (just the names, not the bytes).
+    const fileChips = attachments.map(a => ({ name: a.name }))
     if (isDemo) {
-      setMessages(prev => [...prev, { role: 'user', content }])
-      setInput('')
+      setMessages(prev => [...prev, { role: 'user', content, attachments: fileChips }])
+      setInput(''); setAttachments([])
       if (textareaRef.current) textareaRef.current.style.height = 'auto'
       setIsTyping(true)
       window.setTimeout(() => {
@@ -548,11 +598,12 @@ export default function Workspace() {
       return
     }
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    setMessages(prev => [...prev, { role: 'user', content }])
-    wsRef.current.send(JSON.stringify({ type: 'message', content }))
-    setInput('')
+    const outFiles = attachments.map(a => ({ filename: a.name, mime_type: a.mime, data: a.data }))
+    setMessages(prev => [...prev, { role: 'user', content, attachments: fileChips }])
+    wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: outFiles }))
+    setInput(''); setAttachments([])
     if (textareaRef.current) { textareaRef.current.style.height = 'auto' }
-  }, [input, isStreaming, isTyping, isEvaluating, isDemo])
+  }, [input, attachments, isStreaming, isTyping, isEvaluating, isDemo])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
@@ -704,7 +755,7 @@ export default function Workspace() {
                 </div>
               )}
 
-              {messages.map((m, i) => <Message key={i} role={m.role} content={m.content} />)}
+              {messages.map((m, i) => <Message key={i} role={m.role} content={m.content} attachments={m.attachments} />)}
 
               {/* Typing / streaming */}
               {isTyping && (
@@ -785,26 +836,69 @@ export default function Workspace() {
                   </div>
                 </div>
               ) : (
-                <div className="flex gap-3 items-end bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3" style={{ borderWidth: '1.5px' }}>
-                  <textarea
-                    ref={textareaRef}
-                    value={input}
-                    onChange={handleTextarea}
-                    onKeyDown={handleKeyDown}
-                    placeholder={challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)'}
-                    rows={1}
-                    className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
-                    style={{ fontFamily: "'DM Sans', sans-serif" }}
-                  />
-                  <button
-                    onClick={handleSend}
-                    disabled={!input.trim() || isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
-                    className="w-9 h-9 rounded-[9px] bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer"
-                  >
-                    <svg className="w-4 h-4 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                    </svg>
-                  </button>
+                <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3" style={{ borderWidth: '1.5px' }}>
+                  {/* Pending attachments */}
+                  {attachments.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mb-2.5">
+                      {attachments.map((a, i) => (
+                        <span key={i} className="inline-flex items-center gap-1.5 pl-2 pr-1 py-1 rounded-[8px] bg-[#F7F3EE] border border-[#E7E0D8] text-[11px] text-[#4A4440]" style={{ borderWidth: '1px' }}>
+                          <svg className="w-3 h-3 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                          </svg>
+                          <span className="max-w-[160px] truncate">{a.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeAttachment(i)}
+                            className="w-4 h-4 rounded-full flex items-center justify-center text-[#9A948E] hover:text-[#C8102E] hover:bg-[#FDE8EC] border-none bg-transparent cursor-pointer"
+                            aria-label={`Remove ${a.name}`}
+                          >
+                            <svg className="w-3 h-3 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex gap-3 items-end">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      multiple
+                      accept={ATTACH_ACCEPT}
+                      onChange={handleFileInput}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
+                      title="Attach a document or image (PDF, DOCX, TXT, MD, CSV, images · max 15 MB)"
+                      className="w-9 h-9 rounded-[9px] bg-[#F7F3EE] hover:bg-[#EDEAE4] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border border-[#E7E0D8] cursor-pointer"
+                      style={{ borderWidth: '1.5px' }}
+                    >
+                      <svg className="w-4 h-4 stroke-[#6B6560] fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                      </svg>
+                    </button>
+                    <textarea
+                      ref={textareaRef}
+                      value={input}
+                      onChange={handleTextarea}
+                      onKeyDown={handleKeyDown}
+                      placeholder={challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)'}
+                      rows={1}
+                      className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
+                      style={{ fontFamily: "'DM Sans', sans-serif" }}
+                    />
+                    <button
+                      onClick={handleSend}
+                      disabled={(!input.trim() && attachments.length === 0) || isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
+                      className="w-9 h-9 rounded-[9px] bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer"
+                    >
+                      <svg className="w-4 h-4 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               )}
               {!sessionEnded && (
