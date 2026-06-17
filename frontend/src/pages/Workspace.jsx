@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
 import SessionAnalysisCard from '../components/SessionAnalysisCard'
+import { API_URL, authHeaders } from '../lib/api'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
@@ -294,6 +295,7 @@ export default function Workspace() {
   const [turnCount, setTurnCount]         = useState(0)
   const [input, setInput]                 = useState('')
   const [attachments, setAttachments]     = useState([]) // [{ name, mime, data(base64), size }]
+  const [exporting, setExporting]         = useState(false)
   const [challengeContext, setChallengeContext] = useState(null)
   const [briefExpanded, setBriefExpanded] = useState(true)
   const [conversationId, setConversationId] = useState(null)
@@ -573,6 +575,36 @@ export default function Workspace() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deadlineMs, sessionEnded, isDemo])
 
+  const handleExport = useCallback(async () => {
+    if (!conversationId || exporting) return
+    setExporting(true)
+    try {
+      const res = await fetch(`${API_URL}/conversations/${conversationId}/export`, {
+        headers: { ...authHeaders() },
+      })
+      if (!res.ok) throw new Error(`Export failed (${res.status})`)
+      const blob = await res.blob()
+      // Prefer the server-provided filename; fall back to a sensible default.
+      let filename = `huskyai_chat_${new Date().toISOString().slice(0, 10)}.pdf`
+      const cd = res.headers.get('Content-Disposition')
+      const m = cd && cd.match(/filename="?([^"]+)"?/)
+      if (m) filename = m[1]
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      console.error('Export failed:', e)
+      alert('Could not export this chat. Please try again.')
+    } finally {
+      setExporting(false)
+    }
+  }, [conversationId, exporting])
+
   const handleSend = useCallback(() => {
     const content = input.trim()
     const hasFiles = attachments.length > 0
@@ -673,6 +705,27 @@ export default function Workspace() {
               >
                 <span aria-hidden>⏱</span>{fmtClock(remainingMs)}
               </div>
+            )}
+            {conversationId && !isDemo && messages.length > 0 && (
+              <button
+                onClick={handleExport}
+                disabled={exporting}
+                title="Download this chat as Markdown (transcript + scores)"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: '5px',
+                  padding: '5px 12px',
+                  background: '#F7F3EE',
+                  color: '#6B6560',
+                  border: '1.5px solid #E7E0D8',
+                  borderRadius: '8px',
+                  fontSize: '12px', fontWeight: 600,
+                  cursor: exporting ? 'default' : 'pointer',
+                  opacity: exporting ? 0.6 : 1,
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                {exporting ? 'Exporting…' : 'Export chat'}
+              </button>
             )}
             {conversationId && !isDemo && (() => {
               const minTurnsMet = minTurns == null || turnCount >= minTurns
