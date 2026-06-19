@@ -195,9 +195,20 @@ function Message({ role, content, attachments }) {
         {Array.isArray(attachments) && attachments.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mb-2">
             {attachments.map((a, i) => (
-              <span key={i} className="inline-flex items-center gap-1 px-2 py-1 rounded-[8px] bg-[#FDFCFB] border border-[#D8D0C6] text-[11px] text-[#4A4440]" style={{ borderWidth: '1px' }}>
+              <span
+                key={i}
+                title={a.failed ? `Not sent: ${a.reason || 'rejected'}` : a.name}
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-[8px] border text-[11px] ${
+                  a.failed
+                    ? 'bg-[#FDE8EC] border-[#F2B8C2] text-[#C8102E] line-through'
+                    : 'bg-[#FDFCFB] border-[#D8D0C6] text-[#4A4440]'
+                }`}
+                style={{ borderWidth: '1px' }}
+              >
                 <svg className="w-3 h-3 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                  {a.failed
+                    ? <><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></>
+                    : <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>}
                 </svg>
                 {a.name}
               </span>
@@ -295,6 +306,9 @@ export default function Workspace() {
   const [turnCount, setTurnCount]         = useState(0)
   const [input, setInput]                 = useState('')
   const [attachments, setAttachments]     = useState([]) // [{ name, mime, data(base64), size }]
+  const [attachNotice, setAttachNotice]   = useState('') // upload error shown in a dialog
+  const [chatFiles, setChatFiles]         = useState(0)  // files already sent in this chat
+  const [chatBytes, setChatBytes]         = useState(0)  // their combined size (this session)
   const [exporting, setExporting]         = useState(false)
   const [challengeContext, setChallengeContext] = useState(null)
   const [briefExpanded, setBriefExpanded] = useState(true)
@@ -326,15 +340,42 @@ export default function Workspace() {
   const userInitials = user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : 'U'
 
   /* ─── File attachments (doc/image upload) ─── */
+  // All limits kept in sync with the backend.
   const ATTACH_ACCEPT = '.pdf,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.gif'
-  const MAX_ATTACH_BYTES = 15 * 1024 * 1024 // keep in sync with backend
+  const MAX_ATTACH_BYTES = 15 * 1024 * 1024        // per file
+  const MAX_FILES_PER_MESSAGE = 5
+  const MAX_FILES_PER_CHAT = 15
+  const MAX_CHAT_BYTES = 50 * 1024 * 1024          // combined across the whole chat
+  const CHAT_MB = Math.round(MAX_CHAT_BYTES / (1024 * 1024))
+
+  // Show a centered dialog instead of a browser alert.
+  const showAttachNotice = (msg) => setAttachNotice(msg)
+
+  const pendingBytes = attachments.reduce((s, a) => s + (a.size || 0), 0)
+  // True once this message or this chat has no room for more files.
+  const attachFull =
+    attachments.length >= MAX_FILES_PER_MESSAGE ||
+    chatFiles + attachments.length >= MAX_FILES_PER_CHAT
 
   const addFiles = (fileList) => {
-    Array.from(fileList || []).forEach((file) => {
-      if (file.size > MAX_ATTACH_BYTES) {
-        alert(`"${file.name}" is too large (max 15 MB).`)
-        return
-      }
+    const files = Array.from(fileList || [])
+    if (!files.length) return
+
+    const accepted = []
+    const tooBig = []
+    let usedCount = chatFiles + attachments.length // files already committed + pending
+    let usedBytes = chatBytes + pendingBytes
+    let hitMsgCap = false, hitChatCount = false, hitChatBytes = false
+
+    for (const file of files) {
+      if (file.size > MAX_ATTACH_BYTES) { tooBig.push(file.name); continue }
+      if (attachments.length + accepted.length >= MAX_FILES_PER_MESSAGE) { hitMsgCap = true; continue }
+      if (usedCount >= MAX_FILES_PER_CHAT) { hitChatCount = true; continue }
+      if (usedBytes + file.size > MAX_CHAT_BYTES) { hitChatBytes = true; continue }
+      accepted.push(file); usedCount += 1; usedBytes += file.size
+    }
+
+    accepted.forEach((file) => {
       const reader = new FileReader()
       reader.onload = () => {
         const base64 = String(reader.result || '').split(',')[1] || ''
@@ -345,6 +386,19 @@ export default function Workspace() {
       }
       reader.readAsDataURL(file)
     })
+
+    // Surface a single, most-relevant reason if anything was turned away.
+    if (tooBig.length === 1) {
+      showAttachNotice(`"${tooBig[0]}" is too large. Each file must be under 15 MB.`)
+    } else if (tooBig.length > 1) {
+      showAttachNotice(`${tooBig.length} files are too large. Each file must be under 15 MB.`)
+    } else if (hitMsgCap) {
+      showAttachNotice(`You can attach up to ${MAX_FILES_PER_MESSAGE} files per message.`)
+    } else if (hitChatCount) {
+      showAttachNotice(`This chat has reached its limit of ${MAX_FILES_PER_CHAT} files.`)
+    } else if (hitChatBytes) {
+      showAttachNotice(`This chat can hold up to ${CHAT_MB} MB of files in total.`)
+    }
   }
 
   const handleFileInput = (e) => {
@@ -393,15 +447,17 @@ export default function Workspace() {
         break
       case 'history':
         if (Array.isArray(data.messages)) {
-          setMessages(
-            data.messages
-              .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
-              .map(m => ({
-                role: m.role,
-                content: m.content,
-                attachments: Array.isArray(m.attachments) && m.attachments.length ? m.attachments : undefined,
-              })),
-          )
+          const hist = data.messages
+            .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
+            .map(m => ({
+              role: m.role,
+              content: m.content,
+              attachments: Array.isArray(m.attachments) && m.attachments.length ? m.attachments : undefined,
+            }))
+          setMessages(hist)
+          // Re-seed the per-chat file count from history (sizes aren't replayed, so
+          // the byte cap is enforced authoritatively by the server on a resumed chat).
+          setChatFiles(hist.reduce((n, m) => n + (m.attachments ? m.attachments.length : 0), 0))
         }
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         break
@@ -427,6 +483,35 @@ export default function Workspace() {
         // Tell the Sidebar (and anyone else who cares) the Husky Score may have shifted
         try { window.dispatchEvent(new CustomEvent('husky:eval')) } catch {}
         break
+      case 'attachment_warning': {
+        // The server dropped some files (too big / too many). Mark those chips on
+        // the most recent user message as failed so the student knows the model
+        // never saw them.
+        const failed = Array.isArray(data.files) ? data.files : []
+        if (failed.length) {
+          const reasonByName = Object.fromEntries(
+            failed.map(f => [f.name, f.reason || 'not sent']),
+          )
+          setMessages(prev => {
+            const next = [...prev]
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i].role === 'user' && Array.isArray(next[i].attachments)) {
+                next[i] = {
+                  ...next[i],
+                  attachments: next[i].attachments.map(a =>
+                    reasonByName[a.name]
+                      ? { ...a, failed: true, reason: reasonByName[a.name] }
+                      : a,
+                  ),
+                }
+                break
+              }
+            }
+            return next
+          })
+        }
+        break
+      }
       case 'eval_error': setIsEvaluating(false); break
       case 'error':
         setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
@@ -633,9 +718,14 @@ export default function Workspace() {
     const outFiles = attachments.map(a => ({ filename: a.name, mime_type: a.mime, data: a.data }))
     setMessages(prev => [...prev, { role: 'user', content, attachments: fileChips }])
     wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: outFiles }))
+    // Track this chat's running file usage so the next pick can be capped client-side.
+    if (attachments.length) {
+      setChatFiles(c => c + attachments.length)
+      setChatBytes(b => b + pendingBytes)
+    }
     setInput(''); setAttachments([])
     if (textareaRef.current) { textareaRef.current.style.height = 'auto' }
-  }, [input, attachments, isStreaming, isTyping, isEvaluating, isDemo])
+  }, [input, attachments, pendingBytes, isStreaming, isTyping, isEvaluating, isDemo])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
@@ -1000,6 +1090,56 @@ export default function Workspace() {
               </button>
             </div>
             <SessionAnalysisCard analysis={analysis} loading={analysisLoading} onRetry={handleRetryAnalysis} />
+          </div>
+        </div>
+      )}
+
+      {/* Attachment notice dialog (replaces the browser alert) */}
+      {attachNotice && (
+        <div
+          onClick={() => setAttachNotice('')}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(22,18,14,0.42)', backdropFilter: 'blur(4px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1100, padding: '24px',
+            animation: 'fadeIn 0.2s ease',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            role="alertdialog"
+            aria-label="Upload problem"
+            style={{
+              background: '#FDFCFB', borderRadius: '16px', border: '1.5px solid #E7E0D8',
+              width: '100%', maxWidth: '380px', padding: '28px 26px 22px', textAlign: 'center',
+              boxShadow: '0 24px 60px rgba(0,0,0,0.22)',
+              animation: 'modalPop 0.28s cubic-bezier(0.22,1,0.36,1)',
+            }}
+          >
+            <style>{`@keyframes fadeIn{from{opacity:0}to{opacity:1}}@keyframes modalPop{from{opacity:0;transform:translateY(12px) scale(0.98)}to{opacity:1;transform:none}}`}</style>
+            <div style={{
+              width: '52px', height: '52px', borderRadius: '50%', background: '#FDE8EC',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
+            }}>
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#C8102E" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="7" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+            </div>
+            <h3 style={{ margin: '0 0 6px', fontSize: '16px', fontWeight: 700, color: '#16120E' }}>
+              File can&apos;t be attached
+            </h3>
+            <p style={{ margin: '0 0 20px', fontSize: '13.5px', lineHeight: 1.55, color: '#6B6560' }}>
+              {attachNotice}
+            </p>
+            <button
+              type="button"
+              onClick={() => setAttachNotice('')}
+              style={{
+                background: '#C8102E', color: '#fff', border: 'none', borderRadius: '9px',
+                padding: '9px 22px', fontSize: '13.5px', fontWeight: 600, cursor: 'pointer', width: '100%',
+              }}
+            >
+              Got it
+            </button>
           </div>
         </div>
       )}
