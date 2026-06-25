@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import base64
 import asyncio
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
@@ -184,6 +185,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],  # let the browser read the download filename
 )
 
 app.include_router(auth_router)
@@ -979,6 +981,254 @@ async def end_conversation(
         "analysis_status": (ucs.session_analysis or {}).get("status") if ucs else None,
         "end_reason": ucs.end_reason if ucs else None,
     }
+
+
+# --- Chat export → PDF ------------------------------------------------------
+# Rendered with fpdf2 (pure-Python, no system deps — safe on Railway). Core
+# fonts are latin-1 only, so text is normalized first; message bodies get a
+# light markdown cleanup and fenced code blocks render in a monospace box.
+
+def _pdf_safe(s: str) -> str:
+    """Make text safe for fpdf2 core (latin-1) fonts."""
+    if not s:
+        return ""
+    repl = {
+        "‘": "'", "’": "'", "“": '"', "”": '"',
+        "–": "-", "—": "-", "…": "...", "•": "-",
+        " ": " ", "→": "->", "←": "<-", "✓": "[x]",
+    }
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def _pei_rgb(pei):
+    if pei is None:
+        return (107, 101, 96)
+    if pei <= 40:
+        return (200, 16, 46)
+    if pei <= 65:
+        return (249, 115, 22)
+    if pei <= 80:
+        return (13, 148, 136)
+    return (22, 163, 74)
+
+
+def _md_inline_clean(s: str) -> str:
+    """Strip inline markdown markers so prose reads cleanly without artifacts."""
+    s = re.sub(r"`([^`]*)`", r"\1", s)          # inline code
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)    # bold
+    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)  # italic
+    s = re.sub(r"__([^_]+)__", r"\1", s)        # underline/bold
+    s = re.sub(r"^\s{0,3}#{1,6}\s*", "", s, flags=re.M)  # headings
+    return s
+
+
+def _render_message_body(pdf, text: str):
+    """Write a message body, rendering fenced code blocks in a monospace box."""
+    from fpdf.enums import XPos, YPos
+
+    text = text or ""
+    for part in re.split(r"(```.*?```)", text, flags=re.DOTALL):
+        if not part:
+            continue
+        if part.startswith("```"):
+            code = re.sub(r"^```[a-zA-Z0-9_+\-]*\n?", "", part)
+            code = re.sub(r"```$", "", code).rstrip()
+            pdf.set_font("Courier", "", 8.5)
+            pdf.set_text_color(40, 40, 40)
+            pdf.set_fill_color(244, 244, 246)
+            pdf.multi_cell(0, 4.3, _pdf_safe(code), fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(0.5)
+        else:
+            clean = _md_inline_clean(part).strip("\n")
+            if clean.strip():
+                pdf.set_font("Helvetica", "", 10)
+                pdf.set_text_color(30, 30, 30)
+                pdf.multi_cell(0, 5, _pdf_safe(clean), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+
+def _render_export_pdf(title: str, started_at, turns: list, avg_pei) -> bytes:
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    class PDF(FPDF):
+        def footer(self):
+            self.set_y(-14)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(160, 160, 160)
+            self.cell(0, 8, f"HuskyAI chat export   -   page {self.page_no()}", align="C")
+
+    pdf = PDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(18, 16, 18)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(22, 18, 14)
+    pdf.cell(0, 9, "HuskyAI Chat Export", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+
+    # Metadata
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(90, 90, 90)
+    pdf.multi_cell(0, 5.5, _pdf_safe(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    bits = []
+    if started_at:
+        bits.append("Started: " + started_at.strftime("%Y-%m-%d %H:%M UTC"))
+    bits.append(f"Turns: {len(turns)}")
+    if avg_pei is not None:
+        bits.append(f"Session avg PEI: {round(float(avg_pei), 1)}")
+    pdf.multi_cell(0, 5.5, _pdf_safe("   |   ".join(bits)), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+    pdf.set_draw_color(220, 220, 220)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + pdf.epw, pdf.get_y())
+    pdf.ln(4)
+
+    def _n(v):
+        return str(round(v)) if isinstance(v, (int, float)) else "-"
+
+    for t in turns:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(200, 16, 46)
+        pdf.cell(0, 7, _pdf_safe(f"Turn {t['turn']}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+
+        # You
+        pdf.set_font("Helvetica", "B", 9.5)
+        pdf.set_text_color(70, 68, 64)
+        pdf.cell(0, 5, "You", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        _render_message_body(pdf, t["user"] or "(no text)")
+        if t["attachments"]:
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.set_text_color(120, 120, 120)
+            pdf.multi_cell(0, 5, _pdf_safe("Attached: " + ", ".join(t["attachments"])),
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1.5)
+
+        # AI
+        pdf.set_font("Helvetica", "B", 9.5)
+        pdf.set_text_color(70, 68, 64)
+        pdf.cell(0, 5, "AI", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        _render_message_body(pdf, t["assistant"] or "(no response)")
+
+        # Evaluation line (PEI colored by band)
+        ev = t["eval"]
+        if ev:
+            s = ev["scores"]
+            pdf.ln(1.5)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(90, 90, 90)
+            pdf.cell(pdf.get_string_width("Evaluation:") + 2, 6, "Evaluation:",
+                     new_x=XPos.RIGHT, new_y=YPos.TOP)
+            r, g, b = _pei_rgb(ev["pei"])
+            pdf.set_text_color(r, g, b)
+            pei_txt = f"  PEI {_n(ev['pei'])}"
+            pdf.cell(pdf.get_string_width(pei_txt) + 2, 6, pei_txt,
+                     new_x=XPos.RIGHT, new_y=YPos.TOP)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(90, 90, 90)
+            rest = (f"   PSQ {_n(s.get('PSQ'))}   CCM {_n(s.get('CCM'))}   "
+                    f"TSI {_n(s.get('TSI'))}   CLM {_n(s.get('CLM'))}   RAS {_n(s.get('RAS'))}")
+            if ev.get("classification"):
+                rest += f"    [{ev['classification']}]"
+            pdf.cell(0, 6, _pdf_safe(rest), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        pdf.ln(3)
+        pdf.set_draw_color(232, 224, 216)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + pdf.epw, pdf.get_y())
+        pdf.ln(3)
+
+    return bytes(pdf.output())
+
+
+@app.get("/conversations/{conversation_id}/export")
+async def export_conversation(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Export a conversation as a Markdown transcript with per-turn eval scores.
+    Owner-only. Works for free-workspace and challenge/session conversations."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Title: challenge/session name if linked, else a generic workspace label.
+    title = "Workspace chat"
+    ucs = (await db.execute(
+        select(UserChallengeSession).where(
+            UserChallengeSession.conversation_id == conversation_id,
+            UserChallengeSession.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if ucs:
+        ch = await db.get(Challenge, ucs.challenge_id)
+        if ch:
+            sess_title = ""
+            try:
+                sess_title = ch.sessions_data[ucs.session_number - 1].get("title", "")
+            except (IndexError, KeyError, TypeError):
+                pass
+            title = f"{ch.title} — Session {ucs.session_number}"
+            if sess_title:
+                title += f": {sess_title}"
+
+    msgs = (await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at, Message.id)
+    )).scalars().all()
+
+    evals = (await db.execute(
+        select(EvalResult)
+        .where(EvalResult.conversation_id == conversation_id)
+        .order_by(EvalResult.created_at, EvalResult.id)
+    )).scalars().all()
+
+    atts = (await db.execute(
+        select(Attachment).where(Attachment.conversation_id == conversation_id)
+    )).scalars().all()
+    atts_by_msg: dict[str, list] = {}
+    for a in atts:
+        atts_by_msg.setdefault(a.message_id, []).append(a.filename)
+
+    # Pair messages into turns (user → assistant), aligning evals positionally.
+    turns = []
+    current = None
+    for m in msgs:
+        if m.role == "user":
+            current = {
+                "turn": len(turns) + 1,
+                "user": m.content,
+                "attachments": atts_by_msg.get(m.id, []),
+                "assistant": None,
+                "eval": None,
+            }
+            turns.append(current)
+        elif m.role == "assistant" and current is not None:
+            current["assistant"] = m.content
+    for i, e in enumerate(evals):
+        if i < len(turns):
+            turns[i]["eval"] = {
+                "pei": e.pei,
+                "scores": {"PSQ": e.psq, "CCM": e.ccm, "TSI": e.tsi, "CLM": e.clm, "RAS": e.ras},
+                "classification": e.classification,
+            }
+
+    peis = [e.pei for e in evals if e.pei is not None]
+    avg_pei = sum(peis) / len(peis) if peis else None
+
+    pdf_bytes = _render_export_pdf(title, conv.started_at, turns, avg_pei)
+    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip().replace(" ", "_")[:60]
+    date_str = (conv.started_at or datetime.utcnow()).strftime("%Y%m%d")
+    filename = f"huskyai_{safe or 'chat'}_{date_str}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/conversations/{conversation_id}/analysis")
