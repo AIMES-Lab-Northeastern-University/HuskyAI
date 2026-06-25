@@ -27,6 +27,8 @@ from database import (
     ClassroomChallenge,
     ClassroomMembership,
     EvalResult,
+    GroupChallenge,
+    GroupMember,
     InstructorTestEnrollment,
     User,
     UserChallengeSession,
@@ -770,6 +772,11 @@ class CreateChallengeBody(BaseModel):
     time_limit_minutes: Optional[int] = Field(None, ge=1, le=120)
     min_turns: Optional[int] = Field(None, ge=1, le=50)
     is_active: Optional[bool] = None  # None → publish immediately (default); False → save as draft
+    # How this challenge runs in this section: "solo" (default) or "group"
+    # (prof-assigned teams). team_min/team_max bound team size for group mode.
+    mode: str = Field(default="solo", pattern="^(solo|group)$")
+    team_min: int = Field(default=2, ge=2, le=4)
+    team_max: int = Field(default=4, ge=2, le=4)
 
 
 class UpdateChallengeBody(BaseModel):
@@ -793,6 +800,71 @@ async def _student_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
         )
     )
     return {row[0] for row in r.all()}
+
+
+async def _student_group_mode_challenge_ids(db: AsyncSession, user_id: str) -> set[str]:
+    """Challenge ids assigned in GROUP mode in any section the student is in."""
+    cids = await _student_classroom_ids(db, user_id)
+    if not cids:
+        return set()
+    r = await db.execute(
+        select(ClassroomChallenge.challenge_id).where(
+            ClassroomChallenge.classroom_id.in_(cids),
+            ClassroomChallenge.mode == "group",
+        )
+    )
+    return {row[0] for row in r.all()}
+
+
+async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str):
+    """For a student: (is_group_mode, team_or_None). The team is their prof-assigned
+    GroupChallenge for this challenge in one of their sections, with teammate names.
+    Returns team=None when the challenge is group mode but they aren't assigned yet."""
+    cids = await _student_classroom_ids(db, user_id)
+    if not cids:
+        return False, None
+    group_cids = {
+        row[0]
+        for row in (
+            await db.execute(
+                select(ClassroomChallenge.classroom_id).where(
+                    ClassroomChallenge.challenge_id == challenge_id,
+                    ClassroomChallenge.classroom_id.in_(cids),
+                    ClassroomChallenge.mode == "group",
+                )
+            )
+        ).all()
+    }
+    if not group_cids:
+        return False, None
+
+    gid = (
+        await db.execute(
+            select(GroupChallenge.id)
+            .join(GroupMember, GroupMember.group_id == GroupChallenge.id)
+            .where(
+                GroupChallenge.challenge_id == challenge_id,
+                GroupChallenge.classroom_id.in_(group_cids),
+                GroupMember.user_id == user_id,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if not gid:
+        return True, None
+
+    names = [
+        n
+        for (n,) in (
+            await db.execute(
+                select(User.name)
+                .join(GroupMember, GroupMember.user_id == User.id)
+                .where(GroupMember.group_id == gid)
+                .order_by(User.name)
+            )
+        ).all()
+    ]
+    return True, {"group_id": gid, "member_names": names}
 
 
 async def _test_enrollment_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
@@ -933,6 +1005,8 @@ async def list_challenges(
     for s in user_sessions:
         sessions_by_challenge.setdefault(s.challenge_id, []).append(s)
 
+    group_ids = await _student_group_mode_challenge_ids(db, user_id)
+
     out = []
     for ch in challenges:
         user_ch_sessions = sessions_by_challenge.get(ch.id, [])
@@ -952,6 +1026,7 @@ async def list_challenges(
             "best_pei": best_pei,
             "is_active": bool(ch.is_active),
             "instructor_preview": bool(not is_admin and ch.id in preview_ids),
+            "group_mode": ch.id in group_ids,
         })
 
     return out
@@ -992,6 +1067,8 @@ async def create_challenge(
 ):
     """Instructor only: create a challenge and assign it to a section you manage."""
     await _assert_user_manages_classroom(db, user_id, body.classroom_id)
+    if body.team_min > body.team_max:
+        raise HTTPException(status_code=400, detail="team_min cannot exceed team_max")
     max_so = await db.scalar(
         select(func.coalesce(func.max(ClassroomChallenge.sort_order), -1)).where(
             ClassroomChallenge.classroom_id == body.classroom_id
@@ -1020,16 +1097,20 @@ async def create_challenge(
             classroom_id=body.classroom_id,
             challenge_id=ch.id,
             sort_order=next_sort,
+            mode=body.mode,
+            team_min=body.team_min,
+            team_max=body.team_max,
         )
     )
     await db.commit()
     await db.refresh(ch)
-    log.info("challenge created id=%s classroom=%s by user=%s", ch.id, body.classroom_id, user_id[:8])
+    log.info("challenge created id=%s classroom=%s by user=%s mode=%s", ch.id, body.classroom_id, user_id[:8], body.mode)
     return {
         "id": ch.id,
         "title": ch.title,
         "classroom_id": body.classroom_id,
         "total_sessions": ch.total_sessions,
+        "mode": body.mode,
     }
 
 
@@ -1130,6 +1211,8 @@ async def get_challenge(
             "end_reason": us.end_reason if us else None,
         })
 
+    group_mode, group = await _student_group_info(db, user_id, challenge_id)
+
     return {
         "id": ch.id,
         "title": ch.title,
@@ -1141,6 +1224,8 @@ async def get_challenge(
         "time_limit_minutes": ch.time_limit_minutes,
         "min_turns": ch.min_turns,
         "sessions": sessions_out,
+        "group_mode": group_mode,
+        "group": group,
     }
 
 
