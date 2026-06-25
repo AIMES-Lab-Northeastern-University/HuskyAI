@@ -1,5 +1,6 @@
 # Husky AI backend dependencies
 google-genai>=1.0.0
+python-docx>=1.1.0
 openai>=1.0.0
 openai-agents>=0.0.3
 fastapi>=0.115.0

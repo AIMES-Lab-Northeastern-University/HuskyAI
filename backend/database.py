@@ -10,6 +10,7 @@ from sqlalchemy import (
     JSON,
     Text,
     Boolean,
+    LargeBinary,
     UniqueConstraint,
     text,
 )
@@ -84,6 +85,24 @@ class Message(Base):
     conversation_id: Mapped[str] = mapped_column(String, ForeignKey("conversations.id"), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Attachment(Base):
+    """A file (document/image) a user uploaded with a chat message. Bytes are
+    stored inline so attachments survive reconnects/redeploys (the deploy target
+    has an ephemeral filesystem). message_id links it to the user Message it was
+    sent with; it's nullable only during the brief window before the turn is saved."""
+
+    __tablename__ = "attachments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    conversation_id: Mapped[str] = mapped_column(String, ForeignKey("conversations.id"), nullable=False, index=True)
+    message_id: Mapped[str | None] = mapped_column(String, ForeignKey("messages.id"), nullable=True, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
