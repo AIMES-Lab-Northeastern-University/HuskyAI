@@ -256,9 +256,8 @@ export default function HowItWorks() {
                   </div>
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.55 }}>
-                  Associate Professor &amp; Director, AIMES Lab<br />
-                  Special Advisor for Strategic AI Initiatives<br />
-                  Affiliate, Harvard Shorenstein Center
+                  Professor &amp; Director, AIMES Lab<br />
+                  Northeastern University
                 </div>
                 <div style={{ marginTop: 8, fontSize: 10, color: '#C8102E', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
                   aimeslab.org

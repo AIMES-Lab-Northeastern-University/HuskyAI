@@ -252,7 +252,7 @@ export default function LandingPage() {
     heroH1Em: { fontStyle: 'italic', color: 'var(--red)' },
     heroSub: {
       fontSize: 17, fontWeight: 300, color: 'var(--ink-2)',
-      lineHeight: 1.75, maxWidth: 440, marginBottom: 44,
+      lineHeight: 1.75, maxWidth: 750, marginBottom: 44,
     },
     heroActions: { display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' },
     btnPrimary: {
@@ -554,8 +554,10 @@ export default function LandingPage() {
               professional.
             </h1>
             <p style={s.heroSub}>
-              Husky AI is your personal coach for learning how to think with AI - not just use it.
-              Complete real challenges, get scored on your prompting, and see how your class stacks up.
+              HuskyAI is your personal coach for learning to think with AI, not just offloading your cognitive powers to the LLM.
+              Work through real challenges and get scored on the quality of your reasoning and human agency - how well you
+              direct, question, test, and judge dynamically, in partnership with the AI's outputs. Work with a group, too,
+              and see how your team stacks up.
             </p>
             <div style={{ ...s.heroActions, flexWrap: 'wrap', gap: '12px' }}>
               <button
