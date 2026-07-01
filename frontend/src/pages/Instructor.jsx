@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
+import GroupTeamManager from '../components/GroupTeamManager'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 
 const STUDENTS = [
@@ -87,6 +88,10 @@ export default function Instructor() {
   const [createTimed, setCreateTimed] = useState(false)
   const [createTimeLimit, setCreateTimeLimit] = useState(15)
   const [createMinTurns, setCreateMinTurns] = useState(5)
+  const [createGroup, setCreateGroup] = useState(false)
+  const [createTeamMin, setCreateTeamMin] = useState(2)
+  const [createTeamMax, setCreateTeamMax] = useState(4)
+  const [manageTeamsId, setManageTeamsId] = useState(null)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
@@ -476,6 +481,9 @@ export default function Instructor() {
           time_limit_minutes: createTimed ? createTimeLimit : null,
           min_turns: createTimed ? createMinTurns : null,
           is_active: publish,
+          mode: createGroup ? 'group' : 'solo',
+          team_min: createTeamMin,
+          team_max: createTeamMax,
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -1431,6 +1439,7 @@ export default function Instructor() {
                                           {b.week} · {c.category} · {c.difficulty} · order {typeof c.sort_order === 'number' ? c.sort_order : i} · {c.total_sessions} session{c.total_sessions !== 1 ? 's' : ''}
                                           {c.time_limit_minutes != null ? ` · ⏱ ${c.time_limit_minutes}m` : ''}
                                           {c.min_turns != null ? ` · min ${c.min_turns} turns` : ''}
+                                          {c.mode === 'group' ? ` · 👥 group ${c.team_min}–${c.team_max}` : ''}
                                         </div>
                                       </>
                                     )}
@@ -1480,6 +1489,17 @@ export default function Instructor() {
                                         >
                                           Remove
                                         </button>
+                                        {c.mode === 'group' && !isDemo && (
+                                          <button
+                                            type="button"
+                                            onClick={() => setManageTeamsId(manageTeamsId === c.id ? null : c.id)}
+                                            style={manageTeamsId === c.id
+                                              ? { ...btnSm, background: '#16120E', color: '#fff', borderColor: '#16120E' }
+                                              : btnSm}
+                                          >
+                                            {manageTeamsId === c.id ? 'Hide teams' : 'Manage teams'}
+                                          </button>
+                                        )}
                                       </>
                                     )}
                                     <button
@@ -1500,6 +1520,9 @@ export default function Instructor() {
                                     </button>
                                   </div>
                                 </div>
+                                {c.mode === 'group' && !isDemo && manageTeamsId === c.id && (
+                                  <GroupTeamManager classroomId={selectedId} challengeId={c.id} />
+                                )}
                               </div>
                             )
                           })
@@ -1584,6 +1607,30 @@ export default function Instructor() {
                             </label>
                             <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%', lineHeight: 1.5 }}>
                               Auto-ends at the time limit. Students can end early only after the minimum turns. Applies to sessions started after you save.
+                            </span>
+                          </div>
+                        )}
+                        {/* Group challenge (optional) */}
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#4A4440', cursor: 'pointer' }}>
+                          <input type="checkbox" checked={createGroup} onChange={e => setCreateGroup(e.target.checked)} />
+                          Group challenge (prof-assigned teams)
+                        </label>
+                        {createGroup && (
+                          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                            <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              Team min
+                              <input type="number" min={2} max={4} value={createTeamMin}
+                                onChange={e => setCreateTeamMin(Number(e.target.value))}
+                                style={{ ...inputStyle, flex: '0 0 72px' }} />
+                            </label>
+                            <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              Team max
+                              <input type="number" min={2} max={4} value={createTeamMax}
+                                onChange={e => setCreateTeamMax(Number(e.target.value))}
+                                style={{ ...inputStyle, flex: '0 0 72px' }} />
+                            </label>
+                            <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%', lineHeight: 1.5 }}>
+                              You'll assign students into teams after creating. A team needs at least the minimum members online to run — there is no solo fallback.
                             </span>
                           </div>
                         )}
