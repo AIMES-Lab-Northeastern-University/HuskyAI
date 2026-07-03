@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import ContributionAnalytics from './ContributionAnalytics'
 
 /**
  * Instructor team builder for a group-mode challenge. Lists teams + members,
@@ -12,6 +13,7 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
   const [err, setErr] = useState('')
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
+  const [analyticsFor, setAnalyticsFor] = useState(null)
 
   const base = `${API_URL}/classrooms/${classroomId}/challenges/${challengeId}/teams`
 
@@ -127,9 +129,15 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
                       {t.members.length < team_min ? ' · needs more' : ''}
                     </span>
                   </div>
-                  <button type="button" onClick={() => deleteTeam(t.id)} disabled={busy} style={{ ...btn, borderColor: '#F9BFCA', color: '#C8102E' }}>
-                    Delete team
-                  </button>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button type="button" onClick={() => setAnalyticsFor(analyticsFor === t.id ? null : t.id)} disabled={busy}
+                      style={{ ...btn, ...(analyticsFor === t.id ? { background: '#16120E', color: '#fff', borderColor: '#16120E' } : {}) }}>
+                      {analyticsFor === t.id ? 'Hide analytics' : 'Analytics'}
+                    </button>
+                    <button type="button" onClick={() => deleteTeam(t.id)} disabled={busy} style={{ ...btn, borderColor: '#F9BFCA', color: '#C8102E' }}>
+                      Delete team
+                    </button>
+                  </div>
                 </div>
 
                 {t.members.length > 0 && (
@@ -161,6 +169,10 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
                     ))}
                   </select>
                 </div>
+
+                {analyticsFor === t.id && (
+                  <ContributionAnalytics classroomId={classroomId} challengeId={challengeId} teamId={t.id} />
+                )}
               </div>
             )
           })}
