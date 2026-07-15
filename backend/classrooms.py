@@ -412,7 +412,8 @@ async def list_classroom_linked_challenges(
         raise HTTPException(status_code=404, detail="Classroom not found")
     await _assert_can_manage_classroom(db, user_id, room)
     q = (
-        select(Challenge, ClassroomChallenge.sort_order)
+        select(Challenge, ClassroomChallenge.sort_order, ClassroomChallenge.mode,
+               ClassroomChallenge.team_min, ClassroomChallenge.team_max)
         .join(ClassroomChallenge, ClassroomChallenge.challenge_id == Challenge.id)
         .where(ClassroomChallenge.classroom_id == classroom_id)
         .order_by(ClassroomChallenge.sort_order, Challenge.title)
@@ -429,8 +430,11 @@ async def list_classroom_linked_challenges(
             "is_active": bool(c.is_active),
             "week": c.week,
             "sort_order": int(sort_order),
+            "mode": mode or "solo",
+            "team_min": int(team_min) if team_min is not None else 2,
+            "team_max": int(team_max) if team_max is not None else 4,
         }
-        for c, sort_order in result.all()
+        for c, sort_order, mode, team_min, team_max in result.all()
     ]
 
 

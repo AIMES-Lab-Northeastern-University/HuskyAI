@@ -38,6 +38,7 @@ export default function ChallengeDetail() {
   const location = useLocation()
   const isDemo = location.pathname.startsWith('/demo')
   const pathPrefix = isDemo ? '/demo' : ''
+  const myName = (JSON.parse(localStorage.getItem('user') || 'null') || {}).name || ''
   const [challenge, setChallenge] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -288,7 +289,39 @@ export default function ChallengeDetail() {
               </p>
             </div>
 
-            {/* Sessions list */}
+            {/* Group challenge entry — prof-assigned teams; no solo session flow */}
+            {!isDemo && challenge.group_mode && (
+              <div style={{ background: '#FDFCFB', borderRadius: '12px', padding: '20px', border: '1.5px solid #DDD6FE', marginBottom: '20px' }}>
+                <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#EDE9FE', color: '#7C3AED' }}>Group challenge</span>
+                {challenge.group ? (
+                  <>
+                    <p style={{ fontSize: '13px', color: '#4A4440', lineHeight: 1.7, margin: '10px 0 4px' }}>
+                      You're on a team with {challenge.group.member_names.filter(n => n !== myName).join(', ') || 'your teammates'}. You share one live chat and one Husky Score.
+                    </p>
+                    <p style={{ fontSize: '12px', color: '#9A948E', margin: '0 0 14px' }}>
+                      At least 2 teammates must be online at the same time to message the coach.
+                    </p>
+                    <button
+                      onClick={() => navigate(`/group/${challenge.group.group_id}`)}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', background: '#7C3AED', color: '#fff', border: 'none', borderRadius: '9px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                      </svg>
+                      Open group challenge
+                    </button>
+                  </>
+                ) : (
+                  <p style={{ fontSize: '13px', color: '#4A4440', lineHeight: 1.7, margin: '10px 0 0' }}>
+                    This is a group challenge. Your instructor hasn't assigned you to a team yet — check back once your team is set up.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Sessions list (solo flow only; group challenges run through the team chat) */}
+            {!challenge.group_mode && (
+            <>
             <h2 style={{ fontSize: '13px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: '12px', marginTop: 0 }}>
               Sessions
             </h2>
@@ -513,6 +546,8 @@ export default function ChallengeDetail() {
                 )
               })}
             </div>
+            </>
+            )}
 
           </div>
         </div>

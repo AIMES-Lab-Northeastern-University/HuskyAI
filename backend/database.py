@@ -17,13 +17,36 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
 
-from db_config import resolve_database_url, engine_connect_args
+from sqlalchemy.pool import NullPool
+
+from db_config import resolve_database_url, engine_connect_args, is_transaction_pooler
 
 _db_url = resolve_database_url()
 _engine_kw: dict = {"echo": os.getenv("SQL_ECHO", "").lower() in ("1", "true", "yes")}
 _ca = engine_connect_args(_db_url)
 if _ca:
     _engine_kw["connect_args"] = _ca
+
+if is_transaction_pooler(_db_url):
+    # Transaction pooler (Supavisor :6543) does its own connection pooling and
+    # rotates server connections per transaction, so a client-side pool would just
+    # pin connections and re-introduce the session-mode 'max clients' cap. Use
+    # NullPool: open per checkout, hand back immediately. (statement_cache_size=0
+    # is set in engine_connect_args — required for asyncpg in transaction mode.)
+    _engine_kw["poolclass"] = NullPool
+elif _db_url.startswith("postgresql"):
+    # Session pooler (:5432) / direct: it caps total client connections (~15) and
+    # holds one per client session. SQLAlchemy's async default (5 + 10 overflow = 15)
+    # saturates that exactly, and uvicorn --reload leaves stale connections that eat
+    # the cap. Keep our pool well under it, pre-ping to drop dead conns, recycle to
+    # beat pooler timeouts. Overridable via env. (Prefer the :6543 transaction pooler.)
+    _engine_kw.update(
+        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "2")),
+        pool_pre_ping=True,
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
+        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+    )
 
 engine = create_async_engine(_db_url, **_engine_kw)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -73,6 +96,11 @@ class Conversation(Base):
     classroom_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("classrooms.id"), nullable=True, index=True
     )
+    # Set when this is a shared group-challenge conversation. NULL for the normal
+    # single-user flow. user_id above is still the conversation's creator/owner.
+    group_session_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=True, index=True
+    )
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -85,6 +113,11 @@ class Message(Base):
     conversation_id: Mapped[str] = mapped_column(String, ForeignKey("conversations.id"), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Which group member authored a user message, so a shared transcript can
+    # attribute prompts. NULL for single-user conversations and assistant turns.
+    sender_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -203,6 +236,14 @@ class ClassroomChallenge(Base):
     classroom_id: Mapped[str] = mapped_column(String, ForeignKey("classrooms.id"), nullable=False, index=True)
     challenge_id: Mapped[str] = mapped_column(String, ForeignKey("challenges.id"), nullable=False, index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # How this challenge runs *in this section*: "solo" (the normal single-user
+    # flow) or "group" (prof-assigned teams collaborate in one shared chat). Group
+    # mode is an assignment-level property — the same challenge can be solo in one
+    # section and group in another. team_min/team_max bound a team's size; group
+    # mode is strict (a team needs >= team_min members live to run a turn).
+    mode: Mapped[str] = mapped_column(String(16), default="solo", nullable=False)  # solo | group
+    team_min: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    team_max: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
 
 
 class InstructorTestEnrollment(Base):
@@ -215,6 +256,94 @@ class InstructorTestEnrollment(Base):
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     classroom_id: Mapped[str] = mapped_column(String, ForeignKey("classrooms.id"), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class GroupChallenge(Base):
+    """A team of 2-4 students collaborating on one challenge together. The team
+    persists across all of the challenge's sessions (same teammates throughout)
+    and shares one conversation + one PEI per session through GroupSession.
+
+    Instructor-driven model (2026-06-21 redesign): a team belongs to a classroom
+    and is created by the instructor, who assigns members from the section roster.
+    Eligibility is classroom membership — there is no student self-join. join_code
+    is retired (kept nullable for back-compat with the old student-initiated rows)."""
+
+    __tablename__ = "group_challenges"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    challenge_id: Mapped[str] = mapped_column(String, ForeignKey("challenges.id"), nullable=False, index=True)
+    # The section this team belongs to. Nullable only so pre-redesign rows (created
+    # before this column existed) still load; all new teams set it.
+    classroom_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("classrooms.id"), nullable=True, index=True
+    )
+    # Optional human label for the team (e.g. "Team 1"); falls back to a default in the UI.
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Retired: the old student-initiated join code. Nullable now; new prof-assigned
+    # teams leave it NULL. Kept (unique) so existing rows are undisturbed.
+    join_code: Mapped[str | None] = mapped_column(String(16), unique=True, nullable=True, index=True)
+    # The instructor who created the team (was the originating student pre-redesign).
+    created_by: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="open", nullable=False)  # open | active | completed
+    max_members: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class GroupMember(Base):
+    """Membership of a user in a GroupChallenge team."""
+
+    __tablename__ = "group_members"
+    __table_args__ = (UniqueConstraint("group_id", "user_id", name="uq_group_member"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class GroupSession(Base):
+    """Group analog of UserChallengeSession: one row per (group, session_number).
+    Holds the team's shared conversation and their single PEI for that session.
+    Mirrors UserChallengeSession's scoring/timer/analysis fields so the existing
+    per-turn and post-session logic can be reused with minimal branching."""
+
+    __tablename__ = "group_sessions"
+    __table_args__ = (
+        UniqueConstraint("group_id", "session_number", name="uq_group_session_num"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    challenge_id: Mapped[str] = mapped_column(String, ForeignKey("challenges.id"), nullable=False, index=True)
+    session_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String, ForeignKey("conversations.id"), nullable=True)
+    best_pei: Mapped[float | None] = mapped_column(Float, nullable=True)
+    session_avg_pei: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="not_started")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    end_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Timer settings snapshotted from the challenge when the group session starts.
+    time_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Post-session analysis blob; same shape as UserChallengeSession.session_analysis.
+    session_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class GroupChatMessage(Base):
+    """Team backchannel: student-to-student discussion within a group challenge,
+    separate from the coach (LLM) conversation. DELIBERATELY not linked to
+    Conversation/Message — this stream must never enter the Gemini prompt history,
+    the PEI evaluator, or the de-identified training export. It is human-only
+    deliberation, scoped to one team, and free-form (no turn lock)."""
+
+    __tablename__ = "group_chat_messages"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    sender_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 async def init_db():
@@ -289,6 +418,36 @@ async def init_db():
                     "session_analysis JSON"
                 )
             )
+            # Group-challenge links on existing tables (the new group_* tables
+            # themselves are created by create_all above). Nullable = single-user
+            # flow unaffected.
+            await conn.execute(
+                text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS group_session_id VARCHAR")
+            )
+            await conn.execute(
+                text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_user_id VARCHAR")
+            )
+            # Instructor-driven group redesign (2026-06-21): assignment-level group
+            # mode + team-scoped columns. Defaults keep every existing assignment solo.
+            await conn.execute(
+                text("ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'solo'")
+            )
+            await conn.execute(
+                text("ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS team_min INTEGER NOT NULL DEFAULT 2")
+            )
+            await conn.execute(
+                text("ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS team_max INTEGER NOT NULL DEFAULT 4")
+            )
+            await conn.execute(
+                text("ALTER TABLE group_challenges ADD COLUMN IF NOT EXISTS classroom_id VARCHAR")
+            )
+            await conn.execute(
+                text("ALTER TABLE group_challenges ADD COLUMN IF NOT EXISTS name VARCHAR(200)")
+            )
+            # join_code is retired (prof-assigned teams leave it NULL) — relax NOT NULL.
+            await conn.execute(
+                text("ALTER TABLE group_challenges ALTER COLUMN join_code DROP NOT NULL")
+            )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             # Detect whether research_ack_at already exists, to gate the one-time backfill.
@@ -312,6 +471,14 @@ async def init_db():
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN time_limit_minutes INTEGER", ("duplicate column", "already exists")),
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN min_turns INTEGER", ("duplicate column", "already exists")),
                 ("ALTER TABLE user_challenge_sessions ADD COLUMN session_analysis JSON", ("duplicate column", "already exists")),
+                ("ALTER TABLE conversations ADD COLUMN group_session_id VARCHAR", ("duplicate column", "already exists")),
+                ("ALTER TABLE messages ADD COLUMN sender_user_id VARCHAR", ("duplicate column", "already exists")),
+                # Instructor-driven group redesign (2026-06-21).
+                ("ALTER TABLE classroom_challenges ADD COLUMN mode VARCHAR(16) DEFAULT 'solo'", ("duplicate column", "already exists")),
+                ("ALTER TABLE classroom_challenges ADD COLUMN team_min INTEGER DEFAULT 2", ("duplicate column", "already exists")),
+                ("ALTER TABLE classroom_challenges ADD COLUMN team_max INTEGER DEFAULT 4", ("duplicate column", "already exists")),
+                ("ALTER TABLE group_challenges ADD COLUMN classroom_id VARCHAR", ("duplicate column", "already exists")),
+                ("ALTER TABLE group_challenges ADD COLUMN name VARCHAR(200)", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))

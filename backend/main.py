@@ -18,11 +18,13 @@ from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
 from sqlalchemy import select, update, func
 
-from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User
+from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage
+from group_room import rooms
 from auth import router as auth_router, decode_token, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
+from groups import router as groups_router, team_router as group_teams_router
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / ".env")
@@ -192,6 +194,8 @@ app.include_router(auth_router)
 app.include_router(challenges_router)
 app.include_router(classrooms_router)
 app.include_router(admin_router)
+app.include_router(groups_router)
+app.include_router(group_teams_router)
 
 BASE_SYSTEM_PROMPT = (
     "You are an expert AI tutor helping students develop their AI prompting and reasoning skills. "
@@ -995,6 +999,481 @@ async def websocket_endpoint(
             await _close_conversation(conversation_id)
 
 
+# ============================ Group challenges ============================
+# Multi-client shared chat. A separate endpoint/flow from the single-user /ws
+# above so that path stays untouched. Shared PEI scoring + post-session analysis
+# are added in a later phase; this phase covers the live transport (roster,
+# broadcast streaming, free-form serialized turns, presence, history replay).
+
+
+async def _is_group_member(group_id: str, user_id: str) -> bool:
+    async with AsyncSessionLocal() as db:
+        r = await db.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id, GroupMember.user_id == user_id
+            )
+        )
+        return r.scalar_one_or_none() is not None
+
+
+async def _group_team_min(group_id: str) -> int:
+    """The minimum live members a team needs to run a coach turn. Sourced from the
+    assignment (ClassroomChallenge.team_min) for the team's section+challenge.
+    Group mode is strict — there is no solo fallback. Defaults to 2."""
+    async with AsyncSessionLocal() as db:
+        team = await db.get(GroupChallenge, group_id)
+        if not team or not team.classroom_id:
+            return 2
+        tm = (
+            await db.execute(
+                select(ClassroomChallenge.team_min).where(
+                    ClassroomChallenge.classroom_id == team.classroom_id,
+                    ClassroomChallenge.challenge_id == team.challenge_id,
+                )
+            )
+        ).scalar_one_or_none()
+        return int(tm) if tm is not None else 2
+
+
+async def _ensure_group_session(group_id: str, session_num: int):
+    """Get-or-create the GroupSession for (group, session) and its shared
+    Conversation. Returns (group_session_id, conversation_id, challenge_id) or
+    None if the group does not exist."""
+    async with AsyncSessionLocal() as db:
+        group = await db.get(GroupChallenge, group_id)
+        if not group:
+            return None
+        gs = (await db.execute(
+            select(GroupSession).where(
+                GroupSession.group_id == group_id,
+                GroupSession.session_number == session_num,
+            )
+        )).scalar_one_or_none()
+        if gs is None:
+            gs = GroupSession(
+                group_id=group_id,
+                challenge_id=group.challenge_id,
+                session_number=session_num,
+                status="not_started",
+            )
+            db.add(gs)
+            await db.flush()
+        if gs.conversation_id is None:
+            # The shared conversation is owned (user_id) by the group creator so
+            # existing per-conversation lookups (e.g. consent) keep working; the
+            # group_session_id link is what marks it as a shared conversation.
+            conv = Conversation(user_id=group.created_by, group_session_id=gs.id)
+            db.add(conv)
+            await db.flush()
+            gs.conversation_id = conv.id
+            if group.status == "open":
+                group.status = "active"
+        await db.commit()
+        return gs.id, gs.conversation_id, group.challenge_id
+
+
+async def _load_group_history(conversation_id: str) -> list[dict]:
+    """Hydrate the shared conversation into the in-memory history shape, including
+    attachment bytes (for model context) and the sender's name (for attribution)."""
+    history: list[dict] = []
+    async with AsyncSessionLocal() as db:
+        msgs = (await db.execute(
+            select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+        )).scalars().all()
+        atts = (await db.execute(
+            select(Attachment).where(Attachment.conversation_id == conversation_id)
+        )).scalars().all()
+        atts_by_msg: dict[str, list] = {}
+        for a in atts:
+            atts_by_msg.setdefault(a.message_id, []).append(a)
+        # Resolve sender names in one pass.
+        sender_ids = {m.sender_user_id for m in msgs if m.sender_user_id}
+        names: dict[str, str] = {}
+        if sender_ids:
+            for u in (await db.execute(select(User).where(User.id.in_(sender_ids)))).scalars().all():
+                names[u.id] = u.name
+        for m in msgs:
+            item: dict = {"role": m.role, "content": m.content}
+            if m.sender_user_id:
+                item["sender_user_id"] = m.sender_user_id
+                item["sender_name"] = names.get(m.sender_user_id)
+            mas = atts_by_msg.get(m.id)
+            if mas:
+                item["attachments"] = [
+                    {
+                        "filename": a.filename,
+                        "mime_type": a.mime_type,
+                        "data": base64.b64encode(a.data).decode(),
+                    }
+                    for a in mas
+                ]
+            history.append(item)
+    return history
+
+
+async def _save_team_chat(group_id: str, user_id: str, content: str) -> str | None:
+    """Persist one team-backchannel message. This stream is human-only — it is
+    never sent to Gemini, scored, or exported. Returns the created_at ISO string."""
+    async with AsyncSessionLocal() as db:
+        msg = GroupChatMessage(group_id=group_id, sender_user_id=user_id, content=content)
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+        return msg.created_at.isoformat() if msg.created_at else None
+
+
+async def _load_team_chat(group_id: str) -> list[dict]:
+    """Replay the team backchannel for a (re)connecting member, oldest first."""
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(GroupChatMessage, User.name)
+            .join(User, User.id == GroupChatMessage.sender_user_id)
+            .where(GroupChatMessage.group_id == group_id)
+            .order_by(GroupChatMessage.created_at)
+        )
+        return [
+            {
+                "sender_user_id": m.sender_user_id,
+                "sender_name": name,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m, name in rows.all()
+        ]
+
+
+async def _save_group_turn(
+    conversation_id: str,
+    sender_user_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    eval_data: dict | None,
+    turn_num: int,
+    attachments=None,
+):
+    """Persist one group turn: the user message (attributed to its sender), the
+    assistant reply, attachments, and — when scoring succeeded — the shared
+    EvalResult rolled into the GroupSession's best/started state."""
+    try:
+        async with AsyncSessionLocal() as db:
+            user_message = Message(
+                conversation_id=conversation_id,
+                role="user",
+                content=user_msg,
+                sender_user_id=sender_user_id,
+            )
+            db.add(user_message)
+            db.add(Message(conversation_id=conversation_id, role="assistant", content=assistant_msg))
+            if attachments:
+                await db.flush()
+                for att in attachments:
+                    try:
+                        raw = base64.b64decode(att.get("data", ""), validate=False)
+                    except Exception:
+                        continue
+                    if not raw:
+                        continue
+                    db.add(Attachment(
+                        conversation_id=conversation_id,
+                        message_id=user_message.id,
+                        filename=(att.get("filename") or "file")[:512],
+                        mime_type=(att.get("mime_type") or "application/octet-stream")[:255],
+                        size_bytes=len(raw),
+                        data=raw,
+                    ))
+
+            scores = (eval_data or {}).get("scores", {})
+            if eval_data is not None:
+                # Snapshot the prompt author's research consent for this turn (the
+                # export unit). The sender is the natural owner of their own prompt.
+                sender = await db.get(User, sender_user_id)
+                consent_now = bool(sender.consent_research) if sender else False
+                db.add(EvalResult(
+                    conversation_id=conversation_id,
+                    turn_number=turn_num,
+                    pei=scores.get("PEI"),
+                    psq=scores.get("PSQ"),
+                    ccm=scores.get("CCM"),
+                    tsi=scores.get("TSI"),
+                    clm=scores.get("CLM"),
+                    ras=scores.get("RAS"),
+                    classification=eval_data.get("classification"),
+                    leading_status=eval_data.get("leading_status"),
+                    full_result=eval_data,
+                    consent_research=consent_now,
+                ))
+
+            await db.execute(
+                update(Conversation).where(Conversation.id == conversation_id).values(turn_count=turn_num)
+            )
+
+            # Mark the group session in progress and roll the team's shared best_pei.
+            conv = await db.get(Conversation, conversation_id)
+            if conv and conv.group_session_id:
+                gs = await db.get(GroupSession, conv.group_session_id)
+                if gs:
+                    if gs.status == "not_started":
+                        gs.status = "in_progress"
+                    if gs.started_at is None:
+                        gs.started_at = datetime.utcnow()
+                    new_pei = scores.get("PEI")
+                    if new_pei is not None:
+                        try:
+                            pei_val = float(new_pei)
+                        except (TypeError, ValueError):
+                            pei_val = None
+                        if pei_val is not None and (gs.best_pei is None or pei_val > gs.best_pei):
+                            gs.best_pei = pei_val
+            await db.commit()
+    except Exception as e:
+        log.error(f"DB save failed for group turn {turn_num}: {e}")
+
+
+@app.websocket("/ws/group")
+async def group_websocket_endpoint(
+    websocket: WebSocket,
+    token: str = Query(None),
+    group_id: str = Query(None),
+    session_num: int = Query(1),
+):
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+    user_id = decode_token(token)
+    if not user_id:
+        await websocket.close(code=4001, reason="Invalid or expired token")
+        return
+    if not group_id:
+        await websocket.close(code=4002, reason="group_id required")
+        return
+    if not await _is_group_member(group_id, user_id):
+        await websocket.close(code=4003, reason="Not a member of this group")
+        return
+
+    ensured = await _ensure_group_session(group_id, session_num)
+    if not ensured:
+        await websocket.close(code=4004, reason="Group not found")
+        return
+    group_session_id, conversation_id, challenge_id = ensured
+    team_min = await _group_team_min(group_id)
+
+    # Display name for presence/attribution.
+    async with AsyncSessionLocal() as db:
+        me = await db.get(User, user_id)
+        my_name = me.name if me else "Student"
+
+    system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
+    chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
+
+    await websocket.accept()
+    room = await rooms.get(group_session_id)
+
+    # Hydrate shared history once per live room.
+    if not room.history_loaded:
+        room.history = await _load_group_history(conversation_id)
+        room.history_loaded = True
+
+    room.add(websocket, user_id, my_name)
+    log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
+
+    # --- Initial state to the connecting client only ---
+    await websocket.send_text(json.dumps({
+        "type": "session_init",
+        "conversation_id": conversation_id,
+        "group_id": group_id,
+        "session_num": session_num,
+        "turn_count": len(room.history) // 2,
+    }))
+    if session_data:
+        await websocket.send_text(json.dumps({
+            "type": "challenge_context",
+            "data": {
+                "title": session_data.get("title"),
+                "goal": session_data.get("goal"),
+                "brief": session_data.get("brief"),
+                "seed_question": session_data.get("seed_question"),
+            },
+        }))
+    if room.history:
+        client_history = [
+            {
+                "role": m["role"],
+                "content": m["content"],
+                "sender_user_id": m.get("sender_user_id"),
+                "sender_name": m.get("sender_name"),
+                "attachments": [
+                    {"name": a.get("filename") or a.get("name")} for a in m.get("attachments", [])
+                ],
+            }
+            for m in room.history
+        ]
+        await websocket.send_text(json.dumps({
+            "type": "history",
+            "messages": client_history,
+            "turn_count": len(room.history) // 2,
+        }))
+
+    # Replay the team backchannel (separate stream; never touches the coach/LLM).
+    team_chat = await _load_team_chat(group_id)
+    if team_chat:
+        await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
+
+    # Tell everyone (including this client) who is now present.
+    await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
+    await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            mtype = data.get("type")
+
+            # Typing indicator: ephemeral presence cue relayed to the other members
+            # (never persisted). scope is "coach" or "team" so each pane can show it.
+            if mtype == "typing_indicator":
+                scope = data.get("scope")
+                if scope in ("coach", "team"):
+                    await room.broadcast(
+                        {"type": "peer_typing", "scope": scope, "user_id": user_id, "name": my_name},
+                        exclude=websocket,
+                    )
+                continue
+
+            # Team backchannel: student-to-student only. Free-form (no turn lock),
+            # never sent to Gemini, never scored. Persisted separately for replay.
+            if mtype == "team_chat":
+                chat_content = (data.get("content") or "").strip()
+                if not chat_content:
+                    continue
+                created_at = await _save_team_chat(group_id, user_id, chat_content)
+                await room.broadcast(
+                    {
+                        "type": "team_chat",
+                        "sender_user_id": user_id,
+                        "sender_name": my_name,
+                        "content": chat_content,
+                        "created_at": created_at,
+                    },
+                    exclude=websocket,
+                )
+                continue
+
+            if mtype != "message":
+                continue
+
+            # Strict group-only: a coach turn needs at least team_min distinct
+            # members connected live. A lone student cannot drive the AI — there is
+            # no solo fallback. (Counts distinct users, so multiple tabs don't count.)
+            present = len(room.members_snapshot())
+            if present < team_min:
+                await websocket.send_text(json.dumps({
+                    "type": "waiting", "needed": team_min, "present": present,
+                }))
+                continue
+
+            # Free-form turns, serialized: if a turn is already in flight, tell this
+            # sender to hold (no await between the check and acquire, so no race).
+            if room.turn_lock.locked():
+                await websocket.send_text(json.dumps({"type": "busy"}))
+                continue
+
+            user_content = data.get("content", "").strip()
+            attachments, rejected = _sanitize_attachments(data.get("attachments"))
+            if attachments and conversation_id:
+                attachments, chat_rejected = await _enforce_chat_attachment_caps(conversation_id, attachments)
+                rejected.extend(chat_rejected)
+            if rejected:
+                await websocket.send_text(json.dumps({"type": "attachment_warning", "files": rejected}))
+            if not user_content and not attachments:
+                continue
+            if not user_content:
+                user_content = "Please take a look at the attached file(s)."
+
+            await room.turn_lock.acquire()
+            try:
+                turn = len(room.history) // 2 + 1
+                if attachments:
+                    await asyncio.to_thread(_preprocess_attachments, attachments)
+
+                # Show the prompt (and its author) to the other members; the sender
+                # already rendered it optimistically.
+                await room.broadcast(
+                    {
+                        "type": "user_message",
+                        "sender_user_id": user_id,
+                        "sender_name": my_name,
+                        "content": user_content,
+                        "attachments": [{"name": a.get("filename", "file")} for a in attachments],
+                    },
+                    exclude=websocket,
+                )
+
+                gemini_history = await _build_gemini_history(room.history)
+                turn_parts = await _build_attachment_parts(attachments)
+                turn_parts.append(types.Part(text=user_content))
+                contents = gemini_history + [types.Content(role="user", parts=turn_parts)]
+                room.history.append(
+                    {
+                        "role": "user",
+                        "content": user_content,
+                        "attachments": attachments,
+                        "sender_user_id": user_id,
+                        "sender_name": my_name,
+                    }
+                )
+
+                await room.broadcast({"type": "typing"})
+
+                full_response = ""
+                try:
+                    async for chunk in await client.aio.models.generate_content_stream(
+                        model="gemini-2.5-pro",
+                        contents=contents,
+                        config=chat_config,
+                    ):
+                        text = chunk.text
+                        if text:
+                            full_response += text
+                            await room.broadcast({"type": "stream", "content": text})
+                except Exception as e:
+                    log.error(f"[WS-GROUP] stream error: {type(e).__name__}: {e}", exc_info=True)
+                    await room.broadcast({"type": "error", "message": f"Chat error: {type(e).__name__}"})
+                    room.history.pop()  # roll back the user turn we optimistically added
+                    continue
+
+                room.history.append({"role": "assistant", "content": full_response})
+                await room.broadcast({"type": "done", "full_response": full_response})
+
+                # -- Shared evaluation: one PEI for the whole team, broadcast to all --
+                await room.broadcast({"type": "eval_start"})
+                eval_result = None
+                try:
+                    eval_result = await evaluate_conversation(room.history)
+                except Exception as e:
+                    log.error(f"[WS-GROUP] eval error: {type(e).__name__}: {e}", exc_info=True)
+                # Persist messages regardless; include the eval when it succeeded.
+                await _save_group_turn(
+                    conversation_id, user_id, user_content, full_response, eval_result, turn, attachments
+                )
+                if eval_result is not None:
+                    await room.broadcast({"type": "eval", "data": eval_result})
+                else:
+                    await room.broadcast({"type": "eval_error", "message": "evaluation failed"})
+            finally:
+                room.turn_lock.release()
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.error(f"[WS-GROUP] unexpected error: {type(e).__name__}: {e}", exc_info=True)
+    finally:
+        room.remove(websocket)
+        await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
+        await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+        await rooms.drop_if_empty(group_session_id)
+        log.info(f"[WS-GROUP] {user_id[:8]} left group={group_id[:8]} ({len(room.connections)} live)")
+
+
 async def _generate_session_analysis(conversation_id: str, user_id: str):
     """
     Background task: build the post-session analysis for a completed session and
@@ -1154,6 +1633,157 @@ async def end_conversation(
         "analysis_status": (ucs.session_analysis or {}).get("status") if ucs else None,
         "end_reason": ucs.end_reason if ucs else None,
     }
+
+
+async def _generate_group_session_analysis(group_session_id: str):
+    """Background: post-session analysis for a completed GROUP session, stored on
+    GroupSession.session_analysis. Mirrors _generate_session_analysis but keyed on
+    the group session (one shared analysis for the whole team)."""
+    try:
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            if gs is None or not gs.conversation_id:
+                return
+            if (gs.session_analysis or {}).get("status") == "ready":
+                return
+            conversation_id = gs.conversation_id
+
+            msgs = (await db.execute(
+                select(Message)
+                .where(Message.conversation_id == conversation_id)
+                .order_by(Message.created_at, Message.id)
+            )).scalars().all()
+            transcript = [{"role": m.role, "content": m.content} for m in msgs]
+
+            evals = (await db.execute(
+                select(EvalResult)
+                .where(EvalResult.conversation_id == conversation_id)
+                .order_by(EvalResult.created_at, EvalResult.id)
+            )).scalars().all()
+            per_turn = []
+            for i, e in enumerate(evals, start=1):
+                fr = e.full_result or {}
+                per_turn.append({
+                    "turn": i,
+                    "pei": e.pei,
+                    "scores": {"PSQ": e.psq, "CCM": e.ccm, "TSI": e.tsi, "CLM": e.clm, "RAS": e.ras},
+                    "classification": e.classification,
+                    "turn_summary": fr.get("turn_summary") or "",
+                    "suggestions": fr.get("suggestions") or [],
+                    "red_flags": fr.get("red_flags") or [],
+                })
+
+            challenge_ctx = None
+            ch = await db.get(Challenge, gs.challenge_id)
+            if ch is not None:
+                challenge_ctx = {"title": ch.title, "objective": ch.description}
+
+            analysis = await analyze_session(transcript, per_turn, challenge_ctx)
+            gs.session_analysis = analysis
+            await db.commit()
+            log.info(f"[GROUP-ANALYSIS] stored for group_session {group_session_id[:8]}...")
+    except Exception as e:
+        log.error(f"[GROUP-ANALYSIS] failed for {group_session_id[:8]}...: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            async with AsyncSessionLocal() as db2:
+                gs = await db2.get(GroupSession, group_session_id)
+                if gs is not None and (gs.session_analysis or {}).get("status") != "ready":
+                    gs.session_analysis = {"status": "failed"}
+                    await db2.commit()
+        except Exception:
+            pass
+
+
+def _spawn_group_analysis(group_session_id: str):
+    task = asyncio.create_task(_generate_group_session_analysis(group_session_id))
+    _analysis_tasks.add(task)
+    task.add_done_callback(_analysis_tasks.discard)
+
+
+async def _group_session_or_403(db, group_id: str, session_num: int, user_id: str):
+    """Membership-gate then fetch the GroupSession. Raises 403/404 as appropriate."""
+    member = (await db.execute(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id, GroupMember.user_id == user_id
+        )
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    gs = (await db.execute(
+        select(GroupSession).where(
+            GroupSession.group_id == group_id, GroupSession.session_number == session_num
+        )
+    )).scalar_one_or_none()
+    if not gs:
+        raise HTTPException(status_code=404, detail="Group session not found")
+    return gs
+
+
+@app.post("/groups/{group_id}/sessions/{session_num}/end")
+async def end_group_session(
+    group_id: str,
+    session_num: int,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Any member can end the shared session: finalize the team's avg PEI, kick off
+    the shared post-session analysis, and lock the live room for everyone."""
+    gs = await _group_session_or_403(db, group_id, session_num, user_id)
+
+    avg_pei = turn_count = None
+    if gs.conversation_id:
+        row = (await db.execute(
+            select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
+                EvalResult.conversation_id == gs.conversation_id,
+                EvalResult.pei.is_not(None),
+            )
+        )).one_or_none()
+        avg_pei = row[0] if row else None
+        turn_count = row[1] if row else 0
+        conv = await db.get(Conversation, gs.conversation_id)
+        if conv and conv.ended_at is None:
+            conv.ended_at = datetime.utcnow()
+
+    if avg_pei is not None:
+        gs.session_avg_pei = round(float(avg_pei), 2)
+    gs.status = "completed"
+    gs.completed_at = datetime.utcnow()
+    if gs.end_reason is None:
+        gs.end_reason = "manual"
+
+    schedule_analysis = False
+    if (gs.session_analysis or {}).get("status") not in ("ready", "pending"):
+        gs.session_analysis = _pending_blob()
+        schedule_analysis = True
+
+    await db.commit()
+
+    if schedule_analysis:
+        _spawn_group_analysis(gs.id)
+
+    # Lock the live room for every connected member.
+    room = rooms.peek(gs.id)
+    if room is not None:
+        await room.broadcast({"type": "session_ended"})
+
+    return {
+        "session_avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,
+        "turns": int(turn_count or 0),
+        "analysis_status": (gs.session_analysis or {}).get("status"),
+        "end_reason": gs.end_reason,
+    }
+
+
+@app.get("/groups/{group_id}/sessions/{session_num}/analysis")
+async def get_group_session_analysis(
+    group_id: str,
+    session_num: int,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Poll the shared post-session analysis (same shape as the single-user one)."""
+    gs = await _group_session_or_403(db, group_id, session_num, user_id)
+    return gs.session_analysis or {"status": "none"}
 
 
 # --- Chat export → PDF ------------------------------------------------------
