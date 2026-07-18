@@ -12,6 +12,7 @@ GET /groups/{id} (read a team you belong to) remains. The shared live chat
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -22,9 +23,11 @@ from challenges import get_current_user, get_db, _assert_user_manages_classroom
 from database import (
     ClassroomChallenge,
     ClassroomMembership,
+    EvalResult,
     GroupChallenge,
     GroupMember,
     GroupSession,
+    Message,
     User,
 )
 
@@ -164,6 +167,129 @@ async def _team_or_404(db: AsyncSession, team_id: str, classroom_id: str, challe
     return t
 
 
+def _avg(vals: list) -> float | None:
+    nums = [v for v in vals if v is not None]
+    return round(sum(nums) / len(nums), 1) if nums else None
+
+
+async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
+    """Contribution analytics for one team, aggregated across all of its sessions.
+
+    Per-student metrics are PURELY about participation (how many prompts each
+    member sent and their share of the team's prompts) — these are valid
+    attributions from Message.sender_user_id. Quality (PEI + dimension averages)
+    is reported at the TEAM level only: the per-turn evaluator scores the whole
+    shared conversation up to that turn, so a turn's score reflects the context
+    every member built, not the lone author. Per-student skill scoring is a
+    separate, deliberate feature (attributed re-evaluation), not done here.
+    """
+    members = await _members_payload(db, team.id)
+    name_by_id = {m["user_id"]: m["name"] for m in members}
+
+    sessions = (
+        await db.execute(
+            select(GroupSession)
+            .where(GroupSession.group_id == team.id)
+            .order_by(GroupSession.session_number)
+        )
+    ).scalars().all()
+
+    turns_by_user: dict[str, int] = defaultdict(int)
+    total_turns = 0
+    timeline: list[dict] = []
+    all_evals: list[EvalResult] = []
+    sessions_with_activity = 0
+
+    for s in sessions:
+        if not s.conversation_id:
+            continue
+        umsgs = (
+            await db.execute(
+                select(Message)
+                .where(Message.conversation_id == s.conversation_id, Message.role == "user")
+                .order_by(Message.created_at, Message.id)
+            )
+        ).scalars().all()
+        evals = (
+            await db.execute(
+                select(EvalResult)
+                .where(EvalResult.conversation_id == s.conversation_id)
+                .order_by(EvalResult.created_at, EvalResult.id)
+            )
+        ).scalars().all()
+        if umsgs:
+            sessions_with_activity += 1
+        all_evals.extend(evals)
+        # Within a conversation the Nth user message pairs with the Nth eval
+        # (both ordered by created_at, id) — the same reconstruction the
+        # post-session analysis uses.
+        for i, m in enumerate(umsgs):
+            total_turns += 1
+            if m.sender_user_id:
+                turns_by_user[m.sender_user_id] += 1
+            ev = evals[i] if i < len(evals) else None
+            timeline.append(
+                {
+                    "session": s.session_number,
+                    "turn": i + 1,
+                    "sender_user_id": m.sender_user_id,
+                    "sender_name": name_by_id.get(m.sender_user_id, "Unknown"),
+                    "pei": ev.pei if ev else None,
+                }
+            )
+
+    # Resolve names for any prompt author no longer on the team (removed after
+    # participating) so their contribution still shows and shares still sum to 100%.
+    member_ids = {m["user_id"] for m in members}
+    extra_ids = [uid for uid in turns_by_user if uid and uid not in member_ids]
+    extra_names: dict[str, str] = {}
+    if extra_ids:
+        rows = await db.execute(select(User.id, User.name).where(User.id.in_(extra_ids)))
+        extra_names = {uid: nm for uid, nm in rows.all()}
+
+    def _share(t: int) -> float:
+        return round(100.0 * t / total_turns, 1) if total_turns else 0.0
+
+    participants = [
+        {
+            "user_id": m["user_id"],
+            "name": m["name"],
+            "turns": turns_by_user.get(m["user_id"], 0),
+            "share_pct": _share(turns_by_user.get(m["user_id"], 0)),
+            "on_team": True,
+        }
+        for m in members
+    ]
+    participants += [
+        {
+            "user_id": uid,
+            "name": extra_names.get(uid, "Former member"),
+            "turns": turns_by_user[uid],
+            "share_pct": _share(turns_by_user[uid]),
+            "on_team": False,
+        }
+        for uid in extra_ids
+    ]
+    participants.sort(key=lambda p: p["turns"], reverse=True)
+
+    return {
+        "team": {"id": team.id, "name": team.name, "status": team.status},
+        "total_turns": total_turns,
+        "sessions_with_activity": sessions_with_activity,
+        "members": participants,
+        "team_pei_avg": _avg([e.pei for e in all_evals]),
+        "team_pei_best": max([e.pei for e in all_evals if e.pei is not None], default=None),
+        "team_dimensions": {
+            "PSQ": _avg([e.psq for e in all_evals]),
+            "CCM": _avg([e.ccm for e in all_evals]),
+            "TSI": _avg([e.tsi for e in all_evals]),
+            "CLM": _avg([e.clm for e in all_evals]),
+            "RAS": _avg([e.ras for e in all_evals]),
+        },
+        "timeline": timeline,
+    }
+
+
 @team_router.patch("/{classroom_id}/challenges/{challenge_id}/group-mode")
 async def set_group_mode(
     classroom_id: str,
@@ -239,6 +365,22 @@ async def list_teams(
         "teams": out_teams,
         "unassigned_students": unassigned,
     }
+
+
+@team_router.get("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/analytics")
+async def team_analytics(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: contribution analytics for one team — per-student prompt share
+    (participation) plus team-level scoring. See _team_analytics for the
+    participation-vs-quality boundary."""
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+    return await _team_analytics(db, team)
 
 
 @team_router.post("/{classroom_id}/challenges/{challenge_id}/teams", status_code=201)
