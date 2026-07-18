@@ -12,6 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
@@ -2100,6 +2101,88 @@ async def retry_session_analysis(
     await db.commit()
     _spawn_analysis(conversation_id, user_id)
     return {"status": "pending"}
+
+
+_DIM_CODES = ("PSQ", "CCM", "TSI", "CLM", "RAS")
+# Same model the chat uses (proven available on this API key). A lighter flash
+# model would be cheaper for this one-shot rewrite, but gemini-2.5-flash is no
+# longer offered to new users, so stay on the model we know works.
+_STRONGER_PROMPT_MODEL = "gemini-2.5-pro"
+
+
+class StrongerPromptRequest(BaseModel):
+    """Context the eval sidebar already has for the most recent user turn."""
+    prompt: str
+    scores: dict | None = None
+    suggestions: list[str] | None = None
+
+
+@app.post("/prompt/stronger")
+async def stronger_prompt(
+    body: StrongerPromptRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Generate a single, stronger rewrite of the student's most recent prompt.
+
+    Advisory only — the rewrite is never scored, persisted, or auto-inserted into
+    the student's input. Powers the 'Show me a stronger prompt' button in the eval
+    sidebar. Grounded in the turn's two weakest dimensions + coach suggestions.
+    """
+    original = (body.prompt or "").strip()
+    if not original:
+        raise HTTPException(status_code=400, detail="No prompt to improve yet.")
+
+    scores = body.scores or {}
+    dims = {
+        k: v for k, v in scores.items()
+        if k in _DIM_CODES and isinstance(v, (int, float))
+    }
+    weakest = sorted(dims, key=dims.get)[:2]
+    weak_txt = ", ".join(weakest) if weakest else "overall structure and specificity"
+    tips = "\n".join(f"- {s}" for s in (body.suggestions or [])[:5])
+
+    instruction = (
+        "You are a prompting coach for Northeastern students learning to write "
+        "effective prompts for AI chat models. Lightly improve the student's prompt "
+        "so it scores a bit higher — this is a nudge, NOT a rewrite.\n\n"
+        "Guidelines:\n"
+        "- Make small, targeted tweaks to the student's own wording. Keep their "
+        "voice, intent, and topic. Do NOT answer the prompt.\n"
+        "- Stay close to the original length and scope. Do NOT expand a short prompt "
+        "into a multi-paragraph brief; a slightly longer single prompt is the ceiling.\n"
+        "- Do NOT invent concrete details the student never gave (no made-up "
+        "language, framework, role, project, or scenario). If a useful detail is "
+        "missing, insert a short bracketed placeholder like [language] or "
+        "[what you're building] for the student to fill in.\n"
+        f"- Focus the tweaks on the weakest areas: {weak_txt}.\n\n"
+        + (f"Coach suggestions for this turn:\n{tips}\n\n" if tips else "")
+        + f'Student\'s prompt:\n"""\n{original}\n"""\n\n'
+        'Return ONLY JSON with this shape: '
+        '{"stronger_prompt": "<the lightly improved prompt>", '
+        '"why": "<1-2 sentences naming the specific tweaks you made>"}.'
+    )
+
+    try:
+        resp = await client.aio.models.generate_content(
+            model=_STRONGER_PROMPT_MODEL,
+            contents=instruction,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.4,
+            ),
+        )
+        data = json.loads(resp.text)
+        stronger = str(data.get("stronger_prompt", "")).strip()
+        why = str(data.get("why", "")).strip()
+        if not stronger:
+            raise ValueError("model returned an empty rewrite")
+        return {"stronger_prompt": stronger, "why": why}
+    except Exception as e:
+        log.error(f"[STRONGER-PROMPT] generation failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not generate a stronger prompt right now. Please try again.",
+        )
 
 
 if __name__ == "__main__":
