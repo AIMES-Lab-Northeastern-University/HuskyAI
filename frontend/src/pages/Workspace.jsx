@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
 import SessionAnalysisCard from '../components/SessionAnalysisCard'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
@@ -175,6 +175,81 @@ function EvalSidebar({ evalData, isEvaluating, turnCount }) {
 }
 
 /* ─── Message bubble ─── */
+/* ─── "Show me a stronger prompt" — inline under the latest user message ─── */
+function StrongerPromptCard({ prompt, scores, suggestions, resetKey }) {
+  const [stronger, setStronger] = useState(null)   // { stronger_prompt, why }
+  const [open, setOpen]         = useState(false)
+  const [busy, setBusy]         = useState(false)
+  const [err, setErr]           = useState(null)
+
+  // Reset when the scored turn changes so we never show a stale rewrite.
+  useEffect(() => { setStronger(null); setOpen(false); setErr(null) }, [resetKey])
+
+  async function handleClick() {
+    if (stronger) { setOpen(o => !o); return }   // already fetched → just toggle
+    setBusy(true); setErr(null)
+    try {
+      const resp = await fetch(`${API_URL}/prompt/stronger`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          prompt: prompt || '',
+          scores: scores || {},
+          suggestions: suggestions || [],
+        }),
+      })
+      if (!resp.ok) {
+        const d = await resp.json().catch(() => ({}))
+        throw new Error(formatApiErrorDetail(d.detail))
+      }
+      setStronger(await resp.json())
+      setOpen(true)
+    } catch (e) {
+      setErr(e.message || 'Could not generate a stronger prompt.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Right-aligned to sit under the user's bubble; pr-10 clears the "Y" avatar.
+  return (
+    <div className="flex justify-end pr-10">
+      <div className="max-w-[75%] flex flex-col items-end">
+        <button
+          onClick={handleClick}
+          disabled={busy}
+          className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-[#C8102E] bg-[#FDE8EC] border border-[#F5C6CF] rounded-[10px] px-3 py-1.5 hover:bg-[#FBD9E0] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+          style={{ borderWidth: '1.5px' }}
+        >
+          <svg className="w-[13px] h-[13px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 2l2.4 7.2H22l-6 4.4 2.3 7.2-6.3-4.6-6.3 4.6 2.3-7.2-6-4.4h7.6z"/>
+          </svg>
+          {busy
+            ? 'Thinking…'
+            : stronger
+              ? (open ? 'Hide stronger prompt' : 'Show stronger prompt')
+              : 'Show me a stronger prompt'}
+        </button>
+
+        {err && <p className="text-[12px] text-[#C8102E] mt-1.5">{err}</p>}
+
+        {open && stronger && (
+          <div className="mt-2 w-full bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] p-4 text-left" style={{ borderWidth: '1.5px' }}>
+            <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px] mb-2">Stronger prompt</div>
+            <div className="bg-[#F7F3EE] border border-[#E7E0D8] rounded-[10px] p-3" style={{ borderWidth: '1.5px' }}>
+              <p className="text-[13px] text-[#16120E] leading-[1.65] whitespace-pre-wrap">{stronger.stronger_prompt}</p>
+            </div>
+            {stronger.why && (
+              <p className="text-[12px] text-[#6B6560] leading-[1.6] mt-2.5"><span className="font-semibold">Why: </span>{stronger.why}</p>
+            )}
+            <p className="text-[11px] text-[#9A948E] mt-2.5">Suggestion only — try it out in your next message.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function Message({ role, content, attachments }) {
   const isUser = role === 'user'
   return (
@@ -898,7 +973,22 @@ export default function Workspace() {
                 </div>
               )}
 
-              {messages.map((m, i) => <Message key={i} role={m.role} content={m.content} attachments={m.attachments} />)}
+              {messages.map((m, i) => (
+                <div key={i} className="flex flex-col gap-2">
+                  <Message role={m.role} content={m.content} attachments={m.attachments} />
+                  {/* Under the latest user turn, once it has been scored (not in demo). */}
+                  {!isDemo
+                    && i === messages.findLastIndex((mm) => mm.role === 'user')
+                    && evalData?.scores?.PEI != null && (
+                      <StrongerPromptCard
+                        prompt={m.content}
+                        scores={evalData?.scores}
+                        suggestions={evalData?.suggestions}
+                        resetKey={turnCount}
+                      />
+                  )}
+                </div>
+              ))}
 
               {/* Typing / streaming */}
               {isTyping && (
