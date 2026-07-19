@@ -82,24 +82,16 @@ def resolve_database_url() -> str:
 
 
 def is_transaction_pooler(url: str) -> bool:
-    """Supabase's transaction pooler runs on port 6543 (session pooler = 5432).
-    Transaction mode rotates server connections per transaction, so it does NOT
-    pin a connection per client — which avoids the session-mode 'max clients
-    reached' (EMAXCONNSESSION) cap. asyncpg must disable its prepared-statement
-    cache for transaction pooling to work."""
-    u = url.lower()
-    return ":6543/" in u or ":6543?" in u or u.endswith(":6543")
+    """Temporarily disabled (deploy diagnostics) — kept as a stub so database.py's
+    import/usage doesn't break. Always reports no pooler, restoring the pre-existing
+    (non-pooler-aware) engine/pool configuration."""
+    return False
 
 
 def engine_connect_args(url: str) -> dict:
-    """asyncpg connect args for Supabase: SSL, plus transaction-pooler safety."""
-    args: dict = {}
-    if ("supabase.co" in url.lower() or "supabase.com" in url.lower()) and url.startswith("postgresql"):
-        args["ssl"] = "require"
-    elif os.getenv("DATABASE_SSL_REQUIRE", "").lower() in ("1", "true", "yes"):
-        args["ssl"] = "require"
-    if is_transaction_pooler(url):
-        # Required for asyncpg through Supavisor transaction mode (no prepared
-        # statement reuse across rotated server connections).
-        args["statement_cache_size"] = 0
-    return args
+    """asyncpg SSL for Supabase."""
+    if "supabase.co" in url.lower() and url.startswith("postgresql"):
+        return {"ssl": "require"}
+    if os.getenv("DATABASE_SSL_REQUIRE", "").lower() in ("1", "true", "yes"):
+        return {"ssl": "require"}
+    return {}
