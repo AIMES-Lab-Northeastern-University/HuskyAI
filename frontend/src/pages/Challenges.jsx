@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
-import GroupTeamManager from '../components/GroupTeamManager'
 import { DEMO_CHALLENGE_LIST } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -57,10 +56,6 @@ export default function Challenges() {
   const [createTimed, setCreateTimed] = useState(false)
   const [createTimeLimit, setCreateTimeLimit] = useState(15)
   const [createMinTurns, setCreateMinTurns] = useState(5)
-  const [createGroup, setCreateGroup] = useState(false)
-  const [createTeamMin, setCreateTeamMin] = useState(2)
-  const [createTeamMax, setCreateTeamMax] = useState(4)
-  const [manageTeamsId, setManageTeamsId] = useState(null)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
@@ -154,9 +149,6 @@ export default function Challenges() {
           time_limit_minutes: createTimed ? createTimeLimit : null,
           min_turns: createTimed ? createMinTurns : null,
           is_active: publish,
-          mode: createGroup ? 'group' : 'solo',
-          team_min: createTeamMin,
-          team_max: createTeamMax,
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -345,11 +337,6 @@ export default function Challenges() {
                           Test preview
                         </span>
                       )}
-                      {c.group_mode && (
-                        <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#EDE9FE', color: '#7C3AED', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                          Group
-                        </span>
-                      )}
                     </div>
 
                     {/* Title */}
@@ -471,42 +458,26 @@ export default function Challenges() {
                       ? { label: 'Published', color: '#15803D', bg: '#DCFCE7' }
                       : { label: 'Draft', color: '#9A948E', bg: '#F7F3EE' }
                     return (
-                      <div key={c.id} style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '10px', padding: '12px 16px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>{c.title}</div>
-                            <div style={{ fontSize: '11px', color: '#9A948E', marginTop: '2px' }}>
-                              {c.week != null ? `Week ${c.week}` : ''}
-                              {c.mode === 'group' ? `${c.week != null ? ' · ' : ''}👥 group ${c.team_min}–${c.team_max}` : ''}
-                            </div>
-                          </div>
-                          <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: badge.bg, color: badge.color, flexShrink: 0 }}>
-                            {badge.label}
-                          </span>
-                          {c.mode === 'group' && (
-                            <button
-                              onClick={() => setManageTeamsId(manageTeamsId === c.id ? null : c.id)}
-                              style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid', borderColor: manageTeamsId === c.id ? '#7C3AED' : '#E7E0D8', background: manageTeamsId === c.id ? '#7C3AED' : '#fff', cursor: 'pointer', color: manageTeamsId === c.id ? '#fff' : '#4A4440', flexShrink: 0 }}
-                            >
-                              {manageTeamsId === c.id ? 'Hide teams' : 'Manage teams'}
-                            </button>
-                          )}
-                          <button
-                            onClick={() => setChallengeActive(c.id, !c.is_active)}
-                            style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #E7E0D8', background: '#fff', cursor: 'pointer', color: '#4A4440', flexShrink: 0 }}
-                          >
-                            {c.is_active ? 'Unpublish' : 'Publish'}
-                          </button>
-                          <button
-                            onClick={() => unlinkChallenge(c.id)}
-                            style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #FDE8EC', background: '#FDE8EC', cursor: 'pointer', color: '#C8102E', flexShrink: 0 }}
-                          >
-                            Remove
-                          </button>
+                      <div key={c.id} style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '10px', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>{c.title}</div>
+                          {c.week != null && <div style={{ fontSize: '11px', color: '#9A948E', marginTop: '2px' }}>Week {c.week}</div>}
                         </div>
-                        {c.mode === 'group' && manageTeamsId === c.id && (
-                          <GroupTeamManager classroomId={selectedSectionId} challengeId={c.id} />
-                        )}
+                        <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: badge.bg, color: badge.color, flexShrink: 0 }}>
+                          {badge.label}
+                        </span>
+                        <button
+                          onClick={() => setChallengeActive(c.id, !c.is_active)}
+                          style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #E7E0D8', background: '#fff', cursor: 'pointer', color: '#4A4440', flexShrink: 0 }}
+                        >
+                          {c.is_active ? 'Unpublish' : 'Publish'}
+                        </button>
+                        <button
+                          onClick={() => unlinkChallenge(c.id)}
+                          style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #FDE8EC', background: '#FDE8EC', cursor: 'pointer', color: '#C8102E', flexShrink: 0 }}
+                        >
+                          Remove
+                        </button>
                       </div>
                     )
                   })}
@@ -574,30 +545,6 @@ export default function Challenges() {
                       </label>
                       <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%', lineHeight: 1.5 }}>
                         Auto-ends at the time limit. Students can end early only after the minimum turns. Applies to sessions started after you save.
-                      </span>
-                    </div>
-                  )}
-                  {/* Group challenge (optional) */}
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#4A4440', cursor: 'pointer' }}>
-                    <input type="checkbox" checked={createGroup} onChange={e => setCreateGroup(e.target.checked)} />
-                    Group challenge (prof-assigned teams)
-                  </label>
-                  {createGroup && (
-                    <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
-                      <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        Team min
-                        <input type="number" min={2} max={4} value={createTeamMin}
-                          onChange={e => setCreateTeamMin(Number(e.target.value))}
-                          style={{ ...inputStyle, flex: '0 0 72px' }} />
-                      </label>
-                      <label style={{ fontSize: '12px', color: '#6B6560', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        Team max
-                        <input type="number" min={2} max={4} value={createTeamMax}
-                          onChange={e => setCreateTeamMax(Number(e.target.value))}
-                          style={{ ...inputStyle, flex: '0 0 72px' }} />
-                      </label>
-                      <span style={{ fontSize: '11px', color: '#9A948E', flexBasis: '100%', lineHeight: 1.5 }}>
-                        After publishing, use “Manage teams” on the challenge above to assign students. A team needs at least the minimum online to run — no solo fallback.
                       </span>
                     </div>
                   )}

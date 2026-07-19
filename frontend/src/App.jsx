@@ -16,7 +16,6 @@ import RequireInstructor from './components/RequireInstructor'
 import RequirePlatformAdmin from './components/RequirePlatformAdmin'
 import ConsentGate from './components/ConsentGate'
 import Admin from './pages/Admin'
-import GroupChat from './pages/GroupChat'
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
@@ -63,7 +62,6 @@ export default function App() {
         <Route path="/instructor"  element={<RequireAuth><RequireInstructor><Instructor /></RequireInstructor></RequireAuth>} />
         <Route path="/admin"       element={<RequireAuth><RequirePlatformAdmin><Admin /></RequirePlatformAdmin></RequireAuth>} />
         <Route path="/settings"    element={<RequireAuth><Settings /></RequireAuth>} />
-        <Route path="/group/:id"   element={<RequireAuth><GroupChat /></RequireAuth>} />
 
         {/* Redirects */}
         <Route path="/app"  element={<Navigate to="/workspace" replace />} />

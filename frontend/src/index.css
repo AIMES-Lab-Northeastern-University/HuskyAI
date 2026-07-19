@@ -61,13 +61,6 @@
 }
 .live-dot { animation: livePulse 2s infinite; }
 
-@keyframes typingDots {
-  0% { opacity: 0.2; }
-  20% { opacity: 1; }
-  100% { opacity: 0.2; }
-}
-.typing-dots { animation: typingDots 1.2s infinite; }
-
 /* Markdown in chat - light theme */
 .prose-chat pre {
   background: #EDEAE4;
