@@ -651,6 +651,7 @@ async def websocket_endpoint(
     challenge_id: str = Query(None),
     session_num: int = Query(None),
 ):
+    await websocket.accept()
     if not token:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -658,8 +659,6 @@ async def websocket_endpoint(
     if not user_id:
         await websocket.close(code=4001, reason="Invalid or expired token")
         return
-
-    await websocket.accept()
 
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
@@ -1237,6 +1236,7 @@ async def group_websocket_endpoint(
     group_id: str = Query(None),
     session_num: int = Query(1),
 ):
+    await websocket.accept()
     if not token:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -1266,7 +1266,6 @@ async def group_websocket_endpoint(
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
-    await websocket.accept()
     room = await rooms.get(group_session_id)
 
     # Hydrate shared history once per live room.
