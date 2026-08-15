@@ -34,6 +34,9 @@ const NAV = [
   },
 ]
 
+const EXPANDED_WIDTH = '220px'
+const COLLAPSED_WIDTH = '64px'
+
 export default function Sidebar({ onLogout }) {
   const navigate = useNavigate()
   const location = useLocation()
@@ -42,6 +45,25 @@ export default function Sidebar({ onLogout }) {
     ? { name: 'Demo Student', email: 'demo@husky.edu' }
     : JSON.parse(localStorage.getItem('user') || 'null')
   const initials = user?.name ? user.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : 'U'
+
+  // Persisted across page navigations (Sidebar remounts on every route change)
+  // and shared with every page via the --sidebar-width CSS var those pages'
+  // marginLeft reads, since the sidebar itself is position:fixed.
+  const [collapsed, setCollapsed] = useState(
+    () => localStorage.getItem('sidebar_collapsed') === 'true')
+
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      '--sidebar-width', collapsed ? COLLAPSED_WIDTH : EXPANDED_WIDTH)
+  }, [collapsed])
+
+  const toggleCollapsed = () => {
+    setCollapsed(c => {
+      const next = !c
+      localStorage.setItem('sidebar_collapsed', String(next))
+      return next
+    })
+  }
 
     const [showInstructorNav, setShowInstructorNav] = useState(
     () => pathPrefix ? true : localStorage.getItem('is_instructor') === 'true')
@@ -169,27 +191,42 @@ export default function Sidebar({ onLogout }) {
   const scoreBarPct = bestPei != null ? Math.max(0, Math.min(100, bestPei)) : 0
 
   return (
-    <div className="w-[220px] bg-white border-r border-r-[#E7E0D8] flex flex-col fixed top-0 left-0 bottom-0 z-50" style={{ borderRightWidth: '1.5px' }}>
+    <div
+      className={`${collapsed ? 'w-[64px]' : 'w-[220px]'} bg-white border-r border-r-[#E7E0D8] flex flex-col fixed top-0 left-0 bottom-0 z-50 transition-[width] duration-200 overflow-hidden`}
+      style={{ borderRightWidth: '1.5px' }}
+    >
 
-      {/* Logo */}
-      <div className="px-5 pt-[22px] pb-[18px] border-b border-[#E7E0D8]" style={{ borderBottomWidth: '1.5px' }}>
-        <div className="flex items-center gap-[10px] mb-[3px]">
-          <div className="w-8 h-8 bg-[#C8102E] rounded-[9px] flex items-center justify-center flex-shrink-0">
-            <svg viewBox="0 0 24 24" className="w-4 h-4 stroke-white fill-none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/>
-              <path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>
-            </svg>
+      {/* Logo + collapse toggle */}
+      <div className="px-3 pt-[22px] pb-[18px] border-b border-[#E7E0D8]" style={{ borderBottomWidth: '1.5px' }}>
+        <div className={`flex items-center mb-[3px] ${collapsed ? 'flex-col gap-[10px]' : 'justify-between pl-2'}`}>
+          <div className="flex items-center gap-[10px] min-w-0">
+            <div className="w-8 h-8 bg-[#C8102E] rounded-[9px] flex items-center justify-center flex-shrink-0">
+              <svg viewBox="0 0 24 24" className="w-4 h-4 stroke-white fill-none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/>
+                <path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>
+              </svg>
+            </div>
+            {!collapsed && <span className="font-serif text-[19px] text-[#16120E] truncate">Husky AI</span>}
           </div>
-          <span className="font-serif text-[19px] text-[#16120E]">Husky AI</span>
+          <button
+            onClick={toggleCollapsed}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className="w-6 h-6 rounded-[6px] hover:bg-[#F7F3EE] flex items-center justify-center flex-shrink-0 text-[#9A948E] hover:text-[#4A4440] transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d={collapsed ? 'M9 18l6-6-6-6' : 'M15 18l-6-6 6-6'} />
+            </svg>
+          </button>
         </div>
-        <div className="text-[10px] text-[#9A948E] italic pl-[42px]">Be an AI-Ready professional!</div>
+        {!collapsed && <div className="text-[10px] text-[#9A948E] italic pl-[42px]">Be an AI-Ready professional!</div>}
       </div>
 
       {/* Nav */}
-      <div className="px-[10px] py-[14px] flex-1 overflow-y-auto">
+      <div className={`${collapsed ? 'px-2' : 'px-[10px]'} py-[14px] flex-1 overflow-y-auto overflow-x-hidden`}>
         {navGroups.map(({ group, items }) => (
           <div key={group}>
-            <div className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[1.2px] px-[10px] pt-3 pb-[5px]">{group}</div>
+            {!collapsed && <div className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[1.2px] px-[10px] pt-3 pb-[5px]">{group}</div>}
             {items.map(({ label, path, icon, badge, badgeGreen }) => {
               const dest = linkPath(path)
               const active =
@@ -203,15 +240,17 @@ export default function Sidebar({ onLogout }) {
                 <a
                   key={path}
                   onClick={() => navigate(dest)}
-                  className={`flex items-center gap-[10px] px-3 py-[9px] rounded-[9px] text-[13px] font-medium cursor-pointer mb-[1px] transition-all duration-[120ms] no-underline
+                  title={collapsed ? label : undefined}
+                  className={`flex items-center gap-[10px] py-[9px] rounded-[9px] text-[13px] font-medium cursor-pointer mb-[1px] transition-all duration-[120ms] no-underline
+                    ${collapsed ? 'px-0 justify-center' : 'px-3'}
                     ${active
                       ? 'bg-[#FDE8EC] text-[#C8102E] font-semibold'
                       : 'text-[#4A4440] hover:bg-[#F7F3EE] hover:text-[#16120E]'
                     }`}
                 >
                   <span className={`w-[15px] h-[15px] flex-shrink-0 ${active ? 'text-[#C8102E]' : ''}`}>{icon}</span>
-                  {label}
-                  {computedBadge && (
+                  {!collapsed && label}
+                  {!collapsed && computedBadge && (
                     <span className={`ml-auto text-[10px] font-bold px-[7px] py-[2px] rounded-[20px] text-white ${badgeGreen ? 'bg-[#16A34A]' : 'bg-[#F97316]'}`}>
                       {computedBadge}
                     </span>
@@ -224,6 +263,32 @@ export default function Sidebar({ onLogout }) {
       </div>
 
       {/* User card */}
+      {collapsed ? (
+        <div className="m-[10px] flex flex-col items-center gap-[10px]">
+          <div
+            className="w-8 h-8 rounded-full bg-[#C8102E] text-white flex items-center justify-center text-[12px] font-bold flex-shrink-0"
+            title={`${user?.name || 'User'} · Husky Score ${bestPei != null ? bestPei : '-'}`}
+          >
+            {initials}
+          </div>
+          {onLogout && (
+            <button
+              onClick={() => {
+                localStorage.removeItem('is_instructor')
+                localStorage.removeItem('debug_roles')
+                onLogout()
+              }}
+              title={pathPrefix ? 'Exit demo' : 'Sign out'}
+              aria-label={pathPrefix ? 'Exit demo' : 'Sign out'}
+              className="w-7 h-7 rounded-[8px] hover:bg-[#F7F3EE] flex items-center justify-center text-[#9A948E] hover:text-[#C8102E] transition-colors"
+            >
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+            </button>
+          )}
+        </div>
+      ) : (
       <div className="m-[10px] p-3 rounded-[12px] bg-[#F7F3EE] border border-[#E7E0D8]" style={{ borderWidth: '1.5px' }}>
         <div className="flex items-center gap-[10px]">
           <div className="w-8 h-8 rounded-full bg-[#C8102E] text-white flex items-center justify-center text-[12px] font-bold flex-shrink-0">
@@ -262,6 +327,7 @@ export default function Sidebar({ onLogout }) {
           </button>
         )}
       </div>
+      )}
     </div>
   )
 }

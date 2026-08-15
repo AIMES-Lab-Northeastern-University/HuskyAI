@@ -104,6 +104,10 @@ class Conversation(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    # OpenAI vector store backing this conversation's document-citation search
+    # (see backend/main.py's `_ensure_conversation_vector_store`). NULL until the
+    # first indexable attachment is uploaded.
+    openai_vector_store_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Message(Base):
@@ -137,6 +141,12 @@ class Attachment(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Document-citation indexing state (see backend/main.py's `_index_attachment`).
+    # NULL/"pending" until the background index task finishes; "ready" once the
+    # file is searchable in the conversation's vector store; "failed"/"skipped"
+    # otherwise (e.g. unsupported mime type, upload error).
+    openai_file_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    index_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class EvalResult(Base):
@@ -448,6 +458,18 @@ async def init_db():
             await conn.execute(
                 text("ALTER TABLE group_challenges ALTER COLUMN join_code DROP NOT NULL")
             )
+            # Document-citation retrieval (2026-08-15): per-conversation OpenAI
+            # vector store + per-attachment indexing state. All nullable = no
+            # behavior change until an attachment is uploaded.
+            await conn.execute(
+                text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS openai_vector_store_id VARCHAR")
+            )
+            await conn.execute(
+                text("ALTER TABLE attachments ADD COLUMN IF NOT EXISTS openai_file_id VARCHAR")
+            )
+            await conn.execute(
+                text("ALTER TABLE attachments ADD COLUMN IF NOT EXISTS index_status VARCHAR(16)")
+            )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             # Detect whether research_ack_at already exists, to gate the one-time backfill.
@@ -479,6 +501,10 @@ async def init_db():
                 ("ALTER TABLE classroom_challenges ADD COLUMN team_max INTEGER DEFAULT 4", ("duplicate column", "already exists")),
                 ("ALTER TABLE group_challenges ADD COLUMN classroom_id VARCHAR", ("duplicate column", "already exists")),
                 ("ALTER TABLE group_challenges ADD COLUMN name VARCHAR(200)", ("duplicate column", "already exists")),
+                # Document-citation retrieval (2026-08-15).
+                ("ALTER TABLE conversations ADD COLUMN openai_vector_store_id VARCHAR", ("duplicate column", "already exists")),
+                ("ALTER TABLE attachments ADD COLUMN openai_file_id VARCHAR", ("duplicate column", "already exists")),
+                ("ALTER TABLE attachments ADD COLUMN index_status VARCHAR(16)", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))

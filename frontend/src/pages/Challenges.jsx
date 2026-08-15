@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
+import InfoIcon from '../components/InfoIcon'
+import { PEI_INFO } from '../lib/metricInfo'
 import { DEMO_CHALLENGE_LIST } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -209,7 +211,7 @@ export default function Challenges() {
   return (
     <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
       <Sidebar onLogout={handleLogout} />
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: '220px' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
@@ -401,6 +403,7 @@ export default function Challenges() {
                         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                           <span style={{ fontSize: '11px', color: '#9A948E' }}>Best PEI:</span>
                           <span style={{ fontSize: '11px', fontWeight: 700, color: '#C8102E' }}>{Math.round(c.best_pei)}</span>
+                          <InfoIcon text={PEI_INFO.description} />
                         </div>
                       )}
                       <div style={{ marginLeft: 'auto' }}>

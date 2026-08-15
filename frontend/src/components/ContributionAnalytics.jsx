@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import { DIM_META, PEI_INFO } from '../lib/metricInfo'
+import InfoIcon from './InfoIcon'
 
 /**
  * Instructor-facing contribution analytics for one group-challenge team.
@@ -38,14 +40,6 @@ function scoreLabel(pei) {
   if (pei <= 65) return 'Developing'
   if (pei <= 80) return 'Practitioner'
   return 'Expert'
-}
-
-const DIM_META = {
-  PSQ: { label: 'Prompt Quality', color: '#C8102E' },
-  CCM: { label: 'Conversation Control', color: '#F97316' },
-  TSI: { label: 'Tech Sophistication', color: '#0D9488' },
-  CLM: { label: 'Cognitive Load', color: '#7C3AED' },
-  RAS: { label: 'Reliance Calibration', color: '#D97706' },
 }
 
 const SECTION_LABEL = {
@@ -94,6 +88,7 @@ function DimBar({ code, value }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
         <span style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '10px', fontWeight: 700, color: meta.color, background: '#F7F3EE', borderRadius: '4px', padding: '1px 5px' }}>{code}</span>
         <span style={{ fontSize: '12px', color: '#4A4440', flex: 1 }}>{meta.label}</span>
+        <InfoIcon text={meta.description} />
         <span style={{ fontSize: '12px', fontWeight: 700, color: '#16120E' }}>{value == null ? '–' : Math.round(value)}</span>
       </div>
       <div style={{ height: '6px', background: '#F7F3EE', border: '1px solid #E7E0D8', borderRadius: '999px', overflow: 'hidden' }}>
@@ -204,7 +199,10 @@ export default function ContributionAnalytics({ classroomId, challengeId, teamId
     <div style={{ ...card, marginTop: '10px', display: 'grid', gap: '20px' }}>
       {/* Team score + dimensions */}
       <div>
-        <div style={SECTION_LABEL}>Team performance</div>
+        <div style={{ ...SECTION_LABEL, display: 'flex', alignItems: 'center', gap: '6px' }}>
+          Team performance
+          <InfoIcon text={PEI_INFO.description} />
+        </div>
         <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', alignItems: 'center' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
             <ScoreRing pei={team_pei_avg} />

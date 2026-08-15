@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
+import openai
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
 from sqlalchemy import select, update, func
@@ -93,6 +94,18 @@ api_key = os.getenv("GOOGLE_API_KEY", "")
 if not api_key:
     log.warning("GOOGLE_API_KEY is not set — requests will fail")
 client = genai.Client(api_key=api_key)
+
+# Explicit OpenAI client for document-citation retrieval (separate from Gemini
+# chat above). Instantiated here rather than relying on OPENAI_API_KEY being
+# picked up as a side effect of importing evaluator_v3. None = feature disabled
+# (indexing/retrieval calls are skipped, chat itself is unaffected).
+try:
+    openai_client = openai.AsyncOpenAI() if os.getenv("OPENAI_API_KEY", "") else None
+except Exception as e:
+    log.warning(f"OpenAI client init failed, document citations disabled: {e}")
+    openai_client = None
+if openai_client is None:
+    log.warning("OPENAI_API_KEY is not set — document citation retrieval will be skipped")
 
 
 # --- Post-session analysis: background-task plumbing ---------------------------
@@ -242,6 +255,11 @@ _IMAGE_MIME = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 # Binary types worth uploading once via the Files API instead of re-sending bytes.
 _FILES_API_MIME = {"application/pdf"} | _IMAGE_MIME
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Mime types worth indexing into the conversation's OpenAI vector store for the
+# "related passages" citation feature (see _index_attachment). Images are
+# excluded -- no useful text search over them.
+_INDEXABLE_MIME = {"application/pdf", _DOCX_MIME, "text/plain", "text/markdown"}
 
 
 def _att_field(att: dict, *keys: str) -> str:
@@ -457,6 +475,108 @@ async def _enforce_chat_attachment_caps(conversation_id: str, attachments: list)
     return kept, rejected
 
 
+def _indexable_mime(att: dict, filename: str) -> str | None:
+    """Normalized mime type if this attachment is eligible for citation indexing,
+    else None. Mirrors the docx-detection fallback in _attachment_to_parts."""
+    mime = _att_field(att, "mime_type").split(";")[0].strip().lower()
+    if mime == _DOCX_MIME or filename.lower().endswith(".docx"):
+        return _DOCX_MIME
+    return mime if mime in _INDEXABLE_MIME else None
+
+
+async def _get_conversation_vector_store_id(conversation_id: str) -> str | None:
+    """Read-only lookup -- does NOT create a store. Used by retrieval, which
+    should simply find nothing to search if no attachment has ever been indexed."""
+    async with AsyncSessionLocal() as db:
+        return (await db.execute(
+            select(Conversation.openai_vector_store_id).where(Conversation.id == conversation_id)
+        )).scalar_one_or_none()
+
+
+async def _ensure_conversation_vector_store(conversation_id: str) -> str | None:
+    """Return the conversation's OpenAI vector store id, creating one if this is
+    the first indexable attachment. Race-safe via an atomic conditional UPDATE:
+    if another concurrent turn wins the create, discard ours and use theirs."""
+    existing = await _get_conversation_vector_store_id(conversation_id)
+    if existing:
+        return existing
+    try:
+        store = await openai_client.vector_stores.create(name=f"huskyai-conv-{conversation_id}")
+    except Exception as e:
+        log.warning(f"[citations] vector store create failed: {e}")
+        return None
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            update(Conversation)
+            .where(Conversation.id == conversation_id, Conversation.openai_vector_store_id.is_(None))
+            .values(openai_vector_store_id=store.id)
+        )
+        await db.commit()
+        if res.rowcount == 0:
+            # Another turn already created one first -- discard ours, use theirs.
+            winner = await _get_conversation_vector_store_id(conversation_id)
+            try:
+                await openai_client.vector_stores.delete(store.id)
+            except Exception:
+                pass
+            return winner
+    return store.id
+
+
+async def _index_attachment(conversation_id: str, att: dict, filename: str, mime: str, raw: bytes) -> None:
+    """Background task (fire-and-forget via asyncio.create_task): upload an
+    eligible attachment into the conversation's OpenAI vector store so it's
+    searchable for citation retrieval. Never awaited inline in the turn loop --
+    failures here must never affect the Gemini answer. Caches the result on the
+    att dict (same pattern as att["_gemini_file"]); _save_turn reads it, it never
+    computes it."""
+    if openai_client is None:
+        att["_index_status"] = "skipped"
+        return
+    att["_index_status"] = "pending"
+    try:
+        vector_store_id = await _ensure_conversation_vector_store(conversation_id)
+        if not vector_store_id:
+            att["_index_status"] = "failed"
+            return
+        uploaded = await openai_client.files.create(file=(filename, io.BytesIO(raw)), purpose="assistants")
+        vs_file = await openai_client.vector_stores.files.create(vector_store_id=vector_store_id, file_id=uploaded.id)
+        for _ in range(40):
+            if vs_file.status == "completed":
+                break
+            if vs_file.status == "failed":
+                raise RuntimeError(f"vector store processing failed for {filename!r}")
+            await asyncio.sleep(0.5)
+            vs_file = await openai_client.vector_stores.files.retrieve(uploaded.id, vector_store_id=vector_store_id)
+        att["_openai_file_id"] = uploaded.id
+        att["_index_status"] = "ready" if vs_file.status == "completed" else "failed"
+    except Exception as e:
+        log.warning(f"[citations] indexing failed for {filename!r}: {e}")
+        att["_index_status"] = "failed"
+
+
+async def _retrieve_related_passages(vector_store_id: str, question: str, answer: str, top_k: int = 4) -> list[dict]:
+    """Query the conversation's vector store for passages related to this turn,
+    to display alongside the answer. NOT proof the answer was grounded in them --
+    Gemini reads PDFs/images natively via its own Files API and never sees these
+    chunks, so this is "related passages the model likely drew on", not a
+    verified citation. Query on question+answer (not just the question) to bias
+    toward what was actually discussed."""
+    if openai_client is None:
+        return []
+    query = f"{question}\n\n{answer[:2000]}".strip()
+    if not query:
+        return []
+    results = await openai_client.vector_stores.search(vector_store_id, query=query, max_num_results=top_k)
+    out = []
+    for i, r in enumerate(results.data[:top_k]):
+        text = " ".join(c.text for c in (r.content or []) if getattr(c, "text", None))
+        if not text:
+            continue
+        out.append({"id": i + 1, "filename": r.filename, "snippet": text[:400]})
+    return out
+
+
 async def _build_gemini_history(conversation_history: list) -> list:
     history = []
     for msg in conversation_history:
@@ -493,6 +613,12 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                         mime_type=(att.get("mime_type") or "application/octet-stream")[:255],
                         size_bytes=len(raw),
                         data=raw,
+                        # Read-only: citation indexing runs as a background task
+                        # (see _index_attachment) and caches its result on this
+                        # dict. This just persists whatever's there already, if
+                        # anything -- never triggers or awaits indexing itself.
+                        openai_file_id=att.get("_openai_file_id"),
+                        index_status=att.get("_index_status"),
                     ))
             scores = eval_data.get("scores", {})
             # Snapshot the user's research consent at this instant (per-turn, so it
@@ -724,6 +850,14 @@ async def websocket_endpoint(
                                         "filename": a.filename,
                                         "mime_type": a.mime_type,
                                         "data": base64.b64encode(a.data).decode(),
+                                        # Rehydrate citation-indexing cache so a
+                                        # resumed process doesn't need to re-index
+                                        # an attachment that's already searchable.
+                                        **(
+                                            {"_openai_file_id": a.openai_file_id, "_index_status": a.index_status}
+                                            if a.index_status == "ready" and a.openai_file_id
+                                            else {}
+                                        ),
                                     }
                                     for a in mas
                                 ]
@@ -850,6 +984,20 @@ async def websocket_endpoint(
                 await websocket.send_text(json.dumps(
                     {"type": "attachment_warning", "files": rejected_attachments}
                 ))
+            # Kick off document-citation indexing in the background (fire-and-forget:
+            # never awaited here, so it can never add latency to the Gemini turn).
+            if attachments and conversation_id:
+                for att in attachments:
+                    fname = (_att_field(att, "filename", "name") or "file").strip()
+                    idx_mime = _indexable_mime(att, fname)
+                    if not idx_mime:
+                        continue
+                    try:
+                        idx_raw = base64.b64decode(att.get("data", ""), validate=False)
+                    except Exception:
+                        continue
+                    if idx_raw:
+                        asyncio.create_task(_index_attachment(conversation_id, att, fname, idx_mime, idx_raw))
             if not user_content and not attachments:
                 log.warning("[WS] Received empty message (no text, no attachments), skipping")
                 continue
@@ -953,6 +1101,21 @@ async def websocket_endpoint(
                 "full_response": full_response
             }))
             log.debug(f"[TURN {turn}] Sent 'done' to client")
+
+            # -- Related-passages citations (never blocks 'done' above) --
+            vector_store_id = await _get_conversation_vector_store_id(conversation_id) if conversation_id else None
+            if vector_store_id:
+                try:
+                    related = await asyncio.wait_for(
+                        _retrieve_related_passages(vector_store_id, user_content, full_response),
+                        timeout=8,
+                    )
+                    await websocket.send_text(json.dumps({
+                        "type": "citations", "turn": turn, "citations": related
+                    }))
+                except Exception as e:
+                    log.warning(f"[TURN {turn}] Citation retrieval failed: {type(e).__name__}: {e}")
+                    await websocket.send_text(json.dumps({"type": "citations_error", "turn": turn}))
 
             # -- Evaluation --
             await websocket.send_text(json.dumps({"type": "eval_start"}))

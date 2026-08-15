@@ -520,7 +520,7 @@ export default function Instructor() {
   return (
     <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
       <Sidebar onLogout={handleLogout} />
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: '220px' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <span style={{ fontSize: '15px', fontWeight: 600, color: '#16120E' }}>Instructor Dashboard</span>

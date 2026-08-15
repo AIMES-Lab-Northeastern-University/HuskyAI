@@ -4,7 +4,9 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
 import SessionAnalysisCard from '../components/SessionAnalysisCard'
+import InfoIcon from '../components/InfoIcon'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import { DIM_META, PEI_INFO } from '../lib/metricInfo'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
@@ -29,14 +31,6 @@ function scoreLabel(pei) {
   return 'Expert'
 }
 
-const DIM_META = {
-  PSQ: { label: 'Prompt Quality',       color: '#C8102E' },
-  CCM: { label: 'Conversation Control', color: '#F97316' },
-  TSI: { label: 'Tech Sophistication',  color: '#0D9488' },
-  CLM: { label: 'Cognitive Load',       color: '#7C3AED' },
-  RAS: { label: 'Reliance Calibration', color: '#D97706' },
-}
-
 /* ─── PEI Ring ─── */
 function PeiRing({ pei = 0 }) {
   const r = 50, circ = Math.PI * 2 * r
@@ -59,14 +53,6 @@ function PeiRing({ pei = 0 }) {
 }
 
 /* ─── Dimension bar ─── */
-const DIM_DESC = {
-  PSQ: 'Verb clarity, context, constraints & focus',
-  CCM: 'Initiative, verification & course correction',
-  TSI: 'Decomposition, tool awareness & edge cases',
-  CLM: 'Chunk size, incremental building & clarity',
-  RAS: 'Trust calibration & correct reliance',
-}
-
 function DimBar({ code, value = 0, max = 100 }) {
   const meta = DIM_META[code] || { label: code, color: '#9A948E' }
   const pct = Math.min(100, (value / max) * 100)
@@ -76,6 +62,7 @@ function DimBar({ code, value = 0, max = 100 }) {
         <div className="flex items-center gap-[6px] flex-1 min-w-0">
           <span className="text-[11px] font-bold font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: meta.color, background: `${meta.color}15`, border: `1px solid ${meta.color}30` }}>{code}</span>
           <span className="text-[12px] text-[#4A4440] font-medium truncate">{meta.label}</span>
+          <InfoIcon text={meta.description} />
         </div>
         <div className="text-[12px] font-bold text-[#4A4440] w-8 text-right flex-shrink-0">{Math.round(value)}</div>
       </div>
@@ -84,7 +71,6 @@ function DimBar({ code, value = 0, max = 100 }) {
           <div className="h-full rounded-full prog-fill" style={{ width: `${pct}%`, background: meta.color }} />
         </div>
       </div>
-      <div className="text-[11px] text-[#9A948E] mt-[3px]">{DIM_DESC[code]}</div>
     </div>
   )
 }
@@ -128,6 +114,7 @@ function EvalSidebar({ evalData, isEvaluating, turnCount }) {
               style={{ background: scoreBg(pei), color: scoreColor(pei) }}>
               {scoreLabel(pei)}
             </span>
+            <InfoIcon text={PEI_INFO.description} />
           </div>
           {classification !== '-' && (
             <div className="text-[12px] text-[#9A948E]">{classification} · {leadStatus}</div>
@@ -250,7 +237,37 @@ function StrongerPromptCard({ prompt, scores, suggestions, resetKey }) {
   )
 }
 
-function Message({ role, content, attachments }) {
+function RelatedPassages({ citations }) {
+  const [open, setOpen] = useState(false)
+  if (!Array.isArray(citations) || !citations.length) return null
+  return (
+    <div className="mt-2 pt-2 border-t border-[#E7E0D8]">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="text-[11px] font-semibold text-[#9A948E] hover:text-[#6B6560] flex items-center gap-1"
+      >
+        <svg className="w-3 h-3 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>
+        </svg>
+        {open ? 'Hide' : 'Show'} related passages ({citations.length})
+      </button>
+      {/* Topically related excerpts from your uploaded file(s), not a verified
+          citation -- the assistant may not have used every passage shown. */}
+      {open && (
+        <div className="mt-2 flex flex-col gap-1.5">
+          {citations.map((c) => (
+            <div key={c.id} className="bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] p-2.5" style={{ borderWidth: '1px' }}>
+              <div className="text-[11px] font-semibold text-[#4A4440] mb-1">{c.filename}</div>
+              <p className="text-[12px] text-[#6B6560] leading-[1.55] whitespace-pre-wrap">{c.snippet}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Message({ role, content, attachments, citations }) {
   const isUser = role === 'user'
   return (
     <div className={`flex gap-3 message-enter ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -294,6 +311,7 @@ function Message({ role, content, attachments }) {
           ? (content ? <p>{content}</p> : null)
           : <div className="prose-chat"><ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown></div>
         }
+        {!isUser && <RelatedPassages citations={citations} />}
       </div>
       {isUser && (
         <div className="w-7 h-7 rounded-full bg-[#E7E0D8] flex items-center justify-center flex-shrink-0 mt-0.5 text-[11px] font-bold text-[#4A4440]">
@@ -588,6 +606,21 @@ export default function Workspace() {
         break
       }
       case 'eval_error': setIsEvaluating(false); break
+      case 'citations': {
+        // Arrives shortly after 'done', for the assistant message that was just
+        // appended -- attach to the most recent assistant message.
+        const cites = Array.isArray(data.citations) ? data.citations : []
+        if (!cites.length) break
+        setMessages(prev => {
+          const idx = prev.findLastIndex((mm) => mm.role === 'assistant')
+          if (idx === -1) return prev
+          const next = [...prev]
+          next[idx] = { ...next[idx], citations: cites }
+          return next
+        })
+        break
+      }
+      case 'citations_error': break
       case 'error':
         setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
         console.error('Server error:', data.message); break
@@ -821,7 +854,7 @@ export default function Workspace() {
       <Sidebar onLogout={handleLogout} />
 
       {/* Main area */}
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: '220px' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0 sticky top-0 z-10" style={{ borderBottomWidth: '1.5px' }}>
@@ -975,7 +1008,7 @@ export default function Workspace() {
 
               {messages.map((m, i) => (
                 <div key={i} className="flex flex-col gap-2">
-                  <Message role={m.role} content={m.content} attachments={m.attachments} />
+                  <Message role={m.role} content={m.content} attachments={m.attachments} citations={m.citations} />
                   {/* Under the latest user turn, once it has been scored (not in demo). */}
                   {!isDemo
                     && i === messages.findLastIndex((mm) => mm.role === 'user')
