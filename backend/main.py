@@ -22,7 +22,7 @@ from sqlalchemy import select, update, func
 
 from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage
 from group_room import rooms
-from auth import router as auth_router, decode_token, pwd_context
+from auth import router as auth_router, resolve_token_user_id, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
@@ -781,7 +781,7 @@ async def websocket_endpoint(
     if not token:
         await websocket.close(code=4001, reason="Authentication required")
         return
-    user_id = decode_token(token)
+    user_id = await resolve_token_user_id(token)
     if not user_id:
         await websocket.close(code=4001, reason="Invalid or expired token")
         return
@@ -1403,7 +1403,7 @@ async def group_websocket_endpoint(
     if not token:
         await websocket.close(code=4001, reason="Authentication required")
         return
-    user_id = decode_token(token)
+    user_id = await resolve_token_user_id(token)
     if not user_id:
         await websocket.close(code=4001, reason="Invalid or expired token")
         return

@@ -69,6 +69,33 @@ class User(Base):
     # which is what triggers the blocking acceptance gate on login.
     research_ack_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Audit only: when the password last changed. Not used for enforcement.
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Incremented on every password change; tokens embed the value current at issue
+    # and are rejected when it no longer matches, so a reset immediately kills any
+    # existing session. A counter rather than a timestamp on purpose: JWT `iat` has
+    # whole-second resolution, so a clock comparison cannot distinguish a token
+    # issued in the same second as the reset from one issued just before it.
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class PasswordResetToken(Base):
+    """One row per issued password-reset link.
+
+    Only the SHA-256 of the token is stored: the raw value goes out in the email
+    once and is never needed again, so a leaked table is useless for takeover.
+    SHA-256 rather than bcrypt is deliberate — the token is 256 bits of entropy
+    from `secrets`, so there is nothing to brute-force and no need for a slow KDF.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Classroom(Base):
@@ -390,6 +417,22 @@ async def init_db():
                 text(
                     "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
                     "consent_research BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
+            # NULL for accounts that predate password-reset support: those tokens
+            # stay valid until they expire naturally, which is the safe default.
+            await conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                    "password_changed_at TIMESTAMP WITHOUT TIME ZONE"
+                )
+            )
+            # Existing sessions carry no tv claim, which reads as 0 and matches this
+            # default — so nobody is logged out by deploying the reset feature.
+            await conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                    "token_version INTEGER NOT NULL DEFAULT 0"
                 )
             )
             # research_ack_at + one-time consent backfill. The backfill (make ALL

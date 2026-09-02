@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from auth import decode_token, pwd_context
+from auth import resolve_token_user_id, pwd_context
 from database import (
     AsyncSessionLocal,
     Challenge,
@@ -47,7 +47,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header required")
     token = authorization.removeprefix("Bearer ").strip()
-    user_id = decode_token(token)
+    user_id = await resolve_token_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return user_id

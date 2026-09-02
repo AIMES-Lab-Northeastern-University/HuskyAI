@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import LandingPage from './pages/LandingPage'
 import AuthPage from './pages/AuthPage'
+import ForgotPassword from './pages/ForgotPassword'
+import ResetPassword from './pages/ResetPassword'
 import Workspace from './pages/Workspace'
 import Dashboard from './pages/Dashboard'
 import Progress from './pages/Progress'
@@ -36,6 +38,8 @@ export default function App() {
         {/* Public */}
         <Route path="/"             element={<LandingPage />} />
         <Route path="/login"        element={<AuthPage />} />
+        <Route path="/forgot-password" element={<ForgotPassword />} />
+        <Route path="/reset-password"  element={<ResetPassword />} />
         <Route path="/how-it-works" element={<HowItWorks />} />
 
         {/* Public interactive demo (no auth) */}
