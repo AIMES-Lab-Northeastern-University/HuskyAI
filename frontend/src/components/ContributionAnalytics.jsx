@@ -150,6 +150,49 @@ function Sparkline({ timeline }) {
   )
 }
 
+/**
+ * The team's study condition.
+ *
+ * Shown here so the arm is visible without querying the database, which is the
+ * whole point of exposing it: an instructor or researcher checking whether a
+ * team is control or treatment should not need psql.
+ *
+ * Drawn per team, stored per session. `arm_consistent` is false only if two of
+ * a team's sessions disagree, which would be an assignment bug -- surfaced
+ * loudly rather than hidden behind the single team-level value.
+ */
+function ArmBadge({ arm, sessionArms = [], consistent = true }) {
+  if (!arm) {
+    return (
+      <span style={{ fontSize: '11px', color: '#9A948E' }}>
+        No study arm (session predates arm assignment)
+      </span>
+    )
+  }
+  const treatment = arm === 'treatment'
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+      <span
+        style={{
+          fontSize: '11px', fontWeight: 700, borderRadius: '999px',
+          padding: '3px 10px',
+          background: treatment ? '#EDE9FE' : '#E6F7F6',
+          color: treatment ? '#7C3AED' : '#0D9488',
+        }}
+      >
+        {treatment ? 'Treatment' : 'Control'}
+      </span>
+      {!consistent && (
+        <span style={{ fontSize: '11px', fontWeight: 700, color: '#C8102E' }}>
+          Sessions disagree on arm:{' '}
+          {sessionArms.map(s => `S${s.session}=${s.arm || '–'}`).join(', ')}
+        </span>
+      )}
+    </span>
+  )
+}
+
+
 export default function ContributionAnalytics({ classroomId, challengeId, teamId }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -180,7 +223,8 @@ export default function ContributionAnalytics({ classroomId, challengeId, teamId
   if (err) return <div style={{ ...card, marginTop: '10px', fontSize: '13px', color: '#C8102E' }}>{err}</div>
   if (!data) return null
 
-  const { total_turns, sessions_with_activity, members = [], team_pei_avg, team_pei_best, team_dimensions = {}, timeline = [] } = data
+  const { total_turns, sessions_with_activity, members = [], team_pei_avg, team_pei_best, team_dimensions = {}, timeline = [],
+          arm = null, session_arms = [], arm_consistent = true } = data
   const hasActivity = total_turns > 0
   const idleMembers = members.filter(m => m.turns === 0 && m.on_team)
   // Members who sent at least one prompt, for the activity legend.
@@ -191,6 +235,9 @@ export default function ContributionAnalytics({ classroomId, challengeId, teamId
       <div style={{ ...card, marginTop: '10px', textAlign: 'center' }}>
         <div style={{ fontSize: '13px', fontWeight: 600, color: '#16120E', marginBottom: '4px' }}>No activity yet</div>
         <div style={{ fontSize: '12px', color: '#9A948E' }}>This team hasn’t sent any prompts in the challenge yet. Analytics will appear once they start.</div>
+        <div style={{ marginTop: '10px' }}>
+          <ArmBadge arm={arm} sessionArms={session_arms} consistent={arm_consistent} />
+        </div>
       </div>
     )
   }
@@ -199,9 +246,12 @@ export default function ContributionAnalytics({ classroomId, challengeId, teamId
     <div style={{ ...card, marginTop: '10px', display: 'grid', gap: '20px' }}>
       {/* Team score + dimensions */}
       <div>
-        <div style={{ ...SECTION_LABEL, display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <div style={{ ...SECTION_LABEL, display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
           Team performance
           <InfoIcon text={PEI_INFO.description} />
+          <span style={{ marginLeft: 'auto' }}>
+            <ArmBadge arm={arm} sessionArms={session_arms} consistent={arm_consistent} />
+          </span>
         </div>
         <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', alignItems: 'center' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>

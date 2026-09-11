@@ -1,4 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import ArtifactPanel from '../components/ArtifactPanel'
+import PrivateCoachPane from '../components/PrivateCoachPane'
+import { clearAllReadBuffers } from '../lib/readTracking'
 import { useNavigate, useParams, useSearchParams, Navigate } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -224,6 +227,22 @@ export default function GroupChat() {
   const token = localStorage.getItem('token')
   const user = JSON.parse(localStorage.getItem('user') || 'null')
   const myName = user?.name || 'You'
+  const meId = user?.user_id || user?.id || null
+
+  // Which pane the centre column is showing. The shared team coach stays the
+  // default, so existing behaviour is what a student sees on arrival.
+  const [centreTab, setCentreTab] = useState('team_coach')
+  // Shared artifact state, driven entirely by server broadcasts.
+  const [artifactSections, setArtifactSections] = useState([])
+  const [artifactLocks, setArtifactLocks] = useState([])
+  // Stable per (student, session) key for the read-event buffer. Derived from the
+  // route rather than the server payload: session_init carries conversation_id,
+  // which is NOT the group session id.
+  const sessionScopeId = `${groupId}:${sessionNum}`
+  const [artifactNotice, setArtifactNotice] = useState('')
+  const readTrackerRef = useRef(null)
+  const noticeArtifactRef = useRef(null)
+  const artifactNoticeTimer = useRef(null)
 
   const [messages, setMessages]          = useState([])
   const [streamingContent, setStreaming] = useState('')
@@ -303,6 +322,8 @@ export default function GroupChat() {
 
   const handleLogout = () => {
     localStorage.removeItem('token'); localStorage.removeItem('user')
+    // Never leave unacked read events behind for the next student on this machine.
+    clearAllReadBuffers()
     wsRef.current?.close(); navigate('/login', { replace: true })
   }
 
@@ -312,6 +333,57 @@ export default function GroupChat() {
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         break
       case 'challenge_context': setChallengeContext(data.data); break
+
+      /* ── Shared artifact ────────────────────────────────────────────────
+         All artifact state is server-driven: the client never optimistically
+         marks a section locked or written, so two students can't disagree
+         about who holds what. */
+      case 'artifact_state':
+        setArtifactSections(Array.isArray(data.sections) ? data.sections : [])
+        setArtifactLocks(Array.isArray(data.locks) ? data.locks : [])
+        break
+      case 'section_locked':
+        setArtifactLocks(prev => [
+          ...prev.filter(l => l.section_key !== data.section_key),
+          {
+            section_key: data.section_key,
+            holder_user_id: data.holder_user_id,
+            holder_name: data.holder_name,
+            expires_at: data.expires_at,
+          },
+        ])
+        break
+      case 'section_unlocked':
+        setArtifactLocks(prev => prev.filter(l => l.section_key !== data.section_key))
+        break
+      case 'section_updated':
+        setArtifactSections(prev => prev.map(sec => sec.key === data.section_key
+          ? {
+              ...sec,
+              content: data.content,
+              updated_by: data.updated_by,
+              updated_at: data.updated_at,
+              version: data.version,
+            }
+          : sec))
+        break
+      case 'section_lock_denied':
+        noticeArtifactRef.current?.(data.holder_name
+          ? `${data.holder_name} is editing that section.`
+          : 'That section is not available to edit.')
+        break
+      case 'section_write_denied':
+        noticeArtifactRef.current?.('Your changes were not saved — you no longer hold that section.')
+        break
+      case 'read_event_ack':
+        // Drop it from the durable buffer; it is safely recorded server-side.
+        readTrackerRef.current?.ack(data.event_id)
+        break
+      case 'read_event_rejected':
+        // Below the dwell floor or otherwise not a qualifying read. Clear it so
+        // it is not retried forever, but never treat it as recorded.
+        readTrackerRef.current?.ack(data.event_id)
+        break
       case 'history':
         if (Array.isArray(data.messages)) {
           setMessages(data.messages
@@ -465,6 +537,51 @@ export default function GroupChat() {
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
   }, [input, isStreaming, isTyping, isEvaluating, sessionEnded, myName])
 
+  /* ── Artifact send helpers ──────────────────────────────────────────────
+     One place that talks to the socket, so ArtifactPanel never touches wsRef
+     directly and cannot accidentally address another session. */
+  /* ArtifactPanel owns the read tracker (the coverage guard requires the hook to
+     live in the surface that renders section content), and hands it up here so
+     server acks can prune the durable buffer.
+
+     Deliberately NOT cleared when the pane unmounts. An ack lands a beat after
+     the event is sent, so a student who reads a section and immediately switches
+     tabs would otherwise lose the ack and keep that event buffered forever.
+     ack() is a pure localStorage operation keyed by buffer key, so applying it
+     through a detached tracker is safe. It IS cleared when the identity/session
+     scope changes, below, so an ack can never prune a different scope's buffer. */
+  const handleArtifactTracker = useCallback((t) => { readTrackerRef.current = t }, [])
+
+  useEffect(() => () => { readTrackerRef.current = null }, [sessionScopeId])
+
+  const sendArtifact = useCallback((payload) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload))
+    }
+  }, [])
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const noticeArtifact = useCallback((msg) => {
+    setArtifactNotice(msg)
+    clearTimeout(artifactNoticeTimer.current)
+    artifactNoticeTimer.current = setTimeout(() => setArtifactNotice(''), 4000)
+  }, [])
+
+  const requestSectionLock = useCallback((sectionKey) => {
+    sendArtifact({ type: 'section_lock_request', section_key: sectionKey })
+  }, [sendArtifact])
+
+  const releaseSectionLock = useCallback((sectionKey) => {
+    sendArtifact({ type: 'section_unlock', section_key: sectionKey })
+  }, [sendArtifact])
+
+  const writeSection = useCallback((sectionKey, content) => {
+    sendArtifact({ type: 'section_write', section_key: sectionKey, content })
+  }, [sendArtifact])
+
+  // The ws switch runs before these are defined, so it reaches them by ref.
+  useEffect(() => { noticeArtifactRef.current = noticeArtifact }, [noticeArtifact])
+
   const handleKeyDown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }
   const handleTextarea = (e) => {
     setInput(e.target.value)
@@ -585,8 +702,70 @@ export default function GroupChat() {
             className="w-1.5 flex-shrink-0 cursor-col-resize bg-transparent hover:bg-[#D8D0C6] active:bg-[#C8102E] transition-colors"
           />
 
-          {/* Coach chat column */}
+          {/* Centre column: tabbed.
+              The team's shared coach is the default tab and is completely
+              unchanged -- the private coach and the artifact are additions
+              beside it, not replacements. Tabs rather than more columns because
+              this row already holds the team backchannel, the coach and the
+              eval sidebar; a sixth pane would leave nothing readable. */}
           <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+            <div className="flex-shrink-0 flex items-center gap-1 px-4 pt-3 border-b border-[#E7E0D8]"
+                 style={{ borderBottomWidth: '1.5px' }}>
+              {[
+                { id: 'team_coach', label: 'Team coach', dot: '#C8102E' },
+                { id: 'my_coach', label: 'My coach', dot: '#7C3AED' },
+                ...(artifactSections.length
+                  ? [{ id: 'artifact', label: 'Artifact', dot: '#0D9488' }]
+                  : []),
+              ].map(t => (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => setCentreTab(t.id)}
+                  className="flex items-center gap-1.5 text-[12px] font-semibold px-3 py-2 rounded-t-[8px]"
+                  style={{
+                    background: centreTab === t.id ? '#FDFCFB' : 'transparent',
+                    color: centreTab === t.id ? '#16120E' : '#9A948E',
+                    borderBottom: centreTab === t.id ? '2px solid ' + t.dot : '2px solid transparent',
+                  }}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full" style={{ background: t.dot }} />
+                  {t.label}
+                </button>
+              ))}
+              {artifactNotice && (
+                <span className="ml-auto text-[11px] text-[#D97706]">{artifactNotice}</span>
+              )}
+            </div>
+
+            {centreTab === 'my_coach' && (
+              <PrivateCoachPane
+                groupId={groupId}
+                sessionNum={sessionNum}
+                token={token}
+              />
+            )}
+
+            {centreTab === 'artifact' && (
+              <div className="flex-1 overflow-y-auto">
+                <ArtifactPanel
+                  sections={artifactSections}
+                  locks={artifactLocks}
+                  meId={meId}
+                  groupSessionId={sessionScopeId}
+                  send={sendArtifact}
+                  onRequestLock={requestSectionLock}
+                  onReleaseLock={releaseSectionLock}
+                  onWrite={writeSection}
+                  onTracker={handleArtifactTracker}
+                />
+              </div>
+            )}
+
+            <div
+              className="flex-1 flex flex-col overflow-hidden min-w-0"
+              style={{ display: centreTab === 'team_coach' ? 'flex' : 'none' }}
+            >
             {challengeContext && (
               <div className="px-6 pt-4">
                 <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[12px] p-4" style={{ borderWidth: '1.5px' }}>
@@ -669,6 +848,7 @@ export default function GroupChat() {
                   </div>
                 </>
               )}
+            </div>
             </div>
           </div>
 

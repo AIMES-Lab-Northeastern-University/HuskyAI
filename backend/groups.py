@@ -20,6 +20,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from challenges import get_current_user, get_db, _assert_user_manages_classroom
+from turn_taking import session_turn_authors, share_pct
 from database import (
     ClassroomChallenge,
     ClassroomMembership,
@@ -203,13 +204,9 @@ async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
     for s in sessions:
         if not s.conversation_id:
             continue
-        umsgs = (
-            await db.execute(
-                select(Message)
-                .where(Message.conversation_id == s.conversation_id, Message.role == "user")
-                .order_by(Message.created_at, Message.id)
-            )
-        ).scalars().all()
+        # One definition of "a turn", shared with turn_taking so the two can
+        # never disagree about who spoke when.
+        authors = await session_turn_authors(db, s.conversation_id)
         evals = (
             await db.execute(
                 select(EvalResult)
@@ -217,23 +214,23 @@ async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
                 .order_by(EvalResult.created_at, EvalResult.id)
             )
         ).scalars().all()
-        if umsgs:
+        if authors:
             sessions_with_activity += 1
         all_evals.extend(evals)
         # Within a conversation the Nth user message pairs with the Nth eval
         # (both ordered by created_at, id) — the same reconstruction the
         # post-session analysis uses.
-        for i, m in enumerate(umsgs):
+        for i, sender_user_id in enumerate(authors):
             total_turns += 1
-            if m.sender_user_id:
-                turns_by_user[m.sender_user_id] += 1
+            if sender_user_id:
+                turns_by_user[sender_user_id] += 1
             ev = evals[i] if i < len(evals) else None
             timeline.append(
                 {
                     "session": s.session_number,
                     "turn": i + 1,
-                    "sender_user_id": m.sender_user_id,
-                    "sender_name": name_by_id.get(m.sender_user_id, "Unknown"),
+                    "sender_user_id": sender_user_id,
+                    "sender_name": name_by_id.get(sender_user_id, "Unknown"),
                     "pei": ev.pei if ev else None,
                 }
             )
@@ -248,7 +245,7 @@ async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
         extra_names = {uid: nm for uid, nm in rows.all()}
 
     def _share(t: int) -> float:
-        return round(100.0 * t / total_turns, 1) if total_turns else 0.0
+        return share_pct(t, total_turns)
 
     participants = [
         {
@@ -272,8 +269,21 @@ async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
     ]
     participants.sort(key=lambda p: p["turns"], reverse=True)
 
+    # Study arm. Drawn per team but stored per session, so the team-level value
+    # is the first session that has one. `session_arms` is reported alongside it
+    # rather than collapsed away: if two sessions of one team ever disagree, that
+    # is an assignment bug, and hiding it behind a single value would make it
+    # invisible in exactly the data used to analyse the study.
+    session_arms = [{"session": s.session_number, "arm": s.arm} for s in sessions]
+    assigned = [s.arm for s in sessions if s.arm]
+    team_arm = assigned[0] if assigned else None
+    arm_consistent = len(set(assigned)) <= 1
+
     return {
         "team": {"id": team.id, "name": team.name, "status": team.status},
+        "arm": team_arm,
+        "session_arms": session_arms,
+        "arm_consistent": arm_consistent,
         "total_turns": total_turns,
         "sessions_with_activity": sessions_with_activity,
         "members": participants,

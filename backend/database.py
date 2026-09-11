@@ -1,7 +1,11 @@
+import asyncio
+import logging
 import os
 from datetime import datetime
 from uuid import uuid4
 from sqlalchemy import (
+    CheckConstraint,
+    Index,
     String,
     DateTime,
     Float,
@@ -14,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
 
@@ -47,6 +52,8 @@ elif _db_url.startswith("postgresql"):
         pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
         pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
     )
+
+IS_POSTGRES = _db_url.startswith("postgresql")
 
 engine = create_async_engine(_db_url, **_engine_kw)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -115,11 +122,37 @@ class Classroom(Base):
     )  # label + auto test-as-student enrollment for creator
 
 
+# A conversation's kind. Needed because a group session now holds more than one
+# conversation: the team's shared coach thread, plus one PRIVATE thread per
+# student. Without a discriminator, (group_session_id, user_id) would collide for
+# the team creator, who owns the shared thread and also needs their own private one.
+CONVERSATION_SOLO = "solo"
+CONVERSATION_GROUP_SHARED = "group_shared"
+CONVERSATION_GROUP_PRIVATE = "group_private"
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        # A unique INDEX rather than a table constraint: SQLite cannot add a
+        # constraint to an existing table, but CREATE UNIQUE INDEX IF NOT EXISTS
+        # works on both backends, so the same guarantee reaches an already
+        # populated production database. NULL group_session_id (solo chats) is
+        # distinct in both engines, so solo conversations are unconstrained.
+        Index(
+            "uq_conversation_group_user_kind",
+            "group_session_id", "user_id", "kind",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    # solo | group_shared | group_private
+    kind: Mapped[str] = mapped_column(String(24), default=CONVERSATION_SOLO, nullable=False, index=True)
+    # The student's role in the group session, for role-split coaching
+    # (e.g. "backend" / "frontend"). NULL when roles aren't in use.
+    role_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
     classroom_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("classrooms.id"), nullable=True, index=True
     )
@@ -365,6 +398,14 @@ class GroupSession(Base):
     min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Post-session analysis blob; same shape as UserChallengeSession.session_analysis.
     session_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Study condition: 'control' | 'treatment'. Assigned once, when the session
+    # row is created, and never written again -- see _assign_study_arm in
+    # main.py for why it is a TEAM-level draw stored per session.
+    #
+    # Nullable because rows created before this column existed have no arm and
+    # must not be back-filled with a guess: a fabricated condition is worse than
+    # a missing one, and analysis has to be able to exclude them.
+    arm: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
 
 
 class GroupChatMessage(Base):
@@ -383,9 +424,170 @@ class GroupChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class ArtifactEvent(Base):
+    """Append-only research log of what happened to a team's artifact.
+
+    Reads and writes share ONE monotonic `seq` per group session. That is the
+    whole point: the research question is whether a student read a teammate's
+    section *before or after* writing their own, which is unanswerable if the two
+    live on separate timelines. Never sampled, never pruned.
+
+    Coach reads are kept structurally distinct from human reads, not merely
+    distinguished by a string:
+      - actor_kind is 'student' | 'coach' | 'system'
+      - a CHECK constraint enforces that a coach/system event carries no user and
+        a student event always does
+      - the append helpers in artifact_events.py are separate functions, each
+        hard-coding its own actor_kind and rejecting the other's event types
+    so a coach read cannot be recorded as a human one even by a direct insert.
+    """
+
+    __tablename__ = "artifact_events"
+    __table_args__ = (
+        UniqueConstraint("group_session_id", "seq", name="uq_artifact_event_seq"),
+        UniqueConstraint(
+            "group_session_id", "idempotency_key", name="uq_artifact_event_idem"
+        ),
+        CheckConstraint(
+            "(actor_kind = 'student' AND actor_user_id IS NOT NULL) OR "
+            "(actor_kind IN ('coach', 'system') AND actor_user_id IS NULL)",
+            name="ck_artifact_event_actor",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    # Monotonic within the session, shared by reads and writes.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # section_open | section_expand | section_write | section_read_by_coach | heartbeat_shed
+    event_type: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    actor_kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    actor_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True, index=True
+    )
+    # NULL only for session-wide events such as heartbeat_shed.
+    section_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Client clock is untrusted and kept only for skew analysis; server_ts orders.
+    client_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    server_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    # Visible dwell time the client accumulated before the read qualified.
+    dwell_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Which UI surface produced this. The coverage test uses it to prove every
+    # surface that can show a teammate's section actually reports reads.
+    surface: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class ArtifactReadHeartbeat(Base):
+    """Raw dwell samples. Low value individually, and the ONLY thing load
+    shedding is ever allowed to drop. Prunable; ArtifactEvent is not."""
+
+    __tablename__ = "artifact_read_heartbeats"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    section_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    visible_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+def _is_already_exists(exc: BaseException) -> bool:
+    """True when a DDL/insert failed only because another worker got there first."""
+    msg = str(exc).lower()
+    return any(
+        f in msg
+        for f in ("already exists", "duplicate table", "duplicate column", "duplicate key")
+    )
+
+
+async def run_seed_step(name: str, step) -> None:
+    """Run one idempotent startup seed step, tolerating a concurrent worker.
+
+    Every seed step is a check-then-insert, so with several workers booting at
+    once two can both see "missing" and both insert. The unique constraints in
+    the schema are the arbiter: the loser gets an IntegrityError, and simply
+    re-running the step then finds the winner's committed rows and does nothing.
+
+    This is what makes startup safe without needing a distributed lock -- and so
+    without needing Redis to be reachable at boot.
+    """
+    for attempt in range(3):
+        try:
+            await step()
+            return
+        except (IntegrityError, ProgrammingError, OperationalError) as e:
+            if not _is_already_exists(e) and not isinstance(e, IntegrityError):
+                raise
+            if attempt == 2:
+                logging.getLogger("database").warning(
+                    "Seed step %r still conflicting after %d attempts; assuming another "
+                    "worker completed it. Last error: %s", name, attempt + 1, e,
+                )
+                return
+            logging.getLogger("database").info(
+                "Seed step %r lost a race with another worker; re-running it.", name
+            )
+            await asyncio.sleep(0.2 * (attempt + 1))
+
+
+class GroupArtifactSection(Base):
+    """One editable section of a team's shared artifact, for one group session.
+
+    The artifact is divided into fixed sections (one per subproblem, defined by
+    the challenge). Students take a per-section lock to edit, so two people can
+    work on different subproblems at once but never on the same one. There is no
+    per-keystroke merging: a section is held by one editor until they release it.
+
+    Scoped to the GroupSession, matching how rooms, turn locks and the pub/sub
+    fan-out are already keyed. `version` increments on every committed write, so
+    a client can tell whether the content it is looking at is still current.
+    """
+
+    __tablename__ = "group_artifact_sections"
+    __table_args__ = (
+        UniqueConstraint("group_session_id", "section_key", name="uq_artifact_section"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    # Stable identifier for the subproblem, from the challenge's sessions_data.
+    section_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True, index=True
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 0 = the content here has not been edited during THIS session. Combined with
+    # carried_from_session_number that distinguishes "carried over from last
+    # session, untouched" from "the team wrote this here".
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Which earlier session this section's starting content was copied from, if
+    # any. Records the provenance of the *initial* text only; `version` says
+    # whether it has been edited since, so this is never cleared on write.
+    carried_from_session_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # create_all checks-then-creates, so two workers starting against an empty
+    # database can collide. Whoever loses just sees "already exists".
+    for attempt in range(3):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            break
+        except Exception as e:
+            if not _is_already_exists(e) or attempt == 2:
+                raise
+            await asyncio.sleep(0.2 * (attempt + 1))
     # Postgres: ORM expects listed_in_directory; older DBs (pre-Alembic) need the column added.
     if "postgresql" in _db_url.lower():
         async with engine.begin() as conn:
@@ -507,6 +709,27 @@ async def init_db():
             await conn.execute(
                 text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS openai_vector_store_id VARCHAR")
             )
+            # Private per-student coach conversations inside a group session
+            # (2026-09-11). Existing rows are classified by whether they belong
+            # to a group session; the unique index is created after the backfill
+            # so it cannot trip on un-classified rows.
+            await conn.execute(
+                text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS kind VARCHAR(24) NOT NULL DEFAULT 'solo'")
+            )
+            await conn.execute(
+                text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS role_label VARCHAR(64)")
+            )
+            await conn.execute(
+                text("UPDATE conversations SET kind = 'group_shared' "
+                     "WHERE group_session_id IS NOT NULL AND kind = 'solo'")
+            )
+            await conn.execute(
+                text("CREATE UNIQUE INDEX IF NOT EXISTS uq_conversation_group_user_kind "
+                     "ON conversations (group_session_id, user_id, kind)")
+            )
+            await conn.execute(
+                text("ALTER TABLE group_sessions ADD COLUMN IF NOT EXISTS arm VARCHAR(16)")
+            )
             await conn.execute(
                 text("ALTER TABLE attachments ADD COLUMN IF NOT EXISTS openai_file_id VARCHAR")
             )
@@ -546,6 +769,14 @@ async def init_db():
                 ("ALTER TABLE group_challenges ADD COLUMN name VARCHAR(200)", ("duplicate column", "already exists")),
                 # Document-citation retrieval (2026-08-15).
                 ("ALTER TABLE conversations ADD COLUMN openai_vector_store_id VARCHAR", ("duplicate column", "already exists")),
+                # Private per-student coach conversations (2026-09-11).
+                ("ALTER TABLE conversations ADD COLUMN kind VARCHAR(24) DEFAULT 'solo'", ("duplicate column", "already exists")),
+                ("ALTER TABLE conversations ADD COLUMN role_label VARCHAR(64)", ("duplicate column", "already exists")),
+                ("UPDATE conversations SET kind = 'group_shared' WHERE group_session_id IS NOT NULL AND (kind IS NULL OR kind = 'solo')", ()),
+                ("UPDATE conversations SET kind = 'solo' WHERE kind IS NULL", ()),
+                ("CREATE UNIQUE INDEX IF NOT EXISTS uq_conversation_group_user_kind ON conversations (group_session_id, user_id, kind)", ()),
+                # Team-level study arm (2026-09-11).
+                ("ALTER TABLE group_sessions ADD COLUMN arm VARCHAR(16)", ("duplicate column", "already exists")),
                 ("ALTER TABLE attachments ADD COLUMN openai_file_id VARCHAR", ("duplicate column", "already exists")),
                 ("ALTER TABLE attachments ADD COLUMN index_status VARCHAR(16)", ("duplicate column", "already exists")),
             ):

@@ -17,6 +17,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import resolve_token_user_id, pwd_context
+from challenges import _sections_of
 from database import (
     AsyncSessionLocal,
     Challenge,
@@ -433,6 +434,9 @@ async def list_classroom_linked_challenges(
             "mode": mode or "solo",
             "team_min": int(team_min) if team_min is not None else 2,
             "team_max": int(team_max) if team_max is not None else 4,
+            # Authored artifact sections, so the instructor UI can seed its
+            # editor from the list it already loads instead of a second fetch.
+            "sections": _sections_of(c),
         }
         for c, sort_order, mode, team_min, team_max in result.all()
     ]

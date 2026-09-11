@@ -1,5 +1,6 @@
 import os
 import io
+import random
 import re
 import json
 import base64
@@ -19,13 +20,18 @@ import openai
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
 from sqlalchemy import select, update, func
+from sqlalchemy.exc import IntegrityError
 
-from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage
+from database import init_db, run_seed_step, IS_POSTGRES, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, GroupArtifactSection, CONVERSATION_GROUP_SHARED, CONVERSATION_GROUP_PRIVATE
 from group_room import rooms
+import artifact_events
+from rate_limit import close_rate_limit_clients
 from auth import router as auth_router, resolve_token_user_id, pwd_context
-from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
+from challenges import (router as challenges_router, seed_challenges,
+                        backfill_seed_sections, get_current_user, get_db)
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
+from turn_taking import router as research_router
 from groups import router as groups_router, team_router as group_teams_router
 
 _backend_dir = Path(__file__).resolve().parent
@@ -142,30 +148,104 @@ def _spawn_analysis(conversation_id: str, user_id: str):
     task.add_done_callback(_analysis_tasks.discard)
 
 
+# A pending analysis whose timestamp was refreshed this recently is assumed to
+# have just been claimed by a sibling worker that booted moments earlier, rather
+# than orphaned by a dead one. Without this, every worker in a multi-worker
+# deploy re-queues the same stuck analyses and pays for N duplicate LLM runs.
+# Far shorter than _ANALYSIS_STALE_SECONDS: this only has to outlive the spread
+# between workers' start times, not a whole generation.
+_SWEEP_CLAIM_GRACE_SECONDS = 60
+
+
+def _claimed_by_a_sibling(blob: dict | None, now: datetime) -> bool:
+    pa = (blob or {}).get("pending_at")
+    if not pa:
+        return False  # no timestamp -> legacy row, safe to take
+    try:
+        started = datetime.fromisoformat(pa)
+    except ValueError:
+        return False
+    return (now - started).total_seconds() < _SWEEP_CLAIM_GRACE_SECONDS
+
+
 async def _resweep_stuck_analyses():
     """Startup sweep: re-queue any sessions left 'pending' by a previous process
-    (a deploy/crash mid-generation would otherwise wedge them permanently)."""
+    (a deploy/crash mid-generation would otherwise wedge them permanently).
+
+    Runs on every worker, so it has to claim rows rather than just read them.
+    Two guards, covering the two ways workers overlap:
+      - booting at the same instant -> SELECT ... FOR UPDATE SKIP LOCKED, so only
+        one worker can even see a given row (Postgres only; SQLite has no
+        SKIP LOCKED and a SQLite deployment is single-worker anyway).
+      - booting seconds apart -> the winner stamps a fresh pending_at, and the
+        later worker skips anything claimed within the grace window above.
+    A row missed by both still gets picked up later: the analysis GET endpoint
+    re-fires anything pending past _ANALYSIS_STALE_SECONDS.
+    """
     try:
+        claimed: list[tuple[str, str]] = []
         async with AsyncSessionLocal() as db:
-            rows = (await db.execute(
-                select(UserChallengeSession).where(
-                    UserChallengeSession.conversation_id.is_not(None),
-                    UserChallengeSession.session_analysis.is_not(None),
-                )
-            )).scalars().all()
-            requeued = 0
+            stmt = select(UserChallengeSession).where(
+                UserChallengeSession.conversation_id.is_not(None),
+                UserChallengeSession.session_analysis.is_not(None),
+            )
+            if IS_POSTGRES:
+                stmt = stmt.with_for_update(skip_locked=True)
+            rows = (await db.execute(stmt)).scalars().all()
+            now = datetime.utcnow()
             for ucs in rows:
                 blob = ucs.session_analysis or {}
-                if blob.get("status") == "pending":
-                    # Refresh the timestamp so concurrent pollers don't double-fire.
-                    ucs.session_analysis = _pending_blob()
-                    _spawn_analysis(ucs.conversation_id, ucs.user_id)
-                    requeued += 1
-            if requeued:
+                if blob.get("status") != "pending":
+                    continue
+                if _claimed_by_a_sibling(blob, now):
+                    log.debug(
+                        "[SESSION-ANALYSIS] %s claimed by another worker; skipping",
+                        (ucs.conversation_id or "")[:8],
+                    )
+                    continue
+                # Stamping a fresh pending_at IS the claim.
+                ucs.session_analysis = _pending_blob()
+                claimed.append((ucs.conversation_id, ucs.user_id))
+            if claimed:
                 await db.commit()
-                log.info(f"[SESSION-ANALYSIS] re-queued {requeued} stuck pending analyses on startup")
+        # Spawn only once the claim is committed and the row locks are released,
+        # so the generators never contend with the sweep's own transaction.
+        for conversation_id, user_id in claimed:
+            _spawn_analysis(conversation_id, user_id)
+        if claimed:
+            log.info(f"[SESSION-ANALYSIS] re-queued {len(claimed)} stuck pending analyses on startup")
     except Exception as e:
         log.error(f"[SESSION-ANALYSIS] startup sweep failed: {type(e).__name__}: {e}")
+
+
+async def _run_startup_seeding() -> None:
+    """Schema + idempotent seed data, safe to run on several workers at once.
+
+    Every step is a check-then-insert, so with multiple workers booting together
+    two can both see "missing" and both insert. Rather than serialize them behind
+    a distributed lock, each step is made race-tolerant and the database's own
+    unique constraints act as the arbiter: the loser gets an IntegrityError, and
+    re-running the step then finds the winner's committed rows and does nothing.
+    (challenges.title is not unique, so seeded challenges derive their primary key
+    from their title instead -- see challenges._seed_challenge_id.)
+
+    Doing it this way rather than with a lock means startup depends only on the
+    database, which must be reachable for the app to work at all. A lock would
+    have added Redis to the boot path, and a cold start with Redis down would
+    then be exactly the fragile case this avoids.
+    """
+    await run_seed_step("init_db", init_db)
+    await run_seed_step("dev_platform_admin", seed_dev_platform_admin)
+    await run_seed_step("sync_platform_admins", _sync_platform_admin_emails)
+    log.info("Database initialized")
+    await run_seed_step("challenges", seed_challenges)
+    # seed_challenges() is insert-only, so a challenge that already exists never
+    # gains newly-declared artifact sections. This backfills them (guarded: seed
+    # ids only, and only where no sections exist yet).
+    await run_seed_step("seed_sections", backfill_seed_sections)
+    await run_seed_step("demo_classroom", seed_demo_classroom)
+    await run_seed_step("pilot_classroom", seed_pilot_classroom)
+    await run_seed_step("resweep_analyses", _resweep_stuck_analyses)
 
 
 @asynccontextmanager
@@ -182,15 +262,25 @@ async def lifespan(app: FastAPI):
             "JWT_SECRET is shorter than 32 characters — use a long random secret in production "
             "(e.g. openssl rand -hex 32)."
         )
-    await init_db()
-    await seed_dev_platform_admin()
-    await _sync_platform_admin_emails()
-    log.info("Database initialized")
-    await seed_challenges()
-    await seed_demo_classroom()
-    await seed_pilot_classroom()
-    await _resweep_stuck_analyses()
+    # Group-room backend (in-process, or Redis when REDIS_URL is set). Brought up
+    # first because the startup seeding below borrows its distributed lock. A
+    # failure here is logged loudly and leaves group chat closed; it never
+    # silently falls back to in-memory rooms, which would be wrong under
+    # multiple workers.
+    rooms.configure()
+    try:
+        await rooms.startup_check()
+        log.info(f"Group rooms: {rooms.backend_name} backend ready")
+    except Exception as e:
+        log.critical(
+            f"Group rooms: {rooms.backend_name} backend UNREACHABLE ({type(e).__name__}: {e}). "
+            "Group chat will refuse connections until this is fixed. Solo chat is unaffected."
+        )
+
+    await _run_startup_seeding()
     yield
+    await rooms.close()
+    await close_rate_limit_clients()
 
 
 app = FastAPI(title="Husky AI API", lifespan=lifespan)
@@ -208,6 +298,7 @@ app.include_router(auth_router)
 app.include_router(challenges_router)
 app.include_router(classrooms_router)
 app.include_router(admin_router)
+app.include_router(research_router)
 app.include_router(groups_router)
 app.include_router(group_teams_router)
 
@@ -681,6 +772,107 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
             await db.commit()
     except Exception as e:
         log.error(f"DB save failed for turn {turn_num}: {e}")
+
+
+async def run_private_turn(
+    websocket: WebSocket,
+    *,
+    conversation_id: str,
+    history: list[dict],
+    chat_config,
+    user_content: str,
+    attachments: list,
+) -> bool:
+    """Run one coach turn on a PRIVATE, single-reader conversation.
+
+    Extracted from the inline body of the /ws handler so a second private
+    endpoint does not have to paste it a third time. /ws/group already copied
+    that logic once, which is exactly why it silently lacks timers, citations and
+    attachment indexing -- a divergence nobody chose.
+
+    Deliberately writes only to `websocket`. There is no broadcast anywhere in
+    here, which is what makes the conversation private by construction rather
+    than by the caller remembering not to fan it out.
+
+    `history` is mutated in place (user turn appended, assistant turn appended,
+    rolled back on a stream failure) so the caller keeps the running context.
+    Returns True if the turn produced a reply.
+
+    NOTE: /ws still has its own copy. Migrating it is a separate change with its
+    own test pass -- it is the busiest path in the app and not worth folding into
+    a new-endpoint commit.
+    """
+    turn = len(history) // 2 + 1
+
+    if attachments:
+        await asyncio.to_thread(_preprocess_attachments, attachments)
+
+    gemini_history = await _build_gemini_history(history)
+    turn_parts = await _build_attachment_parts(attachments)
+    turn_parts.append(types.Part(text=user_content))
+    contents = gemini_history + [types.Content(role="user", parts=turn_parts)]
+
+    history.append(
+        {"role": "user", "content": user_content, "attachments": attachments}
+    )
+
+    await websocket.send_text(json.dumps({"type": "typing"}))
+
+    full_response = ""
+    try:
+        async for chunk in await client.aio.models.generate_content_stream(
+            model="gemini-2.5-pro",
+            contents=contents,
+            config=chat_config,
+        ):
+            text_chunk = chunk.text
+            if text_chunk:
+                full_response += text_chunk
+                await websocket.send_text(json.dumps({
+                    "type": "stream", "content": text_chunk,
+                }))
+    except Exception as e:
+        log.error(f"[COACH] stream error: {type(e).__name__}: {e}", exc_info=True)
+        await websocket.send_text(json.dumps({
+            "type": "error", "message": f"Chat error: {type(e).__name__}",
+        }))
+        history.pop()  # roll back the optimistically-appended user turn
+        return False
+
+    history.append({"role": "assistant", "content": full_response})
+    await websocket.send_text(json.dumps({
+        "type": "done", "full_response": full_response,
+    }))
+
+    # -- Related passages, when this conversation has indexed attachments --
+    vector_store_id = await _get_conversation_vector_store_id(conversation_id)
+    if vector_store_id:
+        try:
+            related = await asyncio.wait_for(
+                _retrieve_related_passages(vector_store_id, user_content, full_response),
+                timeout=8,
+            )
+            await websocket.send_text(json.dumps({
+                "type": "citations", "turn": turn, "citations": related,
+            }))
+        except Exception as e:
+            log.warning(f"[COACH] citation retrieval failed: {type(e).__name__}: {e}")
+            await websocket.send_text(json.dumps({"type": "citations_error", "turn": turn}))
+
+    # -- Evaluation --
+    await websocket.send_text(json.dumps({"type": "eval_start"}))
+    try:
+        eval_result = await evaluate_conversation(history)
+        # _save_turn is reused unchanged. Its PEI rollup looks up a
+        # UserChallengeSession by conversation_id and finds none for a private
+        # group conversation, so the per-turn EvalResult is stored but nothing
+        # rolls into a session score -- which is the intended behaviour here.
+        await _save_turn(conversation_id, user_content, full_response, eval_result, turn, attachments)
+        await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
+    except Exception as e:
+        log.error(f"[COACH] eval error: {type(e).__name__}: {e}", exc_info=True)
+        await websocket.send_text(json.dumps({"type": "eval_error", "message": str(e)}))
+    return True
 
 
 async def _close_conversation(conversation_id: str):
@@ -1169,6 +1361,359 @@ async def websocket_endpoint(
 # broadcast streaming, free-form serialized turns, presence, history replay).
 
 
+# Minimum visible dwell before an open/expand counts as a read. Filters accidental
+# click-throughs. The client enforces it too; the server re-checks because the
+# client is not trusted to define what a read is.
+_MIN_READ_DWELL_MS = int(os.getenv("ARTIFACT_MIN_READ_DWELL_MS", "3000"))
+
+
+def _parse_client_ts(raw) -> datetime | None:
+    """Client clock, kept only for skew analysis. Never used for ordering."""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+# Longest a single artifact section may be. Generous for prose, but bounded so a
+# client cannot push an unbounded blob through the websocket into the DB.
+_MAX_SECTION_CHARS = 20000
+
+# Total characters of artifact content injected into ONE coach turn. A single
+# section may be _MAX_SECTION_CHARS on its own and a challenge can declare any
+# number of them, so an uncapped snapshot would grow the system prompt without
+# bound as the team writes -- on every turn, for every student in the team.
+_COACH_ARTIFACT_CHAR_BUDGET = 10000
+
+
+def _challenge_sections(session_data: dict | None) -> list[dict]:
+    """The fixed sections (one per subproblem) for this challenge session.
+
+    Authored by the instructor in Challenge.sessions_data[n]["sections"], as a
+    list of {"key", "title", optional "prompt"}. A challenge with no sections
+    declared simply has no artifact -- the feature is opt-in per session.
+    """
+    raw = (session_data or {}).get("sections")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for i, item in enumerate(raw):
+        if isinstance(item, str):
+            if not item.strip():
+                continue  # blank entry in the challenge JSON -- not a section
+            out.append({"key": f"s{i + 1}", "title": item.strip(), "prompt": ""})
+        elif isinstance(item, dict):
+            key = str(item.get("key") or f"s{i + 1}").strip()
+            if key:
+                out.append({
+                    "key": key,
+                    "title": str(item.get("title") or key),
+                    "prompt": str(item.get("prompt") or ""),
+                })
+    # Drop duplicate keys -- they would make a lock ambiguous.
+    seen: set[str] = set()
+    unique = []
+    for sec in out:
+        if sec["key"] in seen:
+            continue
+        seen.add(sec["key"])
+        unique.append(sec)
+    return unique
+
+
+async def _section_lock_holder(room, section_key: str) -> dict | None:
+    """Authoritative read of who holds a section, straight from the backend."""
+    for rec in await room.section_locks():
+        if rec.get("section_key") == section_key:
+            return rec
+    return None
+
+
+async def _seed_artifact_from_previous_session(
+    group_id: str, group_session_id: str, session_num: int, section_keys: set[str]
+) -> int:
+    """Start a new session's artifact from the team's previous session.
+
+    Each session owns an independent artifact -- the locking model is unchanged,
+    and nothing is shared live between sessions. This only copies the *starting*
+    content once, so a team continues from where they left off instead of facing
+    a blank document.
+
+    Source is the most recent earlier session of the same team that actually has
+    content; a session the team skipped or left empty is passed over rather than
+    wiping out the last real work. Only sections that still exist in the current
+    challenge are copied, so renaming or dropping a subproblem doesn't drag
+    orphaned text forward.
+
+    Idempotent and safe with several workers: it no-ops once the session has any
+    section rows, and each copy is its own transaction guarded by the
+    (group_session_id, section_key) unique constraint -- if two students connect
+    at the same moment, the loser of each race just skips that row.
+    """
+    if session_num <= 1 or not section_keys:
+        return 0
+
+    async with AsyncSessionLocal() as db:
+        already = await db.scalar(
+            select(func.count())
+            .select_from(GroupArtifactSection)
+            .where(GroupArtifactSection.group_session_id == group_session_id)
+        )
+        if already:
+            return 0
+
+        previous = (await db.execute(
+            select(GroupSession.id, GroupSession.session_number)
+            .where(
+                GroupSession.group_id == group_id,
+                GroupSession.session_number < session_num,
+            )
+            .order_by(GroupSession.session_number.desc())
+        )).all()
+
+        source_num = None
+        source_rows: list = []
+        for prev_id, prev_num in previous:
+            rows = (await db.execute(
+                select(GroupArtifactSection).where(
+                    GroupArtifactSection.group_session_id == prev_id,
+                    GroupArtifactSection.section_key.in_(section_keys),
+                )
+            )).scalars().all()
+            rows = [r for r in rows if (r.content or "").strip()]
+            if rows:
+                source_num, source_rows = prev_num, rows
+                break
+
+    if not source_rows:
+        return 0
+
+    copied = 0
+    for row in source_rows:
+        try:
+            async with AsyncSessionLocal() as db:
+                db.add(GroupArtifactSection(
+                    group_session_id=group_session_id,
+                    section_key=row.section_key,
+                    content=row.content,
+                    # Provenance of the text, which is genuinely who last wrote
+                    # it. version stays 0: nobody has edited it in THIS session.
+                    updated_by_user_id=row.updated_by_user_id,
+                    updated_at=row.updated_at,
+                    version=0,
+                    carried_from_session_number=source_num,
+                ))
+                await db.commit()
+                copied += 1
+        except IntegrityError:
+            # Another worker seeded this section a moment earlier.
+            pass
+
+    if copied:
+        log.info(
+            f"[ARTIFACT] carried {copied} section(s) from session {source_num} "
+            f"into session {session_num} for group={group_id[:8]}"
+        )
+    return copied
+
+
+async def _load_artifact_sections(group_session_id: str) -> dict[str, dict]:
+    """Persisted content for every section of this group session, by section_key."""
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(GroupArtifactSection).where(
+                GroupArtifactSection.group_session_id == group_session_id
+            )
+        )).scalars().all()
+        return {
+            r.section_key: {
+                "content": r.content or "",
+                "updated_by": r.updated_by_user_id,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                "version": r.version,
+                "carried_from_session_number": r.carried_from_session_number,
+            }
+            for r in rows
+        }
+
+
+async def _build_coach_artifact_context(
+    *, group_session_id: str, session_data: dict | None
+) -> tuple[str, list[dict]]:
+    """The team's current artifact, rendered for the coach's system prompt.
+
+    Returns (prompt_block, manifest). The manifest is one entry per section that
+    actually reached the model, carrying the characters sent and whether it was
+    truncated -- it is what gets logged, so the read log records what the coach
+    SAW rather than what happened to exist in the table.
+
+    Only sections with content are included: an empty section tells the coach
+    nothing and would spend budget a written one needs.
+
+    Deliberately the full current content of every written section, NOT the
+    subset this student has opened. The opened-set IS the human read measure
+    (log_student_read, driven by the dwell timer); sourcing the coach's context
+    from it would couple the intervention to the measurement and make
+    read-before-write circular.
+    """
+    sections = _challenge_sections(session_data)
+    if not sections:
+        return "", []
+    saved = await _load_artifact_sections(group_session_id)
+
+    parts: list[str] = []
+    manifest: list[dict] = []
+    omitted: list[str] = []
+    budget = _COACH_ARTIFACT_CHAR_BUDGET
+
+    for sec in sections:
+        row = saved.get(sec["key"]) or {}
+        content = (row.get("content") or "").strip()
+        if not content:
+            continue
+        if budget <= 0:
+            # Budget already spent by earlier sections. Recorded, not dropped
+            # quietly: the log has to show the coach never saw this one.
+            omitted.append(sec["key"])
+            continue
+        truncated = len(content) > budget
+        body = content[:budget]
+        # Counted before the marker is appended: `chars` means "characters of
+        # the team's own text the coach saw", which is what the budget bounds
+        # and what analysis wants. Including the marker would overstate it.
+        sent_chars = len(body)
+        budget -= sent_chars
+        if truncated:
+            body += "\n[...truncated: the team's text continues beyond this point]"
+        parts.append(f"### {sec['title']} (section key: {sec['key']})\n{body}")
+        manifest.append({
+            "section_key": sec["key"],
+            "chars": sent_chars,
+            "truncated": truncated,
+            "version": row.get("version"),
+        })
+
+    if not parts:
+        return "", []
+
+    if omitted:
+        parts.append(
+            "(Some sections were omitted because the artifact exceeded the "
+            f"context budget: {', '.join(omitted)})"
+        )
+    for item in manifest:
+        item["budget_omitted"] = omitted or None
+
+    block = (
+        "\n\nTHE TEAM'S SHARED ARTIFACT (its current contents, written by this "
+        "student and their teammates):\n\n"
+        + "\n\n".join(parts)
+        + "\n\nDraw on this when it is relevant to what the student asks. It is "
+          "the team's work and not yours: do not rewrite it for them, and do "
+          "not assume this student wrote any particular part of it."
+    )
+    return block, manifest
+
+
+async def _log_coach_artifact_reads(
+    *,
+    group_session_id: str,
+    conversation_id: str,
+    user_id: str,
+    turn: int,
+    manifest: list[dict],
+) -> None:
+    """Record that the coach pulled these sections into its own context.
+
+    *** Anyone computing read metrics from artifact_events, read this. ***
+
+    These rows are actor_kind='coach' with actor_user_id NULL -- the DB CHECK
+    constraint enforces that pairing and would reject anything else.
+    `meta.requested_by` names the student whose turn triggered the pull. That is
+    PROVENANCE, NOT A HUMAN READ: the coach read the section, the student did
+    not. Every "student reads" query must filter on actor_kind='student'.
+    Scanning meta.requested_by instead would count coach pulls as human reads
+    and inflate read-before-write toward 1.0, which is the single easiest way to
+    silently invalidate the headline result of this study.
+
+    Logged before the model call rather than after: the pull is what we are
+    recording, and the idempotency key is per (conversation, turn, section), so
+    a retried turn collapses onto the same row instead of double-counting.
+    """
+    for item in manifest:
+        try:
+            await artifact_events.log_coach_read(
+                group_session_id=group_session_id,
+                section_key=item["section_key"],
+                idempotency_key=f"coach:{conversation_id}:{turn}:{item['section_key']}",
+                meta={
+                    "requested_by": user_id,   # provenance only -- see above
+                    "conversation_id": conversation_id,
+                    "turn": turn,
+                    "chars": item["chars"],
+                    "truncated": item["truncated"],
+                    "section_version": item.get("version"),
+                    "budget_omitted": item.get("budget_omitted"),
+                    "surface": "coach_context",
+                },
+            )
+        except Exception as e:
+            # A logging failure must never cost the student their coach turn.
+            log.error(
+                "[WS-COACH] failed to log coach read of %s: %s: %s",
+                item["section_key"], type(e).__name__, e,
+            )
+
+
+async def _save_artifact_section(
+    group_session_id: str, section_key: str, content: str, user_id: str
+) -> dict:
+    """Upsert one section's content. Called only after the lock check passed."""
+    now = datetime.utcnow()
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(
+            select(GroupArtifactSection).where(
+                GroupArtifactSection.group_session_id == group_session_id,
+                GroupArtifactSection.section_key == section_key,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            row = GroupArtifactSection(
+                group_session_id=group_session_id,
+                section_key=section_key,
+                content=content,
+                updated_by_user_id=user_id,
+                updated_at=now,
+                version=1,
+            )
+            db.add(row)
+            try:
+                await db.commit()
+            except IntegrityError:
+                # Another worker created the row first; fall through to update it.
+                await db.rollback()
+                row = (await db.execute(
+                    select(GroupArtifactSection).where(
+                        GroupArtifactSection.group_session_id == group_session_id,
+                        GroupArtifactSection.section_key == section_key,
+                    )
+                )).scalar_one()
+                row.content = content
+                row.updated_by_user_id = user_id
+                row.updated_at = now
+                row.version = (row.version or 0) + 1
+                await db.commit()
+        else:
+            row.content = content
+            row.updated_by_user_id = user_id
+            row.updated_at = now
+            row.version = (row.version or 0) + 1
+            await db.commit()
+        return {"updated_at": now.isoformat(), "version": row.version}
+
+
 async def _is_group_member(group_id: str, user_id: str) -> bool:
     async with AsyncSessionLocal() as db:
         r = await db.execute(
@@ -1198,10 +1743,100 @@ async def _group_team_min(group_id: str) -> int:
         return int(tm) if tm is not None else 2
 
 
+ARM_CONTROL = "control"
+ARM_TREATMENT = "treatment"
+STUDY_ARMS = (ARM_CONTROL, ARM_TREATMENT)
+
+
+async def _assign_study_arm(db, group: GroupChallenge) -> str:
+    """The study arm for a GroupSession that is about to be created.
+
+    TEAM-level, despite living on the session row. A team runs up to six
+    sessions, and an independent draw each time would put the same team in
+    control for session 1 and treatment for session 2 -- which is not a
+    team-level intervention, it is noise. So:
+
+      - if this team already has ANY session with an arm, return that arm. This
+        is what makes "assigned once, never changed" true across the whole team
+        rather than just within one row.
+      - otherwise draw, stratified within the team's cohort (same classroom and
+        challenge).
+
+    Stratified minimisation rather than a coin flip, because the cohort is small:
+    a class has roughly six teams, and a fair coin gives a 5-1-or-worse split
+    about 22% of the time. Assigning whichever arm is currently
+    under-represented removes that risk; ties break randomly, so the first team
+    in a cohort is still a genuine 50/50 and assignment order is not predictable
+    from the outside.
+
+    Counted per TEAM, not per session -- a team with three sessions must not
+    count three times toward its arm's total, or a single active team would
+    drag every later assignment to the other arm.
+    """
+    existing = await db.scalar(
+        select(GroupSession.arm)
+        .where(GroupSession.group_id == group.id, GroupSession.arm.is_not(None))
+        .limit(1)
+    )
+    if existing in STUDY_ARMS:
+        return existing
+
+    cohort = (
+        select(GroupSession.group_id, GroupSession.arm)
+        .join(GroupChallenge, GroupChallenge.id == GroupSession.group_id)
+        .where(
+            GroupChallenge.challenge_id == group.challenge_id,
+            GroupSession.arm.is_not(None),
+            GroupSession.group_id != group.id,
+        )
+    )
+    # Legacy teams predate classroom_id and carry NULL; treat those as their own
+    # cohort rather than pooling them with every classroom's teams.
+    if group.classroom_id is None:
+        cohort = cohort.where(GroupChallenge.classroom_id.is_(None))
+    else:
+        cohort = cohort.where(GroupChallenge.classroom_id == group.classroom_id)
+
+    arm_by_team = {gid: arm for gid, arm in (await db.execute(cohort.distinct())).all()}
+    counts = {arm: 0 for arm in STUDY_ARMS}
+    for arm in arm_by_team.values():
+        if arm in counts:
+            counts[arm] += 1
+
+    if counts[ARM_CONTROL] < counts[ARM_TREATMENT]:
+        return ARM_CONTROL
+    if counts[ARM_TREATMENT] < counts[ARM_CONTROL]:
+        return ARM_TREATMENT
+    return random.choice(STUDY_ARMS)
+
+
 async def _ensure_group_session(group_id: str, session_num: int):
     """Get-or-create the GroupSession for (group, session) and its shared
     Conversation. Returns (group_session_id, conversation_id, challenge_id) or
-    None if the group does not exist."""
+    None if the group does not exist.
+
+    Two teammates connecting at the same moment both see "no session yet" and
+    both try to insert. The uq_group_session_num constraint means exactly one
+    wins; the loser re-reads the row the winner just committed. This was already
+    racy with a single worker (two interleaved coroutines) and is unavoidable
+    across workers, where no in-process lock could help -- so the DB constraint
+    is the arbiter.
+    """
+    for attempt in range(2):
+        try:
+            return await _ensure_group_session_once(group_id, session_num)
+        except IntegrityError:
+            if attempt == 0:
+                log.info(
+                    f"[WS-GROUP] concurrent create for group={group_id[:8]} "
+                    f"session={session_num}; re-reading the winner's row"
+                )
+                continue
+            raise
+    return None
+
+
+async def _ensure_group_session_once(group_id: str, session_num: int):
     async with AsyncSessionLocal() as db:
         group = await db.get(GroupChallenge, group_id)
         if not group:
@@ -1218,6 +1853,11 @@ async def _ensure_group_session(group_id: str, session_num: int):
                 challenge_id=group.challenge_id,
                 session_number=session_num,
                 status="not_started",
+                # Assigned here and nowhere else. Two teammates can race to
+                # create this row; uq_group_session_num picks one winner and the
+                # loser re-reads the winner's row, so the arm is written exactly
+                # once and never updated.
+                arm=await _assign_study_arm(db, group),
             )
             db.add(gs)
             await db.flush()
@@ -1225,7 +1865,11 @@ async def _ensure_group_session(group_id: str, session_num: int):
             # The shared conversation is owned (user_id) by the group creator so
             # existing per-conversation lookups (e.g. consent) keep working; the
             # group_session_id link is what marks it as a shared conversation.
-            conv = Conversation(user_id=group.created_by, group_session_id=gs.id)
+            conv = Conversation(
+                user_id=group.created_by,
+                group_session_id=gs.id,
+                kind=CONVERSATION_GROUP_SHARED,
+            )
             db.add(conv)
             await db.flush()
             gs.conversation_id = conv.id
@@ -1429,15 +2073,29 @@ async def group_websocket_endpoint(
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
+    # Fixed artifact sections for this challenge session. Empty list = this
+    # challenge has no artifact, and every section_* message is rejected.
+    artifact_sections = _challenge_sections(session_data)
+    valid_sections = {sec["key"] for sec in artifact_sections}
+
     room = await rooms.get(group_session_id)
 
-    # Hydrate shared history once per live room.
-    if not room.history_loaded:
-        room.history = await _load_group_history(conversation_id)
-        room.history_loaded = True
+    # The shared history is NOT cached on the room: with several workers each
+    # would hold its own copy and they would drift. Postgres is the source of
+    # truth, and it is re-read at the top of every turn inside the turn lock.
+    history = await _load_group_history(conversation_id)
 
-    room.add(websocket, user_id, my_name)
-    log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
+    try:
+        await room.add(websocket, user_id, my_name)
+    except Exception as e:
+        # Fail loudly: without the shared backend this member would be invisible
+        # to the rest of the team and could take a turn nobody else is aware of.
+        log.critical(
+            f"[WS-GROUP] room backend unavailable, refusing connection: {type(e).__name__}: {e}"
+        )
+        await websocket.close(code=4005, reason="Collaboration backend unavailable")
+        return
+    log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({room.local_count()} live on this worker)")
 
     # --- Initial state to the connecting client only ---
     await websocket.send_text(json.dumps({
@@ -1445,7 +2103,7 @@ async def group_websocket_endpoint(
         "conversation_id": conversation_id,
         "group_id": group_id,
         "session_num": session_num,
-        "turn_count": len(room.history) // 2,
+        "turn_count": len(history) // 2,
     }))
     if session_data:
         await websocket.send_text(json.dumps({
@@ -1457,7 +2115,7 @@ async def group_websocket_endpoint(
                 "seed_question": session_data.get("seed_question"),
             },
         }))
-    if room.history:
+    if history:
         client_history = [
             {
                 "role": m["role"],
@@ -1468,12 +2126,12 @@ async def group_websocket_endpoint(
                     {"name": a.get("filename") or a.get("name")} for a in m.get("attachments", [])
                 ],
             }
-            for m in room.history
+            for m in history
         ]
         await websocket.send_text(json.dumps({
             "type": "history",
             "messages": client_history,
-            "turn_count": len(room.history) // 2,
+            "turn_count": len(history) // 2,
         }))
 
     # Replay the team backchannel (separate stream; never touches the coach/LLM).
@@ -1481,9 +2139,47 @@ async def group_websocket_endpoint(
     if team_chat:
         await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
 
+    # Current artifact: section definitions, saved content, and who is editing
+    # what right now (across every worker), so a joining client renders the same
+    # locked/unlocked state everyone else already sees.
+    if artifact_sections:
+        try:
+            # Continue from the team's previous session. No-ops once this
+            # session has any content of its own.
+            await _seed_artifact_from_previous_session(
+                group_id, group_session_id, session_num, valid_sections
+            )
+            saved = await _load_artifact_sections(group_session_id)
+            live_locks = await room.section_locks()
+        except Exception as e:
+            log.critical(f"[WS-GROUP] artifact state unavailable: {type(e).__name__}: {e}")
+            await websocket.close(code=4005, reason="Collaboration backend unavailable")
+            return
+        await websocket.send_text(json.dumps({
+            "type": "artifact_state",
+            "sections": [
+                {
+                    **sec,
+                    **saved.get(sec["key"], {"content": "", "updated_by": None,
+                                             "updated_at": None, "version": 0,
+                                             "carried_from_session_number": None}),
+                }
+                for sec in artifact_sections
+            ],
+            "locks": [
+                {
+                    "section_key": rec.get("section_key"),
+                    "holder_user_id": rec.get("holder_user_id"),
+                    "holder_name": rec.get("holder_name"),
+                    "expires_at": rec.get("expires_at"),
+                }
+                for rec in live_locks
+            ],
+        }))
+
     # Tell everyone (including this client) who is now present.
     await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
 
     try:
         while True:
@@ -1521,40 +2217,231 @@ async def group_websocket_endpoint(
                 )
                 continue
 
+            # --- Artifact read logging ---
+            # A read is an explicit open/expand that survived the client-side
+            # dwell threshold. The client buffers these and replays them on
+            # reconnect, so the same event can arrive more than once; the
+            # idempotency key collapses retries instead of dropping them.
+            # Nothing here is ever sampled.
+            if mtype == "section_read":
+                section_key = (data.get("section_key") or "").strip()
+                event_type = (data.get("event_type") or "").strip()
+                event_id = (data.get("event_id") or "").strip()
+                dwell_ms = data.get("dwell_ms")
+                surface = (data.get("surface") or "").strip() or None
+                if (
+                    section_key not in valid_sections
+                    or event_type not in artifact_events.STUDENT_READ_TYPES
+                    or not event_id
+                ):
+                    await websocket.send_text(json.dumps({
+                        "type": "read_event_rejected", "event_id": event_id,
+                        "reason": "invalid",
+                    }))
+                    continue
+                if not isinstance(dwell_ms, int) or dwell_ms < _MIN_READ_DWELL_MS:
+                    # Below the dwell floor the client should not have sent this
+                    # at all. Refuse rather than record a read that did not meet
+                    # the agreed definition.
+                    await websocket.send_text(json.dumps({
+                        "type": "read_event_rejected", "event_id": event_id,
+                        "reason": "below_dwell_threshold",
+                    }))
+                    continue
+                try:
+                    stored = await artifact_events.log_student_read(
+                        group_session_id=group_session_id,
+                        user_id=user_id,
+                        section_key=section_key,
+                        event_type=event_type,
+                        idempotency_key=f"read:{user_id}:{section_key}:{event_id}",
+                        dwell_ms=dwell_ms,
+                        client_ts=_parse_client_ts(data.get("client_ts")),
+                        surface=surface,
+                    )
+                except Exception as e:
+                    # Do NOT ack: the client keeps the event buffered and retries.
+                    log.error(f"[ARTIFACT] read log failed: {type(e).__name__}: {e}")
+                    continue
+                # Ack by event_id so the client can drop it from its buffer.
+                await websocket.send_text(json.dumps({
+                    "type": "read_event_ack",
+                    "event_id": event_id,
+                    "seq": stored["seq"],
+                    "duplicate": stored["duplicate"],
+                }))
+                continue
+
+            # Raw dwell samples: the only tier that may ever be shed.
+            if mtype == "section_read_heartbeat":
+                section_key = (data.get("section_key") or "").strip()
+                visible_ms = data.get("visible_ms")
+                if section_key in valid_sections and isinstance(visible_ms, int):
+                    await artifact_events.record_heartbeat(
+                        group_session_id=group_session_id,
+                        user_id=user_id,
+                        section_key=section_key,
+                        visible_ms=visible_ms,
+                    )
+                continue
+
+            # --- Shared artifact: per-section editing locks ---
+            # Sections are fixed (one per subproblem). A student holds a section
+            # while editing it; nobody else can write to it meanwhile. No
+            # per-keystroke merging -- the lock IS the concurrency control.
+            if mtype == "section_lock_request":
+                section_key = (data.get("section_key") or "").strip()
+                if section_key not in valid_sections:
+                    await websocket.send_text(json.dumps({
+                        "type": "section_lock_denied", "section_key": section_key,
+                        "reason": "unknown_section",
+                    }))
+                    continue
+                try:
+                    got, holder = await room.acquire_section(
+                        websocket, section_key, user_id, my_name
+                    )
+                except Exception as e:
+                    log.critical(f"[WS-GROUP] section lock backend unavailable: {type(e).__name__}: {e}")
+                    await websocket.send_text(json.dumps({
+                        "type": "error", "message": "Collaboration backend unavailable. Please reconnect.",
+                    }))
+                    break
+                if not got:
+                    await websocket.send_text(json.dumps({
+                        "type": "section_lock_denied",
+                        "section_key": section_key,
+                        "reason": "held",
+                        "holder_user_id": holder.get("holder_user_id"),
+                        "holder_name": holder.get("holder_name"),
+                    }))
+                    continue
+                # Tell everyone, so each client can show "X is editing" and
+                # disable the section for the others.
+                await room.broadcast({
+                    "type": "section_locked",
+                    "section_key": section_key,
+                    "holder_user_id": user_id,
+                    "holder_name": my_name,
+                    "expires_at": holder.get("expires_at"),
+                })
+                continue
+
+            if mtype == "section_unlock":
+                section_key = (data.get("section_key") or "").strip()
+                freed = await room.release_section(websocket, section_key)
+                if freed:
+                    await room.broadcast({"type": "section_unlocked", "section_key": section_key})
+                continue
+
+            if mtype == "section_write":
+                section_key = (data.get("section_key") or "").strip()
+                content = data.get("content")
+                if not isinstance(content, str):
+                    content = ""
+                if len(content) > _MAX_SECTION_CHARS:
+                    await websocket.send_text(json.dumps({
+                        "type": "section_write_denied", "section_key": section_key,
+                        "reason": "too_long",
+                    }))
+                    continue
+                # Defence in depth: never trust that the client only writes when
+                # it believes it holds the lock. Re-read the lock and require
+                # that THIS user on THIS socket is the holder.
+                try:
+                    holder = await _section_lock_holder(room, section_key)
+                except Exception as e:
+                    log.critical(f"[WS-GROUP] section lock read failed: {type(e).__name__}: {e}")
+                    await websocket.send_text(json.dumps({
+                        "type": "error", "message": "Collaboration backend unavailable. Please reconnect.",
+                    }))
+                    break
+                if (
+                    section_key not in valid_sections
+                    or holder is None
+                    or holder.get("holder_user_id") != user_id
+                    or not room.holds_section(websocket, section_key)
+                ):
+                    await websocket.send_text(json.dumps({
+                        "type": "section_write_denied",
+                        "section_key": section_key,
+                        "reason": "not_lock_holder",
+                        "holder_user_id": (holder or {}).get("holder_user_id"),
+                        "holder_name": (holder or {}).get("holder_name"),
+                    }))
+                    continue
+                saved = await _save_artifact_section(
+                    group_session_id, section_key, content, user_id
+                )
+                # Writes join the SAME seq space as reads, which is what makes
+                # "did they read the teammate's section before or after writing?"
+                # answerable. Keyed on the section's new version, so a retried
+                # write cannot double-log.
+                await artifact_events.log_section_write(
+                    group_session_id=group_session_id,
+                    user_id=user_id,
+                    section_key=section_key,
+                    idempotency_key=f"write:{section_key}:{saved['version']}",
+                    version=saved["version"],
+                    content_len=len(content),
+                )
+                await room.broadcast({
+                    "type": "section_updated",
+                    "section_key": section_key,
+                    "content": content,
+                    "updated_by": user_id,
+                    "updated_by_name": my_name,
+                    "updated_at": saved["updated_at"],
+                    "version": saved["version"],
+                })
+                continue
+
             if mtype != "message":
                 continue
 
             # Strict group-only: a coach turn needs at least team_min distinct
             # members connected live. A lone student cannot drive the AI — there is
             # no solo fallback. (Counts distinct users, so multiple tabs don't count.)
-            present = len(room.members_snapshot())
+            present = len(await room.members_snapshot())
             if present < team_min:
                 await websocket.send_text(json.dumps({
                     "type": "waiting", "needed": team_min, "present": present,
                 }))
                 continue
 
-            # Free-form turns, serialized: if a turn is already in flight, tell this
-            # sender to hold (no await between the check and acquire, so no race).
-            if room.turn_lock.locked():
+            # Free-form turns, serialized across every worker: one atomic
+            # non-blocking acquire. (This replaces an in-process check-then-acquire
+            # — with a networked lock there is no longer a gap-free way to test
+            # first, and a single atomic attempt is what we actually want.)
+            try:
+                turn_token = await room.try_acquire_turn()
+            except Exception as e:
+                log.critical(f"[WS-GROUP] turn lock unavailable: {type(e).__name__}: {e}")
+                await websocket.send_text(json.dumps({
+                    "type": "error", "message": "Collaboration backend unavailable. Please reconnect.",
+                }))
+                break
+            if turn_token is None:
                 await websocket.send_text(json.dumps({"type": "busy"}))
                 continue
 
-            user_content = data.get("content", "").strip()
-            attachments, rejected = _sanitize_attachments(data.get("attachments"))
-            if attachments and conversation_id:
-                attachments, chat_rejected = await _enforce_chat_attachment_caps(conversation_id, attachments)
-                rejected.extend(chat_rejected)
-            if rejected:
-                await websocket.send_text(json.dumps({"type": "attachment_warning", "files": rejected}))
-            if not user_content and not attachments:
-                continue
-            if not user_content:
-                user_content = "Please take a look at the attached file(s)."
-
-            await room.turn_lock.acquire()
             try:
-                turn = len(room.history) // 2 + 1
+                user_content = data.get("content", "").strip()
+                attachments, rejected = _sanitize_attachments(data.get("attachments"))
+                if attachments and conversation_id:
+                    attachments, chat_rejected = await _enforce_chat_attachment_caps(conversation_id, attachments)
+                    rejected.extend(chat_rejected)
+                if rejected:
+                    await websocket.send_text(json.dumps({"type": "attachment_warning", "files": rejected}))
+                if not user_content and not attachments:
+                    continue
+                if not user_content:
+                    user_content = "Please take a look at the attached file(s)."
+
+                # Re-read the shared history from the DB now that we hold the lock,
+                # so this turn sees every turn any worker has already committed.
+                history = await _load_group_history(conversation_id)
+                turn = len(history) // 2 + 1
                 if attachments:
                     await asyncio.to_thread(_preprocess_attachments, attachments)
 
@@ -1571,11 +2458,11 @@ async def group_websocket_endpoint(
                     exclude=websocket,
                 )
 
-                gemini_history = await _build_gemini_history(room.history)
+                gemini_history = await _build_gemini_history(history)
                 turn_parts = await _build_attachment_parts(attachments)
                 turn_parts.append(types.Part(text=user_content))
                 contents = gemini_history + [types.Content(role="user", parts=turn_parts)]
-                room.history.append(
+                history.append(
                     {
                         "role": "user",
                         "content": user_content,
@@ -1601,17 +2488,17 @@ async def group_websocket_endpoint(
                 except Exception as e:
                     log.error(f"[WS-GROUP] stream error: {type(e).__name__}: {e}", exc_info=True)
                     await room.broadcast({"type": "error", "message": f"Chat error: {type(e).__name__}"})
-                    room.history.pop()  # roll back the user turn we optimistically added
+                    history.pop()  # roll back the user turn we optimistically added
                     continue
 
-                room.history.append({"role": "assistant", "content": full_response})
+                history.append({"role": "assistant", "content": full_response})
                 await room.broadcast({"type": "done", "full_response": full_response})
 
                 # -- Shared evaluation: one PEI for the whole team, broadcast to all --
                 await room.broadcast({"type": "eval_start"})
                 eval_result = None
                 try:
-                    eval_result = await evaluate_conversation(room.history)
+                    eval_result = await evaluate_conversation(history)
                 except Exception as e:
                     log.error(f"[WS-GROUP] eval error: {type(e).__name__}: {e}", exc_info=True)
                 # Persist messages regardless; include the eval when it succeeded.
@@ -1623,18 +2510,309 @@ async def group_websocket_endpoint(
                 else:
                     await room.broadcast({"type": "eval_error", "message": "evaluation failed"})
             finally:
-                room.turn_lock.release()
+                await room.release_turn(turn_token)
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
         log.error(f"[WS-GROUP] unexpected error: {type(e).__name__}: {e}", exc_info=True)
     finally:
-        room.remove(websocket)
-        await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
-        await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+        # Best-effort teardown: a backend blip must not stop us releasing the
+        # socket, but it is logged rather than swallowed.
+        try:
+            # Free any section this connection was editing BEFORE dropping the
+            # socket, so a teammate can take it over immediately rather than
+            # waiting out the lock's TTL. The TTL only has to cover this worker
+            # dying outright, where no cleanup code runs at all.
+            socket_id = room.socket_id_for(websocket)
+            if socket_id:
+                for freed_key in await room.release_sections_for_socket(socket_id):
+                    await room.broadcast({"type": "section_unlocked", "section_key": freed_key})
+            await room.remove(websocket)
+            await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
+            await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+        except Exception as e:
+            log.error(f"[WS-GROUP] disconnect cleanup failed: {type(e).__name__}: {e}")
         await rooms.drop_if_empty(group_session_id)
-        log.info(f"[WS-GROUP] {user_id[:8]} left group={group_id[:8]} ({len(room.connections)} live)")
+        log.info(f"[WS-GROUP] {user_id[:8]} left group={group_id[:8]} ({room.local_count()} live on this worker)")
+
+
+async def _ensure_private_coach_conversation(
+    group_session_id: str, user_id: str, role_label: str | None
+) -> str:
+    """Get-or-create THIS student's private coach conversation for this session.
+
+    Keyed (group_session_id, user_id, kind='group_private'), enforced by a unique
+    index. Two of the student's own tabs racing both try to insert; the loser
+    catches IntegrityError and re-reads the winner's row -- the same pattern the
+    seeding and group-session paths use, since no in-process lock helps across
+    workers.
+    """
+    async with AsyncSessionLocal() as db:
+        existing = (await db.execute(
+            select(Conversation).where(
+                Conversation.group_session_id == group_session_id,
+                Conversation.user_id == user_id,
+                Conversation.kind == CONVERSATION_GROUP_PRIVATE,
+            )
+        )).scalar_one_or_none()
+        if existing is not None:
+            if role_label and existing.role_label != role_label:
+                existing.role_label = role_label
+                await db.commit()
+            return existing.id
+
+        conv = Conversation(
+            user_id=user_id,
+            group_session_id=group_session_id,
+            kind=CONVERSATION_GROUP_PRIVATE,
+            role_label=role_label,
+        )
+        db.add(conv)
+        try:
+            await db.commit()
+            return conv.id
+        except IntegrityError:
+            await db.rollback()
+
+    async with AsyncSessionLocal() as db:
+        return (await db.execute(
+            select(Conversation.id).where(
+                Conversation.group_session_id == group_session_id,
+                Conversation.user_id == user_id,
+                Conversation.kind == CONVERSATION_GROUP_PRIVATE,
+            )
+        )).scalar_one()
+
+
+async def _load_private_history(conversation_id: str) -> list[dict]:
+    """Rehydrate one private conversation, attachment bytes included."""
+    history: list[dict] = []
+    async with AsyncSessionLocal() as db:
+        msgs = (await db.execute(
+            select(Message).where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at, Message.id)
+        )).scalars().all()
+        atts = (await db.execute(
+            select(Attachment).where(Attachment.conversation_id == conversation_id)
+        )).scalars().all()
+        by_msg: dict[str, list] = {}
+        for a in atts:
+            by_msg.setdefault(a.message_id, []).append(a)
+        for m in msgs:
+            item: dict = {"role": m.role, "content": m.content}
+            mas = by_msg.get(m.id)
+            if mas:
+                item["attachments"] = [
+                    {
+                        "filename": a.filename,
+                        "mime_type": a.mime_type,
+                        "data": base64.b64encode(a.data).decode(),
+                        **(
+                            {"_openai_file_id": a.openai_file_id, "_index_status": a.index_status}
+                            if a.index_status == "ready" and a.openai_file_id
+                            else {}
+                        ),
+                    }
+                    for a in mas
+                ]
+            history.append(item)
+    return history
+
+
+@app.websocket("/ws/coach")
+async def private_coach_endpoint(
+    websocket: WebSocket,
+    token: str = Query(None),
+    group_id: str = Query(None),
+    session_num: int = Query(1),
+    role: str = Query(None),
+):
+    """A student's OWN coach thread inside a group session.
+
+    One socket per student per group session, driving a conversation nobody else
+    can see. Additive: the shared /ws/group thread is untouched and runs
+    alongside this.
+
+    Privacy is structural, not conventional:
+      - the conversation is resolved from the authenticated user's own id, so a
+        student cannot address someone else's thread even by guessing an id
+      - there is no room, no presence registration and no broadcast anywhere in
+        this handler; every send targets this one socket
+    """
+    await websocket.accept()
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+    user_id = await resolve_token_user_id(token)
+    if not user_id:
+        await websocket.close(code=4001, reason="Invalid or expired token")
+        return
+    if not group_id:
+        await websocket.close(code=4002, reason="group_id required")
+        return
+    if not await _is_group_member(group_id, user_id):
+        await websocket.close(code=4003, reason="Not a member of this group")
+        return
+
+    ensured = await _ensure_group_session(group_id, session_num)
+    if not ensured:
+        await websocket.close(code=4004, reason="Group not found")
+        return
+    group_session_id, _shared_conversation_id, challenge_id = ensured
+
+    role_label = (role or "").strip()[:64] or None
+    conversation_id = await _ensure_private_coach_conversation(
+        group_session_id, user_id, role_label
+    )
+
+    system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
+    if role_label:
+        system_prompt = (
+            f"{system_prompt}\n\nThe student you are coaching is working in the "
+            f"role of: {role_label}. Tailor your guidance to that role."
+        )
+    chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
+
+    history = await _load_private_history(conversation_id)
+
+    await websocket.send_text(json.dumps({
+        "type": "session_init",
+        "conversation_id": conversation_id,
+        "group_id": group_id,
+        "session_num": session_num,
+        "role_label": role_label,
+        "private": True,
+        "turn_count": len(history) // 2,
+    }))
+    if session_data:
+        await websocket.send_text(json.dumps({
+            "type": "challenge_context",
+            "data": {
+                "title": session_data.get("title"),
+                "goal": session_data.get("goal"),
+                "brief": session_data.get("brief"),
+                "seed_question": session_data.get("seed_question"),
+            },
+        }))
+    if history:
+        await websocket.send_text(json.dumps({
+            "type": "history",
+            "messages": [
+                {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "attachments": [
+                        {"name": a.get("filename") or a.get("name")}
+                        for a in m.get("attachments", [])
+                    ],
+                }
+                for m in history
+            ],
+            "turn_count": len(history) // 2,
+        }))
+
+    log.info(
+        f"[WS-COACH] {user_id[:8]} opened private coach for group={group_id[:8]} "
+        f"session={session_num} role={role_label or '-'} (conv {conversation_id[:8]})"
+    )
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            if data.get("type") != "message":
+                continue
+
+            user_content = (data.get("content") or "").strip()
+            attachments, rejected = _sanitize_attachments(data.get("attachments"))
+            if attachments:
+                attachments, chat_rejected = await _enforce_chat_attachment_caps(
+                    conversation_id, attachments
+                )
+                rejected.extend(chat_rejected)
+            if rejected:
+                await websocket.send_text(json.dumps(
+                    {"type": "attachment_warning", "files": rejected}
+                ))
+            # Index attachments for citation retrieval (fire-and-forget, never
+            # awaited, so it cannot add latency to the turn).
+            if attachments:
+                for att in attachments:
+                    fname = (_att_field(att, "filename", "name") or "file").strip()
+                    idx_mime = _indexable_mime(att, fname)
+                    if not idx_mime:
+                        continue
+                    try:
+                        idx_raw = base64.b64decode(att.get("data", ""), validate=False)
+                    except Exception:
+                        continue
+                    if idx_raw:
+                        asyncio.create_task(
+                            _index_attachment(conversation_id, att, fname, idx_mime, idx_raw)
+                        )
+            if not user_content and not attachments:
+                continue
+            if not user_content:
+                user_content = "Please take a look at the attached file(s)."
+
+            # The team's artifact as it stands RIGHT NOW, rebuilt every turn.
+            #
+            # Injected through the system prompt, not as a turn in `history`.
+            # `history` is persisted by _save_turn as real Message rows, fed to
+            # evaluate_conversation to produce the PEI, and its length drives
+            # turn numbering -- so a synthetic artifact turn would plant a fake
+            # message in the permanent record, contaminate the score this study
+            # measures, and desynchronise the umsgs[i]<->evals[i] pairing that
+            # the post-session analysis depends on.
+            #
+            # Rebuilt per turn because chat_config is built once when the socket
+            # opens: injecting there would freeze the snapshot at connect time
+            # and never show a teammate's later edits.
+            turn_no = len(history) // 2 + 1
+            turn_config = chat_config
+            try:
+                artifact_block, artifact_manifest = await _build_coach_artifact_context(
+                    group_session_id=group_session_id, session_data=session_data
+                )
+            except Exception as e:
+                # Degrade to a coach turn with no artifact context rather than
+                # costing the student their turn. Visible in the log by the
+                # absence of coach reads for this turn, not just in stderr.
+                log.error(
+                    "[WS-COACH] artifact context unavailable for turn %s: %s: %s",
+                    turn_no, type(e).__name__, e,
+                )
+                artifact_block, artifact_manifest = "", []
+            if artifact_block:
+                turn_config = types.GenerateContentConfig(
+                    system_instruction=system_prompt + artifact_block
+                )
+                await _log_coach_artifact_reads(
+                    group_session_id=group_session_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    turn=turn_no,
+                    manifest=artifact_manifest,
+                )
+
+            await run_private_turn(
+                websocket,
+                conversation_id=conversation_id,
+                history=history,
+                chat_config=turn_config,
+                user_content=user_content,
+                attachments=attachments,
+            )
+
+    except WebSocketDisconnect:
+        log.info(f"[WS-COACH] {user_id[:8]} closed private coach ({len(history) // 2} turns)")
+    except Exception as e:
+        log.error(f"[WS-COACH] unexpected error: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
 
 
 async def _generate_session_analysis(conversation_id: str, user_id: str):
@@ -1924,10 +3102,15 @@ async def end_group_session(
     if schedule_analysis:
         _spawn_group_analysis(gs.id)
 
-    # Lock the live room for every connected member.
-    room = rooms.peek(gs.id)
-    if room is not None:
+    # Lock the live room for every connected member, on any worker. Published
+    # unconditionally: this worker may hold none of the session's sockets.
+    try:
+        room = await rooms.get(gs.id)
         await room.broadcast({"type": "session_ended"})
+        # Don't leave an empty room behind if this worker holds none of the sockets.
+        await rooms.drop_if_empty(gs.id)
+    except Exception as e:
+        log.error(f"[WS-GROUP] could not broadcast session_ended for {gs.id}: {type(e).__name__}: {e}")
 
     return {
         "session_avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,

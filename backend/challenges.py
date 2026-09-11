@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import resolve_token_user_id
@@ -47,6 +49,19 @@ router = APIRouter(prefix="/challenges", tags=["challenges"])
 SEED_CHALLENGES = [
     {
         "title": "Debug a Failing Web App",
+        # Shared-artifact sections. Declared once for the challenge and written
+        # into every session by _apply_sections, because carry-forward matches
+        # on section key across sessions.
+        "sections": [
+            {"key": "root-causes", "title": "Root causes",
+             "prompt": "Which failures are you claiming, and what makes each one likely?"},
+            {"key": "evidence", "title": "Evidence",
+             "prompt": "Which log lines or symptoms support each root cause?"},
+            {"key": "fix-plan", "title": "Fix plan",
+             "prompt": "For each confirmed cause: the change, and why it is first or last."},
+            {"key": "risks", "title": "Risks and trade-offs",
+             "prompt": "What could this break, and what are you deliberately not fixing?"},
+        ],
         "description": (
             "A production web application is broken. Users report login failures, "
             "slow page loads, and occasional 500 errors. Your job is to diagnose "
@@ -760,6 +775,99 @@ def _default_sessions_data(total: int) -> list[dict]:
     return sessions
 
 
+class SectionBody(BaseModel):
+    """One fixed section of the shared artifact, as authored by an instructor.
+
+    `key` is the stable identifier the whole collaboration layer is keyed on:
+    the per-section edit lock, the artifact websocket payloads, the read/write
+    event log, and session-to-session carry-forward (which matches on key, so a
+    renamed key silently orphans the previous session's text). Constrained here
+    rather than trusted, because it travels into Redis lock names.
+    """
+
+    key: str = Field(..., min_length=1, max_length=64,
+                     pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    title: str = Field(..., min_length=1, max_length=200)
+    prompt: str = Field(default="", max_length=2000)
+
+
+def _normalize_sections(sections: list[SectionBody] | None) -> list[dict]:
+    """Validate and flatten authored sections.
+
+    _challenge_sections (main.py) silently DROPS duplicate keys when reading,
+    which is the right defensive behaviour at read time but the wrong answer for
+    an author: they would save two sections and later find one missing with no
+    explanation. So the authoring path rejects instead.
+    """
+    if not sections:
+        return []
+    if len(sections) > 12:
+        raise HTTPException(
+            status_code=400,
+            detail="A challenge may declare at most 12 artifact sections",
+        )
+    out: list[dict] = []
+    seen: set[str] = set()
+    for sec in sections:
+        key = sec.key.strip()
+        if key in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate section key {key!r}: keys must be unique "
+                       "within a challenge (a section lock is addressed by key)",
+            )
+        seen.add(key)
+        out.append({
+            "key": key,
+            "title": sec.title.strip(),
+            "prompt": sec.prompt.strip(),
+        })
+    return out
+
+
+def _normalize_sections_raw(raw: list[dict] | None) -> list[dict]:
+    """Same validation as _normalize_sections, for plain dicts (seed data).
+
+    Routed through SectionBody so seed data cannot declare something the API
+    would reject -- a malformed seed would otherwise be the one way to get an
+    invalid section key into the system.
+    """
+    if not raw:
+        return []
+    return _normalize_sections([SectionBody(**s) for s in raw])
+
+
+def _apply_sections(sessions_data: list[dict], sections: list[dict]) -> list[dict]:
+    """Write one section list into EVERY session of a challenge.
+
+    Sections are stored per session (main.py's _challenge_sections reads
+    sessions_data[n]["sections"]) but authored once for the challenge, because
+    carry-forward copies the previous session's content by matching section_key.
+    Per-session divergence would mean a section that exists in session 2 but not
+    session 1 silently starts empty, with no signal that anything was lost. So
+    the same list goes into all of them, and the other session keys (title,
+    goal, brief, seed_question, system_prompt_extra) are preserved untouched.
+    """
+    out = []
+    for sd in sessions_data or []:
+        merged = dict(sd)
+        if sections:
+            merged["sections"] = [dict(s) for s in sections]
+        else:
+            merged.pop("sections", None)
+        out.append(merged)
+    return out
+
+
+def _sections_of(ch: Challenge) -> list[dict]:
+    """The authored sections for a challenge, read off its first session."""
+    for sd in ch.sessions_data or []:
+        raw = sd.get("sections")
+        if isinstance(raw, list):
+            return [s for s in raw if isinstance(s, dict)]
+    return []
+
+
 class CreateChallengeBody(BaseModel):
     classroom_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1, max_length=300)
@@ -777,6 +885,9 @@ class CreateChallengeBody(BaseModel):
     mode: str = Field(default="solo", pattern="^(solo|group)$")
     team_min: int = Field(default=2, ge=2, le=4)
     team_max: int = Field(default=4, ge=2, le=4)
+    # Fixed artifact sections (one per subproblem). Optional: a challenge with
+    # none simply has no shared artifact -- the feature is opt-in.
+    sections: Optional[list[SectionBody]] = None
 
 
 class UpdateChallengeBody(BaseModel):
@@ -790,6 +901,9 @@ class UpdateChallengeBody(BaseModel):
     time_limit_minutes: Optional[int] = Field(None, ge=1, le=120)
     min_turns: Optional[int] = Field(None, ge=1, le=50)
     is_active: Optional[bool] = None
+    # Sections are replace-all, like the timer fields: an explicit [] removes
+    # the artifact from the challenge. Absent = leave whatever is there.
+    sections: Optional[list[SectionBody]] = None
 
 
 async def _student_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
@@ -948,31 +1062,92 @@ async def _can_play_challenge(
 # Seed helper — called from main.py lifespan
 # ---------------------------------------------------------------------------
 
+# Fixed namespace so a seeded challenge's id is a pure function of its title.
+# challenges.title is deliberately NOT unique (instructors create challenges with
+# any title they like), so without this two workers booting at once would each
+# see "missing" and each insert, silently duplicating every seeded challenge.
+# A derived primary key turns that race into a harmless duplicate-key error.
+_SEED_CHALLENGE_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+
+def _seed_challenge_id(title: str) -> str:
+    return str(uuid.uuid5(_SEED_CHALLENGE_NS, title))
+
+
 async def seed_challenges():
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Challenge))
-        existing = result.scalars().all()
-        existing_titles = {c.title for c in existing}
+        existing_titles = {c.title for c in result.scalars().all()}
 
-        added = 0
-        for data in SEED_CHALLENGES:
-            if data["title"] not in existing_titles:
+    missing = [d for d in SEED_CHALLENGES if d["title"] not in existing_titles]
+    if not missing:
+        log.info("All challenges already seeded")
+        return
+
+    # One row per transaction: a challenge that another worker inserted first
+    # must not roll back the ones this worker legitimately added.
+    added = 0
+    for data in missing:
+        try:
+            async with AsyncSessionLocal() as db:
                 db.add(Challenge(
+                    id=_seed_challenge_id(data["title"]),
                     title=data["title"],
                     description=data["description"],
                     category=data["category"],
                     difficulty=data["difficulty"],
                     week=data.get("week"),
                     total_sessions=data["total_sessions"],
-                    sessions_data=data["sessions_data"],
+                    sessions_data=_apply_sections(
+                        data["sessions_data"],
+                        _normalize_sections_raw(data.get("sections")),
+                    ),
                 ))
+                await db.commit()
                 added += 1
+        except IntegrityError:
+            # Another worker seeded this one microseconds earlier. Fine.
+            log.debug("Challenge %r already seeded by another worker", data["title"])
 
-        if added:
+    log.info(f"Seeded {added} new challenge(s)")
+
+
+async def backfill_seed_sections():
+    """Give already-seeded challenges their artifact sections.
+
+    seed_challenges() is insert-only: it skips any challenge whose title already
+    exists, entirely. So adding a `sections` list to SEED_CHALLENGES reaches new
+    databases and NOTHING already deployed -- the pilot database included. This
+    backfills those rows.
+
+    Two guards make it safe to run on every boot:
+      - only rows whose id is the uuid5 of a seed title are touched, so an
+        instructor-authored challenge is never in scope
+      - only rows with no sections in any session are written, so an instructor
+        who has since edited the sections of a seeded challenge is not reverted
+    """
+    wanted = {
+        _seed_challenge_id(d["title"]): _normalize_sections_raw(d.get("sections"))
+        for d in SEED_CHALLENGES
+        if d.get("sections")
+    }
+    if not wanted:
+        return 0
+    patched = 0
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(Challenge).where(Challenge.id.in_(list(wanted)))
+        )).scalars().all()
+        for ch in rows:
+            if _sections_of(ch):
+                continue  # already has sections (seeded new, or author-edited)
+            ch.sessions_data = _apply_sections(ch.sessions_data, wanted[ch.id])
+            patched += 1
+        if patched:
             await db.commit()
-            log.info(f"Seeded {added} new challenge(s)")
-        else:
-            log.info("All challenges already seeded")
+    if patched:
+        log.info("Backfilled artifact sections into %d seeded challenge(s)", patched)
+    return patched
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1251,9 @@ async def create_challenge(
     )
     next_sort = int(max_so if max_so is not None else -1) + 1
     sessions_data = _default_sessions_data(body.total_sessions)
+    sections = _normalize_sections(body.sections)
+    if sections:
+        sessions_data = _apply_sections(sessions_data, sections)
     ch = Challenge(
         title=body.title.strip(),
         description=body.description.strip(),
@@ -1111,6 +1289,7 @@ async def create_challenge(
         "classroom_id": body.classroom_id,
         "total_sessions": ch.total_sessions,
         "mode": body.mode,
+        "sections": sections,
     }
 
 
@@ -1150,6 +1329,13 @@ async def update_challenge(
         ch.min_turns = body.min_turns
     if body.is_active is not None:
         ch.is_active = body.is_active
+    if "sections" in body.model_fields_set:
+        # Reassign rather than mutate in place: sessions_data is a JSON column,
+        # and SQLAlchemy does not track in-place mutation of a plain dict/list,
+        # so an in-place edit would not be persisted.
+        ch.sessions_data = _apply_sections(
+            ch.sessions_data, _normalize_sections(body.sections)
+        )
     await db.commit()
     await db.refresh(ch)
     return {
@@ -1159,6 +1345,7 @@ async def update_challenge(
         "week": ch.week,
         "time_limit_minutes": ch.time_limit_minutes,
         "min_turns": ch.min_turns,
+        "sections": _sections_of(ch),
     }
 
 
@@ -1224,6 +1411,7 @@ async def get_challenge(
         "time_limit_minutes": ch.time_limit_minutes,
         "min_turns": ch.min_turns,
         "sessions": sessions_out,
+        "sections": _sections_of(ch),
         "group_mode": group_mode,
         "group": group,
     }

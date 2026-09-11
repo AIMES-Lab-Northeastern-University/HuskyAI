@@ -10,6 +10,9 @@ uvicorn[standard]>=0.32.0
 python-dotenv>=1.0.0
 pydantic[email]>=2.0.0
 websockets>=13.0
+# Shared group-room state (presence, pub/sub fan-out, distributed turn lock).
+# Optional: without REDIS_URL the room manager falls back to single-worker memory.
+redis>=5.0
 sqlalchemy>=2.0.0
 asyncpg>=0.29.0
 alembic>=1.14.0

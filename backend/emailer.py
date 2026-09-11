@@ -4,8 +4,10 @@ Resend is the provider (permanent free tier covers pilot-scale password resets).
 Configure with:
 
   RESEND_API_KEY   from resend.com -> API Keys
-  EMAIL_FROM       e.g. "HuskyAI <no-reply@aimeslab.org>" (domain must be verified
-                   in Resend, or university spam filters will eat the mail)
+  EMAIL_FROM       e.g. "HuskyAI <no-reply@send.aimeslab.org>" (domain must be
+                   verified in Resend, or university spam filters will eat the
+                   mail). It is the `send.` subdomain that is verified -- the
+                   root aimeslab.org is not a valid sender and Resend 403s it.
 
 With no API key set, the reset link is logged instead of sent, so the whole flow
 is testable locally without a provider. Never enable that fallback in production:

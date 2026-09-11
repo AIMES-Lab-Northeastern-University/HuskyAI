@@ -19,3 +19,11 @@ frontend/dist/
 Thumbs.db
 
 /.*
+# Python caches (the old rule only covered backend/__pycache__/)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Mutation-harness scratch output
+backend/.mut_backend.json
+frontend/.mut.json

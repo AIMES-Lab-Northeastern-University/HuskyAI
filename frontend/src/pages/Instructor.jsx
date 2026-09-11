@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
+import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 
 const STUDENTS = [
@@ -90,6 +91,7 @@ export default function Instructor() {
   const [createMinTurns, setCreateMinTurns] = useState(5)
   const [createGroup, setCreateGroup] = useState(false)
   const [createTeamMin, setCreateTeamMin] = useState(2)
+  const [createSections, setCreateSections] = useState([])
   const [createTeamMax, setCreateTeamMax] = useState(4)
   const [manageTeamsId, setManageTeamsId] = useState(null)
   const [createMsg, setCreateMsg] = useState('')
@@ -101,6 +103,7 @@ export default function Instructor() {
   const [editTimed, setEditTimed] = useState(false)
   const [editTimeLimit, setEditTimeLimit] = useState(15)
   const [editMinTurns, setEditMinTurns] = useState(5)
+  const [editSections, setEditSections] = useState([])
   const [actionMsg, setActionMsg] = useState('')
   const [testToggleSaving, setTestToggleSaving] = useState(false)
   const [renamingSection, setRenamingSection] = useState(false)
@@ -379,6 +382,11 @@ export default function Instructor() {
       setActionMsg('Title and description are required')
       return
     }
+    const secProblem = sectionsProblem(editSections)
+    if (secProblem) {
+      setActionMsg(secProblem)
+      return
+    }
     setActionMsg('')
     try {
       const r = await fetch(`${API_URL}/challenges/${challengeId}`, {
@@ -389,6 +397,13 @@ export default function Instructor() {
           description,
           time_limit_minutes: editTimed ? editTimeLimit : null,
           min_turns: editTimed ? editMinTurns : null,
+          // Always sent, so removing every section clears the artifact. The
+          // API distinguishes an explicit [] from an absent field.
+          sections: editSections.map(s => ({
+            key: (s.key || '').trim(),
+            title: (s.title || '').trim(),
+            prompt: (s.prompt || '').trim(),
+          })),
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -454,6 +469,11 @@ export default function Instructor() {
       setCreateMsg('Title and description are required')
       return
     }
+    const secProblem = sectionsProblem(createSections)
+    if (secProblem) {
+      setCreateMsg(secProblem)
+      return
+    }
     let weekNum = null
     if (createWeek.trim() !== '') {
       const n = parseInt(createWeek, 10)
@@ -482,6 +502,11 @@ export default function Instructor() {
           min_turns: createTimed ? createMinTurns : null,
           is_active: publish,
           mode: createGroup ? 'group' : 'solo',
+          sections: createSections.map(s => ({
+            key: (s.key || '').trim(),
+            title: (s.title || '').trim(),
+            prompt: (s.prompt || '').trim(),
+          })),
           team_min: createTeamMin,
           team_max: createTeamMax,
         }),
@@ -497,6 +522,7 @@ export default function Instructor() {
       setCreateTitle('')
       setCreateDesc('')
       setCreateWeek('')
+      setCreateSections([])
       await loadChallenges()
     } catch {
       setCreateMsg('Network error')
@@ -1415,6 +1441,10 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
+                                        <SectionsEditor
+                                          sections={editSections}
+                                          onChange={setEditSections}
+                                        />
                                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                                           <button
                                             type="button"
@@ -1467,6 +1497,7 @@ export default function Instructor() {
                                             setEditTimed(c.time_limit_minutes != null || c.min_turns != null)
                                             setEditTimeLimit(c.time_limit_minutes ?? 15)
                                             setEditMinTurns(c.min_turns ?? 5)
+                                            setEditSections((c.sections || []).map(s => ({ ...s })))
                                           }}
                                           style={btnSm}
                                         >
@@ -1634,6 +1665,11 @@ export default function Instructor() {
                             </span>
                           </div>
                         )}
+                        <SectionsEditor
+                          sections={createSections}
+                          onChange={setCreateSections}
+                          disabled={creating || creatingDraft}
+                        />
                         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                           <button
                             type="button"
