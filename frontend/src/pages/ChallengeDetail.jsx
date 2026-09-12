@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import SessionAnalysisCard from '../components/SessionAnalysisCard'
+import InfoIcon from '../components/InfoIcon'
+import { PEI_INFO } from '../lib/metricInfo'
 import { getDemoChallengeDetail, demoSlugForChallengeId } from '../demo/demoData'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -186,7 +188,7 @@ export default function ChallengeDetail() {
     return (
       <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
         <Sidebar onLogout={handleLogout} />
-        <div style={{ marginLeft: '220px', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <span style={{ color: '#9A948E', fontSize: '14px' }}>Loading...</span>
         </div>
       </div>
@@ -197,7 +199,7 @@ export default function ChallengeDetail() {
     return (
       <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
         <Sidebar onLogout={handleLogout} />
-        <div style={{ marginLeft: '220px', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
+        <div style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
           <span style={{ color: '#C8102E', fontSize: '14px' }}>{error || 'Not found'}</span>
           <button onClick={() => navigate(`${pathPrefix}/challenges`)} style={{ fontSize: '13px', color: '#C8102E', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>
             Back to challenges
@@ -215,7 +217,7 @@ export default function ChallengeDetail() {
   return (
     <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
       <Sidebar onLogout={handleLogout} />
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: '220px' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
@@ -479,8 +481,9 @@ export default function ChallengeDetail() {
                         {/* Meta + actions */}
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
                           {session.best_pei != null && (
-                            <span style={{ fontSize: '12px', color: '#9A948E' }}>
+                            <span style={{ fontSize: '12px', color: '#9A948E', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                               Best PEI: <strong style={{ color: '#C8102E' }}>{Math.round(session.best_pei)}</strong>
+                              <InfoIcon text={PEI_INFO.description} />
                             </span>
                           )}
 

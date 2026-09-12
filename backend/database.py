@@ -69,6 +69,33 @@ class User(Base):
     # which is what triggers the blocking acceptance gate on login.
     research_ack_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Audit only: when the password last changed. Not used for enforcement.
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Incremented on every password change; tokens embed the value current at issue
+    # and are rejected when it no longer matches, so a reset immediately kills any
+    # existing session. A counter rather than a timestamp on purpose: JWT `iat` has
+    # whole-second resolution, so a clock comparison cannot distinguish a token
+    # issued in the same second as the reset from one issued just before it.
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class PasswordResetToken(Base):
+    """One row per issued password-reset link.
+
+    Only the SHA-256 of the token is stored: the raw value goes out in the email
+    once and is never needed again, so a leaked table is useless for takeover.
+    SHA-256 rather than bcrypt is deliberate — the token is 256 bits of entropy
+    from `secrets`, so there is nothing to brute-force and no need for a slow KDF.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Classroom(Base):
@@ -104,6 +131,10 @@ class Conversation(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    # OpenAI vector store backing this conversation's document-citation search
+    # (see backend/main.py's `_ensure_conversation_vector_store`). NULL until the
+    # first indexable attachment is uploaded.
+    openai_vector_store_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Message(Base):
@@ -137,6 +168,12 @@ class Attachment(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Document-citation indexing state (see backend/main.py's `_index_attachment`).
+    # NULL/"pending" until the background index task finishes; "ready" once the
+    # file is searchable in the conversation's vector store; "failed"/"skipped"
+    # otherwise (e.g. unsupported mime type, upload error).
+    openai_file_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    index_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class EvalResult(Base):
@@ -382,6 +419,22 @@ async def init_db():
                     "consent_research BOOLEAN NOT NULL DEFAULT false"
                 )
             )
+            # NULL for accounts that predate password-reset support: those tokens
+            # stay valid until they expire naturally, which is the safe default.
+            await conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                    "password_changed_at TIMESTAMP WITHOUT TIME ZONE"
+                )
+            )
+            # Existing sessions carry no tv claim, which reads as 0 and matches this
+            # default — so nobody is logged out by deploying the reset feature.
+            await conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                    "token_version INTEGER NOT NULL DEFAULT 0"
+                )
+            )
             # research_ack_at + one-time consent backfill. The backfill (make ALL
             # pre-existing data research-usable) must run exactly once, so we gate
             # it on whether the column already existed before this deploy.
@@ -448,6 +501,18 @@ async def init_db():
             await conn.execute(
                 text("ALTER TABLE group_challenges ALTER COLUMN join_code DROP NOT NULL")
             )
+            # Document-citation retrieval (2026-08-15): per-conversation OpenAI
+            # vector store + per-attachment indexing state. All nullable = no
+            # behavior change until an attachment is uploaded.
+            await conn.execute(
+                text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS openai_vector_store_id VARCHAR")
+            )
+            await conn.execute(
+                text("ALTER TABLE attachments ADD COLUMN IF NOT EXISTS openai_file_id VARCHAR")
+            )
+            await conn.execute(
+                text("ALTER TABLE attachments ADD COLUMN IF NOT EXISTS index_status VARCHAR(16)")
+            )
     if "sqlite" in _db_url.lower():
         async with engine.begin() as conn:
             # Detect whether research_ack_at already exists, to gate the one-time backfill.
@@ -479,6 +544,10 @@ async def init_db():
                 ("ALTER TABLE classroom_challenges ADD COLUMN team_max INTEGER DEFAULT 4", ("duplicate column", "already exists")),
                 ("ALTER TABLE group_challenges ADD COLUMN classroom_id VARCHAR", ("duplicate column", "already exists")),
                 ("ALTER TABLE group_challenges ADD COLUMN name VARCHAR(200)", ("duplicate column", "already exists")),
+                # Document-citation retrieval (2026-08-15).
+                ("ALTER TABLE conversations ADD COLUMN openai_vector_store_id VARCHAR", ("duplicate column", "already exists")),
+                ("ALTER TABLE attachments ADD COLUMN openai_file_id VARCHAR", ("duplicate column", "already exists")),
+                ("ALTER TABLE attachments ADD COLUMN index_status VARCHAR(16)", ("duplicate column", "already exists")),
             ):
                 try:
                     await conn.execute(text(stmt))

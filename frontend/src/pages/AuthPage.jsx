@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate, useSearchParams, useLocation } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom'
 import { API_URL, formatApiErrorDetail } from '../lib/api'
 
 const ROLES = [
@@ -267,7 +267,7 @@ export default function AuthPage() {
                 className="w-full px-[14px] py-[10px] border-[1.5px] border-[#E7E0D8] rounded-[9px] text-[14px] text-[#16120E] bg-[#FDFCFB] outline-none placeholder-[#9A948E] focus:border-[#C8102E] transition-colors" />
               {tab === 'login' && (
                 <div className="text-right mt-[5px]">
-                  <a href="#" className="text-[11px] text-[#C8102E] font-semibold no-underline">Forgot password?</a>
+                  <Link to="/forgot-password" className="text-[11px] text-[#C8102E] font-semibold no-underline">Forgot password?</Link>
                 </div>
               )}
             </div>

@@ -3,7 +3,9 @@ import { useNavigate, useParams, useSearchParams, Navigate } from 'react-router-
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
+import InfoIcon from '../components/InfoIcon'
 import { API_URL, authHeaders } from '../lib/api'
+import { DIM_META, PEI_INFO } from '../lib/metricInfo'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -25,14 +27,6 @@ function scoreLabel(pei) {
   if (pei <= 65) return 'Developing'
   if (pei <= 80) return 'Practitioner'
   return 'Expert'
-}
-
-const DIM_META = {
-  PSQ: { label: 'Prompt Quality',       color: '#C8102E' },
-  CCM: { label: 'Conversation Control', color: '#F97316' },
-  TSI: { label: 'Tech Sophistication',  color: '#0D9488' },
-  CLM: { label: 'Cognitive Load',       color: '#7C3AED' },
-  RAS: { label: 'Reliance Calibration', color: '#D97706' },
 }
 
 function PeiRing({ pei = 0 }) {
@@ -63,6 +57,7 @@ function DimBar({ code, value = 0 }) {
         <div className="flex items-center gap-[6px] flex-1 min-w-0">
           <span className="text-[11px] font-bold font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: meta.color, background: `${meta.color}15`, border: `1px solid ${meta.color}30` }}>{code}</span>
           <span className="text-[12px] text-[#4A4440] font-medium truncate">{meta.label}</span>
+          <InfoIcon text={meta.description} />
         </div>
         <div className="text-[12px] font-bold text-[#4A4440] w-8 text-right flex-shrink-0">{Math.round(value)}</div>
       </div>
@@ -137,6 +132,7 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, collapsed, onToggle })
           <PeiRing pei={pei} />
           <div className="flex items-center justify-center gap-2 mb-1.5">
             <span className="text-[11px] font-bold px-[10px] py-[3px] rounded-[20px]" style={{ background: scoreBg(pei), color: scoreColor(pei) }}>{scoreLabel(pei)}</span>
+            <InfoIcon text={PEI_INFO.description} />
           </div>
           {classification !== '-' && <div className="text-[12px] text-[#9A948E]">{classification} · {leadStatus}</div>}
         </div>
@@ -503,7 +499,7 @@ export default function GroupChat() {
   return (
     <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
       <Sidebar onLogout={handleLogout} />
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: '220px' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         {/* Topbar with presence */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
