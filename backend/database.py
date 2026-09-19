@@ -210,6 +210,10 @@ class EvalResult(Base):
     # Consent is captured per turn (the export unit) so it is immune to mid-session
     # toggles and resumed conversations. The export's consent filter reads this.
     consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Marks the consequential post-feed revision: the scored artifact of record
+    # for that session. The pre-revision score is retained as its own row, so
+    # the delta between seeing the feed and acting on it stays measurable.
+    is_graded_revision: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -296,6 +300,34 @@ class ClassroomChallenge(Base):
     mode: Mapped[str] = mapped_column(String(16), default="solo", nullable=False)  # solo | group
     team_min: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     team_max: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+
+    # ---- Collaborative-study configuration -------------------------------
+    # Every flag below defaults to today's behaviour, so an assignment that
+    # predates the study is unchanged and no section is silently enrolled.
+
+    # Which arm this section runs:
+    #   control_solo_feed     - the existing single-user chat + PEI feed
+    #   collab_coach_artifact - per-student private coaches + one shared artifact
+    study_arm: Mapped[str] = mapped_column(
+        String(32), default="control_solo_feed", nullable=False
+    )
+    # How prominent the coach is. An experimental condition, not a product
+    # choice — resolved once per session into a CoachPolicy (see main.py).
+    #   ambient    - reacts to artifact changes unprompted, visible in the shared space
+    #   on_request - responds only when addressed (today's behaviour)
+    #   isolated   - reachable, but its output never flows into the artifact
+    #                automatically; importing it takes an explicit, logged copy
+    coach_prominence: Mapped[str] = mapped_column(
+        String(16), default="on_request", nullable=False
+    )
+    # Post-feed revision rules for the control arm, e.g.
+    # {"require_revision_on_turn": 3, "graded": "revision"}. NULL = no revision
+    # step, which is how every existing assignment behaves.
+    revision_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Who reviews whose work (Phase 5): none | round_robin | random | instructor_assigned
+    verification_policy: Mapped[str] = mapped_column(
+        String(32), default="none", nullable=False
+    )
 
 
 class InstructorTestEnrollment(Base):
@@ -582,6 +614,11 @@ class ArtifactRevision(Base):
 # cause: the first symptom of adding Conversation.kind was an empty artifact panel.
 _SQLITE_ADDED_COLUMNS = [
     ("conversations", "kind", "VARCHAR(16) NOT NULL DEFAULT 'solo'"),
+    ("classroom_challenges", "study_arm", "VARCHAR(32) NOT NULL DEFAULT 'control_solo_feed'"),
+    ("classroom_challenges", "coach_prominence", "VARCHAR(16) NOT NULL DEFAULT 'on_request'"),
+    ("classroom_challenges", "revision_policy", "JSON"),
+    ("classroom_challenges", "verification_policy", "VARCHAR(32) NOT NULL DEFAULT 'none'"),
+    ("eval_results", "is_graded_revision", "BOOLEAN NOT NULL DEFAULT 0"),
 ]
 
 
@@ -652,6 +689,20 @@ async def init_db():
                     "kind VARCHAR(16) NOT NULL DEFAULT 'solo'"
                 )
             )
+            # Study configuration. Defaults reproduce today's behaviour exactly,
+            # so no existing section is enrolled into an arm by deploying this.
+            for _ddl in (
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "study_arm VARCHAR(32) NOT NULL DEFAULT 'control_solo_feed'",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "coach_prominence VARCHAR(16) NOT NULL DEFAULT 'on_request'",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS revision_policy JSONB",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "verification_policy VARCHAR(32) NOT NULL DEFAULT 'none'",
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
+                "is_graded_revision BOOLEAN NOT NULL DEFAULT false",
+            ):
+                await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens
             # stay valid until they expire naturally, which is the safe default.
             await conn.execute(

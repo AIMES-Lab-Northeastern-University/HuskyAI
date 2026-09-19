@@ -823,18 +823,20 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
     cids = await _student_classroom_ids(db, user_id)
     if not cids:
         return False, None
-    group_cids = {
-        row[0]
-        for row in (
-            await db.execute(
-                select(ClassroomChallenge.classroom_id).where(
-                    ClassroomChallenge.challenge_id == challenge_id,
-                    ClassroomChallenge.classroom_id.in_(cids),
-                    ClassroomChallenge.mode == "group",
-                )
+    rows = (
+        await db.execute(
+            select(ClassroomChallenge.classroom_id, ClassroomChallenge.study_arm).where(
+                ClassroomChallenge.challenge_id == challenge_id,
+                ClassroomChallenge.classroom_id.in_(cids),
+                ClassroomChallenge.mode == "group",
             )
-        ).all()
-    }
+        )
+    ).all()
+    group_cids = {r[0] for r in rows}
+    # Which arm this section runs. Decides whether the student is sent to the
+    # shared-coach chat or the private-coach + artifact workspace, so the entry
+    # point follows configuration rather than offering both and hoping.
+    study_arm = next((r[1] for r in rows if r[1]), "control_solo_feed")
     if not group_cids:
         return False, None
 
@@ -864,7 +866,7 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
             )
         ).all()
     ]
-    return True, {"group_id": gid, "member_names": names}
+    return True, {"group_id": gid, "member_names": names, "study_arm": study_arm}
 
 
 async def _test_enrollment_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:

@@ -24,6 +24,7 @@ from database import init_db, AsyncSessionLocal, Conversation, Message, Attachme
 from group_room import rooms
 from events import log_event
 import artifacts
+from study_policy import resolve_for_group_session
 
 # Version of the study event schema (docs/event-schema.md). Echoed in research
 # responses so an exported dataset is interpretable against a fixed spec.
@@ -595,7 +596,7 @@ async def _build_gemini_history(conversation_history: list) -> list:
     return history
 
 
-async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None):
+async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None):
     try:
         async with AsyncSessionLocal() as db:
             user_message = Message(conversation_id=conversation_id, role="user", content=user_msg)
@@ -692,7 +693,7 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
     # Study log. After the commit, so the log records what actually persisted,
     # and outside the try, so a logging problem can't be mistaken for a save
     # failure. log_event never raises.
-    await _log_coach_turn(conversation_id, user_message.id, turn_num, scores)
+    await _log_coach_turn(conversation_id, user_message.id, turn_num, scores, condition=condition)
 
 
 async def _log_coach_turn(
@@ -701,6 +702,7 @@ async def _log_coach_turn(
     turn_num: int,
     scores: dict,
     sender_user_id: str | None = None,
+    condition: dict | None = None,
 ):
     """Record one completed coach turn in the study event log.
 
@@ -748,6 +750,7 @@ async def _log_coach_turn(
         classroom_id=classroom_id,
         ref_id=message_id,
         payload={"turn": turn_num, "pei": scores.get("PEI")},
+        condition=condition,
     )
 
 
@@ -1728,18 +1731,6 @@ async def group_websocket_endpoint(
 # behaviour and the study arm must not destabilise it.
 
 
-def _resolve_condition(arm: str = "collab_coach_artifact", prominence: str = "on_request") -> dict:
-    """The experimental condition, stamped onto every event so an exported log
-    is self-describing rather than needing a join against a config table that
-    may have changed since.
-
-    One resolution point on purpose. Phase 6 turns prominence into a real
-    per-assignment setting; when it does, this is the only place that reads it,
-    which is what stops `if prominence ==` checks scattering through the
-    handlers and letting conditions drift apart mid-study."""
-    return {"arm": arm, "prominence": prominence}
-
-
 async def _section_defs_for(challenge_id: str | None, session_num: int | None) -> list[dict] | None:
     """The instructor's decomposition of this session into artifact sections,
     read from the challenge's sessions_data. None means no decomposition, which
@@ -1875,7 +1866,11 @@ async def coach_websocket_endpoint(
     group_session_id, _shared_conversation_id, challenge_id = ensured
 
     conversation_id = await _ensure_coach_conversation(group_session_id, user_id)
-    condition = _resolve_condition()
+    # Resolved ONCE per session. Every handler below asks this object a question
+    # rather than re-deriving the condition, which is what stops two sessions
+    # nominally in the same arm behaving differently (see study_policy.py).
+    policy = await resolve_for_group_session(group_session_id)
+    condition = policy.as_condition()
 
     # The artifact is created here, on connect, with the assignment's real
     # decomposition — never lazily on first write, because sections are fixed at
@@ -2117,7 +2112,7 @@ async def coach_websocket_endpoint(
                 # to this student with actor_kind="coach" — never merged into their
                 # human opens, because whether this counts as the student having
                 # read their teammates' work is an open research question.
-                if condition["prominence"] != "isolated":
+                if policy.injects_artifact:
                     snap = await artifacts.snapshot(group_session_id)
                     block = _artifact_prompt_block(snap)
                     if block:
@@ -2164,7 +2159,8 @@ async def coach_websocket_endpoint(
                 except Exception as e:
                     log.error(f"[WS-COACH] eval error: {type(e).__name__}: {e}", exc_info=True)
                 await _save_turn(
-                    conversation_id, user_content, full_response, eval_result or {}, turn, attachments
+                    conversation_id, user_content, full_response, eval_result or {}, turn,
+                    attachments, condition=condition,
                 )
                 await _mark_group_session_started(group_session_id)
                 if eval_result is not None:

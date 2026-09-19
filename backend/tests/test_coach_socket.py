@@ -702,3 +702,88 @@ def test_ending_still_works_for_the_legacy_shared_coach_arm(app_ready):
 
     assert r.status_code == 200, r.text
     assert "arm" not in r.json(), "legacy arm must keep its original response shape"
+
+
+def test_isolated_prominence_keeps_the_artifact_out_of_the_coach_prompt(app_ready, monkeypatch):
+    """The condition must change real behaviour, not just a label in the log.
+    Under `isolated` the team's work must not reach the coach, and no
+    read_by_coach may be recorded — a read that did not happen."""
+    import main
+    from sqlalchemy import select
+
+    from database import AsyncSessionLocal, ClassroomChallenge, GroupChallenge
+
+    captured = {}
+
+    async def capturing_stream(*_a, **kw):
+        captured["contents"] = kw.get("contents")
+
+        async def gen():
+            yield _FakeChunk("ok")
+
+        return gen()
+
+    monkeypatch.setattr(main.client.aio.models, "generate_content_stream", capturing_stream)
+
+    async def fake_eval(_h):
+        return {"scores": {"PEI": 50.0}}
+
+    monkeypatch.setattr(main, "evaluate_conversation", fake_eval)
+
+    group_id, users = asyncio.run(_make_team(1, section_defs=[{"key": "s1"}]))
+
+    async def set_isolated():
+        """Attach the team to a section configured as isolated."""
+        from database import Classroom, User
+        async with AsyncSessionLocal() as db:
+            team = await db.get(GroupChallenge, group_id)
+            inst = User(email=f"i_{uuid.uuid4().hex[:8]}@e.com", name="I", password_hash="x")
+            db.add(inst); await db.flush()
+            room = Classroom(name="Iso", join_code=uuid.uuid4().hex[:8].upper(),
+                             instructor_user_id=inst.id)
+            db.add(room); await db.flush()
+            team.classroom_id = room.id
+            db.add(ClassroomChallenge(classroom_id=room.id, challenge_id=team.challenge_id,
+                                      mode="group", study_arm="collab_coach_artifact",
+                                      coach_prominence="isolated"))
+            await db.commit()
+
+    asyncio.run(set_isolated())
+
+    client = TestClient(app_ready)
+    with _connect(client, group_id, users[0]) as ws:
+        init = _drain_until(ws, {"session_init"})
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "artifact_write", "section_key": "s1",
+                                 "content": "SECRET_TEAM_TEXT", "expected_version": 0}))
+        _drain_until(ws, {"artifact_write_ok"})
+        ws.send_text(json.dumps({"type": "message", "content": "what next?"}))
+        _drain_until(ws, {"done", "error"})
+        _drain_until(ws, {"eval", "eval_error"})
+
+    assert init["condition"]["prominence"] == "isolated"
+    assert "SECRET_TEAM_TEXT" not in str(captured.get("contents")), \
+        "isolated must keep the team artifact out of the coach prompt"
+
+    gs = asyncio.run(_group_session_id(group_id))
+    assert asyncio.run(_events(gs, "read_by_coach")) == [], \
+        "no coach read may be logged when the artifact was never injected"
+
+
+def test_the_resolved_condition_is_stamped_on_every_event(app_ready, stub_model):
+    """An exported log must say what condition produced it, without a join
+    against a config table that may have changed since."""
+    group_id, users = asyncio.run(_make_team(1))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "message", "content": "hi"}))
+        _drain_until(ws, {"done", "error"})
+        _drain_until(ws, {"eval", "eval_error"})
+
+    gs = asyncio.run(_group_session_id(group_id))
+    turns = asyncio.run(_events(gs, "turn"))
+    assert turns[0].condition == {
+        "arm": "collab_coach_artifact", "prominence": "on_request", "corpus": None,
+    }
