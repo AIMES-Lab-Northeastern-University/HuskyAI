@@ -1315,6 +1315,45 @@ async def start_session(
     }
 
 
+async def _assert_revision_submitted(
+    db: AsyncSession, user_id: str, challenge_id: str, session_record
+) -> None:
+    """Raise 409 if this assignment requires a graded revision and none exists.
+
+    No-op unless a ClassroomChallenge in one of the user's sections sets
+    revision_policy.require_revision_on_turn, so every existing assignment
+    completes exactly as before."""
+    cc = (await db.execute(
+        select(ClassroomChallenge)
+        .join(ClassroomMembership,
+              ClassroomMembership.classroom_id == ClassroomChallenge.classroom_id)
+        .where(
+            ClassroomChallenge.challenge_id == challenge_id,
+            ClassroomMembership.user_id == user_id,
+        )
+        .limit(1)
+    )).scalar_one_or_none()
+    required = (cc.revision_policy or {}).get("require_revision_on_turn") if cc else None
+    if not isinstance(required, int) or required < 1:
+        return
+    if not session_record.conversation_id:
+        raise HTTPException(
+            status_code=409,
+            detail="This session requires a revision after the feedback before it can be completed.",
+        )
+    has_revision = (await db.execute(
+        select(EvalResult.id).where(
+            EvalResult.conversation_id == session_record.conversation_id,
+            EvalResult.is_graded_revision.is_(True),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if has_revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This session requires a revision after the feedback before it can be completed.",
+        )
+
+
 @router.post("/{challenge_id}/sessions/{session_number}/complete")
 async def complete_session(
     challenge_id: str,
@@ -1339,6 +1378,13 @@ async def complete_session(
     session_record = result.scalar_one_or_none()
     if not session_record:
         raise HTTPException(status_code=404, detail="Session not found — start it first")
+
+    # Consequential revision: when the assignment requires one, the session
+    # cannot be completed until it exists. Enforced here rather than only in the
+    # UI, because "the student must submit one revision that counts" is a
+    # property of the study design — a client that skips the step, or a stale
+    # tab, must not be able to close the session without it.
+    await _assert_revision_submitted(db, user_id, challenge_id, session_record)
 
     session_record.status = "completed"
     session_record.completed_at = datetime.utcnow()

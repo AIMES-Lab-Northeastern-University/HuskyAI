@@ -596,7 +596,7 @@ async def _build_gemini_history(conversation_history: list) -> list:
     return history
 
 
-async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None):
+async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None, is_graded_revision: bool = False):
     try:
         async with AsyncSessionLocal() as db:
             user_message = Message(conversation_id=conversation_id, role="user", content=user_msg)
@@ -648,6 +648,7 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                 leading_status=eval_data.get("leading_status"),
                 full_result=eval_data,
                 consent_research=consent_now,
+                is_graded_revision=is_graded_revision,
             ))
             res = await db.execute(
                 update(Conversation)
@@ -841,6 +842,98 @@ async def _build_system_prompt(challenge_id: str | None, session_num: int | None
         return BASE_SYSTEM_PROMPT, None
 
 
+async def _resolve_solo_study_config(user_id: str, challenge_id: str | None,
+                                     session_num: int | None) -> tuple:
+    """(CoachPolicy, feed_enabled, revision_turn) for a solo/control session.
+
+    `feed_enabled` is per SESSION, not per assignment: the design runs early
+    sessions with the PEI feed and a later one without it, to see what carries
+    over. It lives in Challenge.sessions_data so it varies by session number
+    without another table. Default True — every existing session is unchanged.
+
+    `revision_turn` is the turn after which a consequential revision is required,
+    or None. Also default-off.
+    """
+    from study_policy import CoachPolicy
+
+    if not challenge_id:
+        return CoachPolicy(), True, None
+
+    async with AsyncSessionLocal() as db:
+        cc = (await db.execute(
+            select(ClassroomChallenge)
+            .join(ClassroomMembership,
+                  ClassroomMembership.classroom_id == ClassroomChallenge.classroom_id)
+            .where(
+                ClassroomChallenge.challenge_id == challenge_id,
+                ClassroomMembership.user_id == user_id,
+            )
+            .limit(1)
+        )).scalar_one_or_none()
+
+        feed_enabled = True
+        ch = await db.get(Challenge, challenge_id)
+        if ch and ch.sessions_data:
+            idx = (session_num or 1) - 1
+            if 0 <= idx < len(ch.sessions_data):
+                feed_enabled = bool(ch.sessions_data[idx].get("feed_enabled", True))
+
+    if cc is None:
+        return CoachPolicy(), feed_enabled, None
+
+    policy = CoachPolicy(
+        arm=cc.study_arm if cc.study_arm in ("control_solo_feed", "collab_coach_artifact")
+            else "control_solo_feed",
+        prominence=cc.coach_prominence if cc.coach_prominence in ("ambient", "on_request", "isolated")
+            else "on_request",
+        revision_policy=cc.revision_policy,
+        verification_policy=cc.verification_policy or "none",
+    )
+    revision_turn = (cc.revision_policy or {}).get("require_revision_on_turn")
+    if not isinstance(revision_turn, int) or revision_turn < 1:
+        revision_turn = None
+    return policy, feed_enabled, revision_turn
+
+
+async def _log_feed_event(conversation_id: str, action: str, payload: dict,
+                          condition: dict | None = None) -> None:
+    """Record what the student was actually shown.
+
+    Whether the feed appeared is the intervention itself, so it cannot be
+    inferred at analysis time from a config table that may have been edited
+    since. `feed.suppressed` fires on every unfed turn precisely so a
+    feed-disabled session is legible in the log rather than by absence — absence
+    is indistinguishable from a logging bug."""
+    try:
+        async with AsyncSessionLocal() as db:
+            conv = await db.get(Conversation, conversation_id)
+            if conv is None:
+                return
+            ucs_id = (await db.execute(
+                select(UserChallengeSession.id).where(
+                    UserChallengeSession.conversation_id == conversation_id
+                )
+            )).scalar_one_or_none()
+            if ucs_id is None:
+                return
+            classroom_id = conv.classroom_id
+            actor = conv.user_id
+    except Exception as e:
+        log.error(f"could not resolve scope for feed event {action}: {e}")
+        return
+
+    await log_event(
+        action=action,
+        target="feed",
+        actor_kind="system" if action == "feed.suppressed" else "student",
+        user_challenge_session_id=ucs_id,
+        actor_user_id=actor,
+        classroom_id=classroom_id,
+        payload=payload,
+        condition=condition,
+    )
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -859,6 +952,11 @@ async def websocket_endpoint(
 
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
+
+    study_policy_, feed_enabled, revision_turn = await _resolve_solo_study_config(
+        user_id, challenge_id, session_num
+    )
+    study_condition = study_policy_.as_condition()
 
     conversation_id = None
     conversation_history: list[dict] = []
@@ -1209,9 +1307,53 @@ async def websocket_endpoint(
                 log.debug(f"[TURN {turn}] Suggestions: {eval_result.get('suggestions', [])}")
                 log.debug(f"[TURN {turn}] Red flags:   {eval_result.get('red_flags', [])}")
                 # Persist before notifying the client so a fast disconnect cannot cancel the save.
+                is_revision = bool(data.get("is_revision")) and revision_turn is not None
                 if conversation_id:
-                    await _save_turn(conversation_id, user_content, full_response, eval_result, turn, attachments)
-                await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
+                    await _save_turn(
+                        conversation_id, user_content, full_response, eval_result, turn,
+                        attachments, condition=study_condition,
+                        is_graded_revision=is_revision,
+                    )
+                pei_now = (eval_result or {}).get("scores", {}).get("PEI")
+                # Log BEFORE notifying the client, matching the rule the save
+                # above follows: a client that disconnects the moment it gets
+                # its score would otherwise cancel this write, and whether the
+                # feed was shown IS the intervention — losing it silently
+                # unlabels the turn.
+                if conversation_id:
+                    if is_revision:
+                        await _log_feed_event(
+                            conversation_id, "revision.submitted",
+                            {"turn": turn, "pei_after": pei_now}, study_condition,
+                        )
+                    await _log_feed_event(
+                        conversation_id,
+                        "feed.shown" if feed_enabled else "feed.suppressed",
+                        {"turn": turn, "pei": pei_now}, study_condition,
+                    )
+                    if revision_turn is not None and turn == revision_turn and feed_enabled:
+                        await _log_feed_event(
+                            conversation_id, "revision.opened",
+                            {"after_turn": turn, "pei_before": pei_now}, study_condition,
+                        )
+
+                if feed_enabled:
+                    await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
+                else:
+                    # Removing the intervention must not remove the measurement:
+                    # the turn is scored and stored exactly as normal, the score
+                    # simply is not shown. The client is told so it can render a
+                    # deliberate "no feedback this session" state rather than a
+                    # silent failure.
+                    await websocket.send_text(json.dumps({
+                        "type": "eval_suppressed", "turn": turn,
+                    }))
+                if revision_turn is not None and turn == revision_turn and feed_enabled:
+                    # The feed has been shown for the designated turn; the next
+                    # submission is the one that counts.
+                    await websocket.send_text(json.dumps({
+                        "type": "revision_required", "after_turn": turn,
+                    }))
             except Exception as e:
                 log.error(f"[TURN {turn}] Eval error: {type(e).__name__}: {e}", exc_info=True)
                 await websocket.send_text(json.dumps({

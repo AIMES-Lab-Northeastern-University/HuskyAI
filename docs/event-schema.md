@@ -68,6 +68,20 @@ Three properties follow, and they are structural rather than conventional:
 |---|---|---|
 | `turn` | A completed coach turn is persisted. | `turn`, `pei` |
 
+### `target = feed` (control arm)
+
+Whether the PEI feed appeared **is** the intervention, so it is recorded per
+turn rather than inferred at analysis time from a config table that may have
+been edited since. All are written *before* the client is notified, so a client
+that disconnects the instant it receives its score cannot cancel the record.
+
+| Action | Emitted when | Payload |
+|---|---|---|
+| `feed.shown` | The score was sent to the student. | `turn`, `pei` |
+| `feed.suppressed` | The turn was scored and stored but **not** shown (a feed-disabled session). Written explicitly on every such turn: absence of `feed.shown` is indistinguishable from a logging bug. | `turn`, `pei` (the unseen score) |
+| `revision.opened` | The feed was shown for the turn that requires a consequential revision. | `after_turn`, `pei_before` |
+| `revision.submitted` | The student submitted the revision that counts. Its `EvalResult.is_graded_revision` is true; the pre-revision score is kept as its own row so the delta stays measurable. | `turn`, `pei_after` |
+
 ## What is deliberately *not* an event
 
 - **Rendering.** Delivering the artifact on connect, and a teammate's screen
