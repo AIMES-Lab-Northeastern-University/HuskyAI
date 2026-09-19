@@ -363,6 +363,19 @@ export default function ChallengeDetail() {
                       </svg>
                       Open group challenge
                     </button>
+                    {/* Collaborative-study arm: one private coach per student plus a
+                        shared artifact. Shown alongside the shared-coach button until
+                        ClassroomChallenge.study_arm (Phase 3) decides which arm a
+                        section is in and this becomes a single, config-driven entry. */}
+                    <button
+                      onClick={() => navigate(`/coach/${challenge.group.group_id}`)}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', background: '#fff', color: '#7C3AED', border: '1.5px solid #7C3AED', borderRadius: '9px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer', marginLeft: '8px' }}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+                      </svg>
+                      Private coach + shared artifact
+                    </button>
                   </>
                 ) : (
                   <p style={{ fontSize: '13px', color: '#4A4440', lineHeight: 1.7, margin: '10px 0 0' }}>

@@ -27,7 +27,14 @@ _ca = engine_connect_args(_db_url)
 if _ca:
     _engine_kw["connect_args"] = _ca
 
-if is_transaction_pooler(_db_url):
+if _db_url.startswith("sqlite"):
+    # aiosqlite ties each connection to the event loop that opened it, and a
+    # pooled connection handed to a different loop deadlocks rather than erroring.
+    # That bites local dev and the test suite, where setup, a TestClient's
+    # portal loop, and assertions each run their own loop. NullPool opens per
+    # checkout, so a connection never crosses loops. Cheap for a local file DB.
+    _engine_kw["poolclass"] = NullPool
+elif is_transaction_pooler(_db_url):
     # Transaction pooler (Supavisor :6543) does its own connection pooling and
     # rotates server connections per transaction, so a client-side pool would just
     # pin connections and re-introduce the session-mode 'max clients' cap. Use
@@ -128,6 +135,14 @@ class Conversation(Base):
     group_session_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("group_sessions.id"), nullable=True, index=True
     )
+    # What this conversation *is*:
+    #   solo          - the single-user control arm (user_id set, no group session)
+    #   group_shared  - the legacy one-conversation-per-team chat (/ws/group)
+    #   coach_private - one student's private coach inside a group session
+    # A private coach needs no new table: it is a Conversation with BOTH user_id
+    # (whose coach it is) and group_session_id (which team session it belongs to).
+    # Defaults to "solo" so every pre-existing row keeps its meaning.
+    kind: Mapped[str] = mapped_column(String(16), default="solo", nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -383,9 +398,219 @@ class GroupChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class StudyEvent(Base):
+    """The collaborative-study event log: one ordered, append-only record of every
+    action in a session — including *reads* of a teammate's work.
+
+    Why this table exists at all: `artifact_revision` and `messages` answer who
+    wrote what, but only this log answers who looked at whose work before writing,
+    which is the question the study is asking. A read that goes unrecorded cannot
+    be reconstructed from a database of final states, so this log is the one part
+    of the design that must be right the first time.
+
+    Three rules this schema enforces, and the reasons they are structural rather
+    than conventional (see docs/collab-study-build-plan.md, "The read requirement"):
+
+    - **Reads and writes share one sequence space.** `seq` is monotonic per
+      session and assigned server-side (see events.py::log_event), so whether a
+      student read a teammate's contribution *before* or *after* writing their own
+      is answerable. Reads in a side table with their own clock could not answer it.
+    - **No sampling.** `idempotency_key` is unique, so client delivery can be
+      at-least-once and dedupe on ingest. Under-recording is not a tunable.
+    - **client_ts is never trusted for ordering.** It is kept for latency analysis
+      only; `seq` and `server_ts` are authoritative.
+
+    A row is scoped to exactly one session: `group_session_id` for collaborative
+    work, `user_challenge_session_id` for the solo control arm.
+    """
+
+    __tablename__ = "study_events"
+    __table_args__ = (
+        # One seq per session scope. Two constraints rather than one because a row
+        # belongs to exactly one scope and the other column is NULL; both engines
+        # treat NULLs as distinct, so the unused constraint never collides.
+        UniqueConstraint("group_session_id", "seq", name="uq_study_event_group_seq"),
+        UniqueConstraint("user_challenge_session_id", "seq", name="uq_study_event_solo_seq"),
+        UniqueConstraint("idempotency_key", name="uq_study_event_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    # Session scope: exactly one of these is set (enforced in events.py::log_event).
+    group_session_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=True, index=True
+    )
+    user_challenge_session_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("user_challenge_sessions.id"), nullable=True, index=True
+    )
+    # Denormalised for analysis-time filtering without a four-table join.
+    classroom_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("classrooms.id"), nullable=True, index=True
+    )
+    challenge_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("challenges.id"), nullable=True, index=True
+    )
+
+    # Monotonic per session, assigned server-side under a per-session lock. The
+    # total order across reads and writes is the finding, not a convenience.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    actor_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True, index=True
+    )
+    # student | coach | system. A coach-mediated read is attributed to the student
+    # whose prompt it entered, with actor_kind="coach" — never merged into human opens.
+    actor_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The student's role-scoped label at the time of the event (Phase 1 roles).
+    # NULL until the role taxonomy lands.
+    role_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # coach | artifact | group_chat | feed | contested | verification
+    target: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Row this event points at (a Message.id, artifact_revision.id, ...). Untyped
+    # by design: targets live in different tables, so no FK.
+    ref_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Client-supplied, preserved across a buffered reconnect flush. For latency
+    # analysis only — never for ordering.
+    client_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    server_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Dedupe key for at-least-once client delivery. NULL for server-emitted events,
+    # which cannot be double-delivered.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Consent snapshotted per row, matching EvalResult.consent_research, so the
+    # export is immune to a later toggle.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Resolved experimental condition (arm, prominence, corpus id) written onto
+    # every row so an exported log is self-describing.
+    condition: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class Artifact(Base):
+    """The one shared document a team reads and writes. One per group session.
+
+    Content lives in ArtifactSection rows, not here: a section is the unit of
+    both write conflict and read granularity, and the study's central question
+    ("did this student read that teammate's contribution before writing their
+    own?") is only answerable if a read can name a part of the document rather
+    than the whole panel. Sections are instructor-definable per assignment; an
+    artifact with none defined gets a single implicit section (IMPLICIT_SECTION_KEY)
+    and behaves like a free-form document.
+    """
+
+    __tablename__ = "artifacts"
+    __table_args__ = (UniqueConstraint("group_session_id", name="uq_artifact_group_session"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True
+    )
+
+
+class ArtifactSection(Base):
+    """One writable region of the shared artifact, and the unit of optimistic
+    concurrency: a write carries the version it was based on, and is rejected
+    with the current version if a teammate got there first, so the client can
+    rebase rather than clobber."""
+
+    __tablename__ = "artifact_sections"
+    __table_args__ = (UniqueConstraint("artifact_id", "key", name="uq_artifact_section_key"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    artifact_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifacts.id"), nullable=False, index=True
+    )
+    # Stable identifier used by read events and (later) Phase 4 subproblem pairing.
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Bumped on every accepted write. Starts at 0 for an empty section.
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True
+    )
+
+
+class ArtifactRevision(Base):
+    """Append-only history of every accepted section write.
+
+    A research record, not an undo buffer, so revisions are never pruned and
+    never rewritten. `origin` distinguishes text the student typed from text
+    they copied out of their coach — the difference between a student's own work
+    and adopted AI output is a finding, not an implementation detail."""
+
+    __tablename__ = "artifact_revisions"
+    __table_args__ = (
+        UniqueConstraint("section_id", "version", name="uq_artifact_revision_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    artifact_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifacts.id"), nullable=False, index=True
+    )
+    section_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifact_sections.id"), nullable=False, index=True
+    )
+    # Denormalised so a revision stays readable if a section is ever renamed.
+    section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    # student_typed | coach_copied | verification_edit
+    origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    bytes_added: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    bytes_removed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# Columns added to already-existing tables, as (table, column, DDL type).
+# `create_all` creates missing TABLES but never missing COLUMNS, and Alembic does
+# not run against SQLite here — so without this, adding a column to an existing
+# model leaves every SQLite database (local dev, the test suite) with an ORM that
+# writes a column the file does not have. That fails at INSERT time, far from the
+# cause: the first symptom of adding Conversation.kind was an empty artifact panel.
+_SQLITE_ADDED_COLUMNS = [
+    ("conversations", "kind", "VARCHAR(16) NOT NULL DEFAULT 'solo'"),
+]
+
+
+async def _ensure_sqlite_columns(conn):
+    """Add any column in _SQLITE_ADDED_COLUMNS that the file is missing.
+
+    SQLite has no ADD COLUMN IF NOT EXISTS, so existence is checked with PRAGMA
+    first. Mirrors the Postgres ALTER block below; both paths exist because the
+    deploy is Postgres and everything else is SQLite."""
+    for table, column, ddl in _SQLITE_ADDED_COLUMNS:
+        try:
+            cols = {row[1] for row in (await conn.exec_driver_sql(f"PRAGMA table_info({table})")).fetchall()}
+            if not cols:
+                continue  # table does not exist yet; create_all will have made it
+            if column not in cols:
+                await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        except Exception as e:  # never block startup on a best-effort backfill
+            import logging
+            logging.getLogger("database").warning(
+                "could not add %s.%s on sqlite: %s", table, column, e
+            )
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    if _db_url.startswith("sqlite"):
+        async with engine.begin() as conn:
+            await _ensure_sqlite_columns(conn)
     # Postgres: ORM expects listed_in_directory; older DBs (pre-Alembic) need the column added.
     if "postgresql" in _db_url.lower():
         async with engine.begin() as conn:
@@ -417,6 +642,14 @@ async def init_db():
                 text(
                     "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
                     "consent_research BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
+            # Existing rows are all either solo or the legacy shared group chat;
+            # "solo" is the safe default and group_session_id still distinguishes them.
+            await conn.execute(
+                text(
+                    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS "
+                    "kind VARCHAR(16) NOT NULL DEFAULT 'solo'"
                 )
             )
             # NULL for accounts that predate password-reset support: those tokens

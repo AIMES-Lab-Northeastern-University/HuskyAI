@@ -1,5 +1,5 @@
 # Environment variables — never commit these
-backend/.env
+backend/.env*
 frontend/.env
 frontend/.env.local
 
@@ -8,6 +8,7 @@ backend/*.db
 
 # Dependencies
 frontend/node_modules/
+backend/.venv/
 backend/__pycache__/
 backend/*.pyc
 

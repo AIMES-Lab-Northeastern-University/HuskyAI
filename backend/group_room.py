@@ -26,12 +26,59 @@ class GroupRoom:
         self.group_session_id = group_session_id
         # ws -> {"user_id": str, "name": str}
         self.connections: dict[WebSocket, dict] = {}
-        # Free-form turns: anyone may send, but only one AI turn runs at a time.
+        # Legacy /ws/group only: one shared coach, so one AI turn at a time.
+        # The collaborative-study design (/ws/coach) gives every student their
+        # own coach and uses per-user locks below instead — private coaches
+        # running concurrently is the whole point of that design, so they must
+        # not serialise behind each other.
         self.turn_lock = asyncio.Lock()
         # Shared server-side conversation history (same shape as the single-user
         # handler's local list: {"role", "content", optional "attachments"}).
         self.history: list[dict] = []
         self.history_loaded = False
+
+        # --- Collaborative study: N private coaches in one room ---
+        # user_id -> {"history": list[dict], "loaded": bool, "conversation_id": str}
+        self.private: dict[str, dict] = {}
+        # user_id -> Lock. One in-flight coach turn per student, independent of
+        # every teammate's.
+        self._user_locks: dict[str, asyncio.Lock] = {}
+        # Set once the artifact row exists, so teammates' sockets can skip the
+        # get-or-create round trip.
+        self.artifact_id: str | None = None
+
+    def user_lock(self, user_id: str) -> asyncio.Lock:
+        """This student's coach-turn lock. Created on first use."""
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+        return lock
+
+    def private_state(self, user_id: str, conversation_id: str) -> dict:
+        """This student's private coach history, created empty on first use."""
+        st = self.private.get(user_id)
+        if st is None:
+            st = {"history": [], "loaded": False, "conversation_id": conversation_id}
+            self.private[user_id] = st
+        return st
+
+    async def send_to_user(self, user_id: str, payload: dict) -> None:
+        """Deliver to every socket belonging to one student (they may have
+        several tabs). Used for private coach output, which teammates must not
+        see — sending it through broadcast() would leak one student's coaching
+        into the shared room and destroy the independence the design rests on."""
+        text = json.dumps(payload)
+        dead: list[WebSocket] = []
+        for ws, meta in list(self.connections.items()):
+            if meta.get("user_id") != user_id:
+                continue
+            try:
+                await ws.send_text(text)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.connections.pop(ws, None)
 
     async def broadcast(self, payload: dict, exclude: WebSocket | None = None) -> None:
         """Send a JSON payload to every connected socket (optionally skipping one).
