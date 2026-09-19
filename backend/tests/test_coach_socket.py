@@ -478,7 +478,7 @@ def stub_model(monkeypatch):
 
     monkeypatch.setattr(main.client.aio.models, "generate_content_stream", _fake_stream)
 
-    async def fake_eval(_history):
+    async def fake_eval(_history, corpus_vector_store_id=None):
         return {"scores": {"PEI": 63.5, "PSQ": 60, "CCM": 65, "TSI": 62, "CLM": 66, "RAS": 64},
                 "classification": "Intermediate", "leading_status": "leading"}
 
@@ -604,7 +604,7 @@ def test_artifact_content_actually_reaches_the_prompt(app_ready, monkeypatch):
 
     monkeypatch.setattr(main.client.aio.models, "generate_content_stream", capturing_stream)
 
-    async def fake_eval(_h):
+    async def fake_eval(_h, corpus_vector_store_id=None):
         return {"scores": {"PEI": 50.0}}
 
     monkeypatch.setattr(main, "evaluate_conversation", fake_eval)
@@ -725,7 +725,7 @@ def test_isolated_prominence_keeps_the_artifact_out_of_the_coach_prompt(app_read
 
     monkeypatch.setattr(main.client.aio.models, "generate_content_stream", capturing_stream)
 
-    async def fake_eval(_h):
+    async def fake_eval(_h, corpus_vector_store_id=None):
         return {"scores": {"PEI": 50.0}}
 
     monkeypatch.setattr(main, "evaluate_conversation", fake_eval)

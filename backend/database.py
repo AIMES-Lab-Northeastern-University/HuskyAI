@@ -203,6 +203,10 @@ class EvalResult(Base):
     tsi: Mapped[float | None] = mapped_column(Float, nullable=True)
     clm: Mapped[float | None] = mapped_column(Float, nullable=True)
     ras: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Does the work cover and stay faithful to the assignment's reference corpus?
+    # NULL when no corpus is attached, so existing rows and corpus-free
+    # assignments are indistinguishable from before this column existed.
+    grounding: Mapped[float | None] = mapped_column(Float, nullable=True)
     classification: Mapped[str | None] = mapped_column(String(64), nullable=True)
     leading_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     full_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -328,6 +332,9 @@ class ClassroomChallenge(Base):
     verification_policy: Mapped[str] = mapped_column(
         String(32), default="none", nullable=False
     )
+    # Ground-truth material the evaluator scores against. NULL = today's
+    # behaviour: the rubric vector store only, and a null grounding score.
+    reference_corpus_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class InstructorTestEnrollment(Base):
@@ -428,6 +435,69 @@ class GroupChatMessage(Base):
     sender_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ReferenceCorpus(Base):
+    """Ground-truth material an instructor attaches to one assignment, which the
+    evaluator scores student work against.
+
+    Scoped to a ClassroomChallenge rather than a Challenge: the same challenge
+    can carry different corpora in different sections, which is what makes a
+    corpus an experimental variable rather than a property of the task.
+
+    Retrofittable by design. `evaluate_conversation_v3` scores a stored
+    conversation history, so a corpus attached in week 6 can re-score every
+    archived transcript from week 1 — which is why this is Phase 2 and the event
+    log is Phase 1. A read that went unlogged is gone; a missing score is not.
+    """
+
+    __tablename__ = "reference_corpora"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    classroom_challenge_id: Mapped[str] = mapped_column(
+        String, ForeignKey("classroom_challenges.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # The OpenAI vector store backing this corpus. NULL until ingestion creates it.
+    openai_vector_store_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # building | ready | failed. The evaluator only uses a corpus that is ready,
+    # so a half-indexed corpus degrades to rubric-only scoring rather than
+    # silently grading against a partial set of documents.
+    status: Mapped[str] = mapped_column(String(16), default="building", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CorpusDocument(Base):
+    """One uploaded ground-truth file.
+
+    Bytes are stored inline, mirroring the Attachment table's decision: the
+    deploy target has an ephemeral filesystem, so anything not in the database
+    is gone on the next restart. Keeping the bytes also means a corpus can be
+    re-ingested into a fresh vector store without asking the instructor to
+    re-upload.
+    """
+
+    __tablename__ = "corpus_documents"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    corpus_id: Mapped[str] = mapped_column(
+        String, ForeignKey("reference_corpora.id"), nullable=False, index=True
+    )
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    openai_file_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # pending | ready | failed
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    uploaded_by_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class StudyEvent(Base):
@@ -619,6 +689,8 @@ _SQLITE_ADDED_COLUMNS = [
     ("classroom_challenges", "revision_policy", "JSON"),
     ("classroom_challenges", "verification_policy", "VARCHAR(32) NOT NULL DEFAULT 'none'"),
     ("eval_results", "is_graded_revision", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("eval_results", "grounding", "FLOAT"),
+    ("classroom_challenges", "reference_corpus_id", "VARCHAR"),
 ]
 
 
@@ -701,6 +773,9 @@ async def init_db():
                 "verification_policy VARCHAR(32) NOT NULL DEFAULT 'none'",
                 "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
                 "is_graded_revision BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS grounding FLOAT",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "reference_corpus_id VARCHAR",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens

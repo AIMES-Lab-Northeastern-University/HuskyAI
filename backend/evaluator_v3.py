@@ -33,6 +33,7 @@ All runs are stored in the OpenAI dashboard under workflow_name="HuskyAI-Eval-v3
 
 import os
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
@@ -59,6 +60,98 @@ _VECTOR_STORE_ID = os.getenv(
     "vs_69c5b5732cfc8191a9fbecc9ee76b31f",
 )
 file_search = FileSearchTool(vector_store_ids=[_VECTOR_STORE_ID])
+
+
+# ---------------------------------------------------------------------------
+# Per-assignment reference corpus (Phase 2)
+# ---------------------------------------------------------------------------
+# The judges below are module-level singletons bound to the rubric store. That
+# stays exactly as it was: an assignment with no corpus takes an identical code
+# path and produces identical prompts, so attaching corpora cannot perturb the
+# control arm or any historical comparison.
+#
+# When a corpus IS attached, `_agents_for` returns CLONES whose FileSearch spans
+# both stores, memoised per corpus so the clone cost is paid once per process
+# rather than per turn.
+
+_agent_cache: dict[str, dict] = {}
+
+
+def _agents_for(corpus_vector_store_id: str | None) -> dict:
+    """The judge panel to use for this evaluation.
+
+    Returns the untouched module-level agents when there is no corpus — not
+    equivalent copies, the same objects, so the corpus-free path is provably
+    unchanged."""
+    if not corpus_vector_store_id:
+        return {
+            "domain": domain_detector, "psq": psq_judge, "ccm": ccm_judge,
+            "tsi": tsi_judge, "clm": clm_judge, "ras": ras_judge,
+            "feedback": feedback_writer, "grounding": None,
+        }
+
+    cached = _agent_cache.get(corpus_vector_store_id)
+    if cached is not None:
+        return cached
+
+    # Both stores: the rubric still defines what good prompting looks like, the
+    # corpus adds what the answer should contain.
+    both = FileSearchTool(vector_store_ids=[_VECTOR_STORE_ID, corpus_vector_store_id])
+    corpus_only = FileSearchTool(vector_store_ids=[corpus_vector_store_id])
+
+    panel = {
+        "domain": domain_detector,           # domain detection needs no retrieval
+        "psq": psq_judge.clone(tools=[both]),
+        "ccm": ccm_judge.clone(tools=[both]),
+        "tsi": tsi_judge.clone(tools=[both]),
+        "clm": clm_judge.clone(tools=[both]),
+        "ras": ras_judge.clone(tools=[both]),
+        "feedback": feedback_writer.clone(tools=[both]),
+        "grounding": _make_grounding_judge(corpus_only),
+    }
+    _agent_cache[corpus_vector_store_id] = panel
+    return panel
+
+
+def _make_grounding_judge(corpus_search: FileSearchTool) -> Agent:
+    """Judge of a sixth dimension: does the student's work cover and stay
+    faithful to the assignment's ground truth?
+
+    Searches the corpus ONLY. Mixing the rubric in would let a rhetorically
+    well-formed answer score well on grounding without matching the source
+    material, which is the exact confusion this dimension exists to avoid."""
+    return Agent(
+        name="Grounding Judge",
+        instructions="""You judge ONLY the grounding dimension.
+
+Use file_search against the reference corpus to find what the correct answer
+should contain, then judge the USER's work in the conversation against it.
+
+Score two things for the LATEST user message and the work it describes:
+
+  coverage (0-100)
+    0   = engages with none of the material the corpus establishes as relevant
+    50  = touches the main points but misses substantive parts
+    100 = addresses the material the corpus says matters
+
+  faithfulness (0-100)
+    0   = asserts things the corpus contradicts
+    50  = broadly consistent, with unsupported claims
+    100 = every substantive claim is supported by the corpus
+
+grounding = (0.5 * coverage) + (0.5 * faithfulness)
+
+Be calibrated and evidence-led. Cite what you found. If the corpus contains
+nothing relevant to what the student is doing, say so and return
+grounding = null rather than guessing — an absent corpus match is not a
+student failure.
+
+Return JSON:
+{"grounding": <0-100 or null>, "coverage": <0-100>, "faithfulness": <0-100>,
+ "evidence": "<what the corpus says, briefly>", "rationale": "<1-2 sentences>"}""",
+        model="gpt-4.1-mini",
+        tools=[corpus_search],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -836,14 +929,16 @@ async def _run_judge(agent: Agent, conversation: list, label: str):
     return result.final_output
 
 
-async def _evaluate_conversation_v3_once(conversation_history: list, input_text: str) -> dict:
+async def _evaluate_conversation_v3_once(conversation_history: list, input_text: str,
+                                        corpus_vector_store_id: str | None = None) -> dict:
+    panel = _agents_for(corpus_vector_store_id)
     conversation: list[TResponseInputItem] = [
         {"role": "user", "content": [{"type": "input_text", "text": input_text}]}
     ]
 
     # Stage 1: Domain
     s1 = await Runner.run(
-        domain_detector,
+        panel["domain"],
         input=conversation,
         run_config=RunConfig(workflow_name="HuskyAI-Eval-v3"),
     )
@@ -857,12 +952,32 @@ async def _evaluate_conversation_v3_once(conversation_history: list, input_text:
 
     # Stage 2: Five parallel dimension judges
     psq_out, ccm_out, tsi_out, clm_out, ras_out = await asyncio.gather(
-        _run_judge(psq_judge, conversation, "PSQ"),
-        _run_judge(ccm_judge, conversation, "CCM"),
-        _run_judge(tsi_judge, conversation, "TSI"),
-        _run_judge(clm_judge, conversation, "CLM"),
-        _run_judge(ras_judge, conversation, "RAS"),
+        _run_judge(panel["psq"], conversation, "PSQ"),
+        _run_judge(panel["ccm"], conversation, "CCM"),
+        _run_judge(panel["tsi"], conversation, "TSI"),
+        _run_judge(panel["clm"], conversation, "CLM"),
+        _run_judge(panel["ras"], conversation, "RAS"),
     )
+
+    # Stage 2b: grounding, only when the assignment has ground truth to judge
+    # against. Runs alongside rather than inside the gather so a corpus failure
+    # cannot take down the five dimensions that make up the PEI — grounding is
+    # additive, and a corpus problem must degrade to rubric-only scoring rather
+    # than break the student's turn.
+    grounding_out = None
+    if panel["grounding"] is not None:
+        try:
+            g = await Runner.run(
+                panel["grounding"], input=conversation,
+                run_config=RunConfig(workflow_name="HuskyAI-Eval-v3-grounding"),
+            )
+            raw = g.final_output_as(str) if not isinstance(g.final_output, dict) else g.final_output
+            grounding_out = json.loads(raw) if isinstance(raw, str) else raw
+            log.info(f"[EVAL3-S2b grounding] {grounding_out.get('grounding')}")
+        except Exception as e:
+            log.warning(f"[EVAL3-S2b grounding] failed, continuing without it: "
+                        f"{type(e).__name__}: {e}")
+            grounding_out = None
 
     # FIX 1 + 2 + 3 + 4: Log individual judge scores for transparency
     log.info(
@@ -893,7 +1008,7 @@ async def _evaluate_conversation_v3_once(conversation_history: list, input_text:
     })
 
     s4 = await Runner.run(
-        feedback_writer,
+        panel["feedback"],
         input=conversation,
         run_config=RunConfig(workflow_name="HuskyAI-Eval-v3"),
     )
@@ -914,10 +1029,14 @@ async def _evaluate_conversation_v3_once(conversation_history: list, input_text:
         "turn_summary": feedback_result.turn_summary,
         "domain_raw": domain_text,
         "judge_notes": aggregated["judge_notes"],
+        # Additive: absent entirely when no corpus is attached, so the result
+        # dict for a corpus-free assignment is byte-identical to before.
+        **({"grounding": grounding_out} if grounding_out is not None else {}),
     }
 
 
-async def evaluate_conversation_v3(conversation_history: list) -> dict:
+async def evaluate_conversation_v3(conversation_history: list,
+                                   corpus_vector_store_id: str | None = None) -> dict:
     """
     Approach 3: domain + five parallel dimension judges + deterministic
     aggregation + feedback writer.
@@ -945,7 +1064,9 @@ async def evaluate_conversation_v3(conversation_history: list) -> dict:
     last_err: BaseException | None = None
     for attempt in range(3):
         try:
-            out = await _evaluate_conversation_v3_once(conversation_history, input_text)
+            out = await _evaluate_conversation_v3_once(
+                conversation_history, input_text, corpus_vector_store_id
+            )
             elapsed = time.monotonic() - t0
             pei = out.get("scores", {}).get("PEI", 0)
             log.info(f"[EVAL3-IMPROVED] Done in {elapsed:.2f}s, PEI={pei:.1f}")

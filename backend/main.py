@@ -34,6 +34,7 @@ from challenges import router as challenges_router, seed_challenges, get_current
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
 from groups import router as groups_router, team_router as group_teams_router
+from corpus import router as corpus_router, resolve_corpus_store
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / ".env")
@@ -216,6 +217,7 @@ app.include_router(challenges_router)
 app.include_router(classrooms_router)
 app.include_router(admin_router)
 app.include_router(groups_router)
+app.include_router(corpus_router)
 app.include_router(group_teams_router)
 
 BASE_SYSTEM_PROMPT = (
@@ -644,6 +646,9 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                 tsi=scores.get("TSI"),
                 clm=scores.get("CLM"),
                 ras=scores.get("RAS"),
+                # NULL unless a ready corpus was attached, so corpus-free
+                # assignments are indistinguishable from before this existed.
+                grounding=(eval_data.get("grounding") or {}).get("grounding"),
                 classification=eval_data.get("classification"),
                 leading_status=eval_data.get("leading_status"),
                 full_result=eval_data,
@@ -895,6 +900,23 @@ async def _resolve_solo_study_config(user_id: str, challenge_id: str | None,
     return policy, feed_enabled, revision_turn
 
 
+async def _resolve_solo_corpus(user_id: str, challenge_id: str | None) -> str | None:
+    """The corpus store for this student's section, or None."""
+    if not challenge_id:
+        return None
+    async with AsyncSessionLocal() as db:
+        classroom_id = (await db.execute(
+            select(ClassroomChallenge.classroom_id)
+            .join(ClassroomMembership,
+                  ClassroomMembership.classroom_id == ClassroomChallenge.classroom_id)
+            .where(
+                ClassroomChallenge.challenge_id == challenge_id,
+                ClassroomMembership.user_id == user_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+    return await resolve_corpus_store(classroom_id, challenge_id)
+
+
 async def _log_feed_event(conversation_id: str, action: str, payload: dict,
                           condition: dict | None = None) -> None:
     """Record what the student was actually shown.
@@ -957,6 +979,11 @@ async def websocket_endpoint(
         user_id, challenge_id, session_num
     )
     study_condition = study_policy_.as_condition()
+    # Resolved once per connection rather than per turn: a corpus cannot change
+    # mid-session without a reconnect, and re-resolving each turn would add a
+    # query to the hot path for a value that does not move.
+    corpus_store_id = await _resolve_solo_corpus(user_id, challenge_id)
+    study_condition["corpus"] = corpus_store_id
 
     conversation_id = None
     conversation_history: list[dict] = []
@@ -1292,7 +1319,9 @@ async def websocket_endpoint(
 
             eval_result = None
             try:
-                eval_result = await evaluate_conversation(conversation_history)
+                eval_result = await evaluate_conversation(
+                    conversation_history, corpus_vector_store_id=corpus_store_id
+                )
                 scores = eval_result.get("scores", {})
                 log.info(
                     f"[TURN {turn}] Eval -> "
@@ -1573,6 +1602,7 @@ async def _save_group_turn(
                     tsi=scores.get("TSI"),
                     clm=scores.get("CLM"),
                     ras=scores.get("RAS"),
+                    grounding=(eval_data.get("grounding") or {}).get("grounding"),
                     classification=eval_data.get("classification"),
                     leading_status=eval_data.get("leading_status"),
                     full_result=eval_data,
@@ -2012,7 +2042,12 @@ async def coach_websocket_endpoint(
     # rather than re-deriving the condition, which is what stops two sessions
     # nominally in the same arm behaving differently (see study_policy.py).
     policy = await resolve_for_group_session(group_session_id)
+    async with AsyncSessionLocal() as _db:
+        _team = await _db.get(GroupChallenge, group_id)
+        _classroom_id = _team.classroom_id if _team else None
+    corpus_store_id = await resolve_corpus_store(_classroom_id, challenge_id)
     condition = policy.as_condition()
+    condition["corpus"] = corpus_store_id
 
     # The artifact is created here, on connect, with the assignment's real
     # decomposition — never lazily on first write, because sections are fixed at
@@ -2297,7 +2332,9 @@ async def coach_websocket_endpoint(
                 await room.send_to_user(user_id, {"type": "eval_start"})
                 eval_result = None
                 try:
-                    eval_result = await evaluate_conversation(history)
+                    eval_result = await evaluate_conversation(
+                        history, corpus_vector_store_id=corpus_store_id
+                    )
                 except Exception as e:
                     log.error(f"[WS-COACH] eval error: {type(e).__name__}: {e}", exc_info=True)
                 await _save_turn(

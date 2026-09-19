@@ -45,7 +45,7 @@ def stub_model(monkeypatch):
             yield _FakeChunk("coached.")
         return gen()
 
-    async def fake_eval(_h):
+    async def fake_eval(_h, corpus_vector_store_id=None):
         return {"scores": {"PEI": 58.0}, "classification": "Intermediate"}
 
     monkeypatch.setattr(main.client.aio.models, "generate_content_stream", stream)

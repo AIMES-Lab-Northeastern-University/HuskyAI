@@ -97,3 +97,24 @@ heartbeat degrades precision, not validity.
 **Null is not zero.** Every ratio returns `null` when its denominator is empty,
 rather than `0.0`. "No eligible writes" and "nobody read anything" are different
 findings and must not be collapsed.
+
+
+## `grounding` (Phase 2)
+
+Not a turn-taking metric, but scored per turn and stored on
+`EvalResult.grounding`, so it belongs in the same codebook.
+
+`grounding = (0.5 * coverage) + (0.5 * faithfulness)`, judged against the
+assignment's reference corpus by a sixth judge that searches **only** that
+corpus. Mixing the rubric store in would let a rhetorically well-formed answer
+score well on grounding without matching the source material, which is the exact
+confusion the dimension exists to avoid.
+
+`NULL` whenever no corpus is attached, the corpus is not `ready`, or the corpus
+contains nothing relevant to what the student is doing. An absent corpus match
+is not a student failure, so it must not be recorded as a low score.
+
+**Grounding is not part of the PEI.** PEI keeps its five weighted dimensions
+exactly as defined above, so scores from corpus-bearing and corpus-free
+assignments remain directly comparable — and so every score computed before
+Phase 2 stays valid.

@@ -47,7 +47,7 @@ Three properties follow, and they are structural rather than conventional:
 | `server_ts` | Authoritative wall-clock. |
 | `idempotency_key` | Unique. NULL for server-emitted events, which cannot be double-delivered. |
 | `consent_research` | Snapshotted per row at write time, so the export is immune to a later toggle. |
-| `condition` | Resolved experimental condition (`arm`, `prominence`), written onto every row so an exported log is self-describing. |
+| `condition` | Resolved experimental condition (`arm`, `prominence`, `corpus`), written onto every row so an exported log is self-describing. |
 
 ## Action vocabulary
 
