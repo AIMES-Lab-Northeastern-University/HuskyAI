@@ -623,3 +623,82 @@ def test_artifact_content_actually_reaches_the_prompt(app_ready, monkeypatch):
 
     blob = str(captured.get("contents"))
     assert "DISTINCTIVE_TEAM_TEXT" in blob, "the shared artifact never reached the coach's prompt"
+
+
+def test_ending_a_coach_session_aggregates_across_private_conversations(app_ready, stub_model):
+    """Regression: the shared end endpoint averaged EvalResult over
+    gs.conversation_id — the shared conversation, which in this arm exists but
+    holds no messages, because every student talks to their own. It reported
+    avg_pei=None / turns=0 and would then have run a narrative analysis over an
+    empty transcript."""
+    from database import AsyncSessionLocal, GroupSession
+    from main import app
+
+    group_id, users = asyncio.run(_make_team(2))
+    client = TestClient(app_ready)
+
+    for u in users:
+        with _connect(client, group_id, u) as ws:
+            _drain_until(ws, {"artifact"})
+            ws.send_text(json.dumps({"type": "message", "content": "hello coach"}))
+            _drain_until(ws, {"done", "error"})
+            _drain_until(ws, {"eval", "eval_error"})
+
+    r = client.post(f"/groups/{group_id}/sessions/1/end",
+                    headers={"Authorization": f"Bearer {_token(users[0])}"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["arm"] == "collab_coach_artifact"
+    assert body["turns"] == 2, "both students' turns must be counted"
+    assert body["session_avg_pei"] == 63.5
+    # Per-student averages are reported rather than collapsed: what a team's
+    # single score means when everyone has their own coach is a research call.
+    assert set(body["per_student"]) == set(users)
+    assert all(v["turns"] == 1 for v in body["per_student"].values())
+    assert body["analysis_status"] is None, "no narrative analysis in this arm yet"
+
+    gs = asyncio.run(_group_session_id(group_id))
+
+    async def status():
+        async with AsyncSessionLocal() as db:
+            row = await db.get(GroupSession, gs)
+            return row.status, row.end_reason
+
+    assert asyncio.run(status()) == ("completed", "manual")
+
+
+def test_ending_still_works_for_the_legacy_shared_coach_arm(app_ready):
+    """The arm switch must not break /ws/group teams, which have a shared
+    conversation and no private ones."""
+    from database import AsyncSessionLocal, Conversation, GroupSession
+
+    group_id, users = asyncio.run(_make_team(1))
+
+    async def seed_shared():
+        from sqlalchemy import select
+        async with AsyncSessionLocal() as db:
+            gs = (await db.execute(
+                select(GroupSession).where(GroupSession.group_id == group_id)
+            )).scalar_one_or_none()
+            if gs is None:
+                from database import Challenge, GroupChallenge
+                team = await db.get(GroupChallenge, group_id)
+                gs = GroupSession(group_id=group_id, challenge_id=team.challenge_id,
+                                  session_number=1, status="in_progress")
+                db.add(gs)
+                await db.flush()
+            conv = Conversation(user_id=users[0], group_session_id=gs.id, kind="group_shared")
+            db.add(conv)
+            await db.flush()
+            gs.conversation_id = conv.id
+            await db.commit()
+            return gs.id
+
+    asyncio.run(seed_shared())
+    client = TestClient(app_ready)
+    r = client.post(f"/groups/{group_id}/sessions/1/end",
+                    headers={"Authorization": f"Bearer {_token(users[0])}"})
+
+    assert r.status_code == 200, r.text
+    assert "arm" not in r.json(), "legacy arm must keep its original response shape"

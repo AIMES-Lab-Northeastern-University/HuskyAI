@@ -9,9 +9,18 @@ the reference corpus, contested input, routed verification, turn-taking indices,
 prominence conditions — is either a reading of that log or a small addition on
 the same architecture, and can follow.
 
-Status: draft for review. Open questions in the final section block parts of
-Phases 1, 4 and 5; question 8 decides whether Phases 1 and 2 can be built in
-this order.
+Status: Phase 1 built (see below). Open questions in the final section block
+parts of Phases 1, 4 and 5; question 8 decides whether Phases 1 and 2 can be
+built in this order.
+
+**Implementation status (2026-09-19).** The Phase 1 spine is built and tested:
+the event log (`backend/events.py`, `study_events`), the sectioned shared
+artifact (`backend/artifacts.py`), per-student private coaches (`/ws/coach`),
+the turn-taking index (`backend/analysis/turn_taking.py`) and its
+instructor-scoped endpoint, plus `docs/event-schema.md` and
+`docs/metrics-codebook.md`, both versioned at 1.0.0. Still open within Phase 1:
+`role_label` is unpopulated pending question 1, and the team backchannel emits
+no study event pending question 6. Phases 2-7 are not started.
 
 ---
 
@@ -170,7 +179,7 @@ with every action landing in a single ordered event log.
 - `backend/events.py::log_event(...)` — the single write path. Call sites:
   `_save_turn`, `_save_group_turn`, `_save_team_chat`, every artifact operation,
   every feed render in Design A, and Phases 4 and 5 wholesale.
-- **Reads are first-class.** Proposed taxonomy, pending open question 5:
+- **Reads are first-class.** Proposed taxonomy, pending open question 4:
   `artifact.open` (panel opened), `artifact.dwell` (heartbeat with duration,
   batched client-side), `artifact.section_expand`, `artifact.read_by_coach`
   (snapshot injected into a prompt). Client-emitted read events go through a
@@ -317,7 +326,7 @@ either.
    and comparable across teams, which matters more than realism for a first run.
 2. **Auto-detected divergence** (behind a flag). An LLM judge compares a
    teammate's contribution against the student's coach output on the same
-   subproblem, scoring both against the Phase 1 corpus. This is where Option D
+   subproblem, scoring both against the Phase 2 corpus. This is where Option D
    pays off directly: with ground truth you can label which option was actually
    better, so adoption becomes measurable as accuracy rather than mere
    preference.
@@ -355,7 +364,7 @@ whether the check happened, was duplicated or was skipped.
 - Outcomes are derived, not self-reported:
   - **happened** — a response exists and read events show the target was opened.
   - **skipped** — no response, or a response with no preceding read event, which
-    is the more interesting case and is only detectable because Phase 2 logs
+    is the more interesting case and is only detectable because Phase 1 logs
     reads as first-class events.
   - **duplicated** — two or more reviewers responded to the same target.
 

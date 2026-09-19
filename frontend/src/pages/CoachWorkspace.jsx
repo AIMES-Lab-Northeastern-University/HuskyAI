@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
+import { API_URL, authHeaders } from '../lib/api'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -182,6 +183,11 @@ export default function CoachWorkspace() {
   // No artifact_open fires on mount: showing the panel is a render, not a read.
   const [artifactOpen, setArtOpen]    = useState(true)
   const [conflicts, setConflicts]     = useState({})
+  const [teamChat, setTeamChat]       = useState([])
+  const [teamInput, setTeamInput]     = useState('')
+  const [sessionEnded, setEnded]      = useState(false)
+  const [ending, setEnding]           = useState(false)
+  const [summary, setSummary]         = useState(null)
   const [recentEdits, setRecentEdits] = useState({})
 
   const wsRef        = useRef(null)
@@ -191,6 +197,8 @@ export default function CoachWorkspace() {
   const dwellRef     = useRef({})   // section_key -> started-at ms
   const outbox       = useRef([])   // read events buffered while disconnected
   const recentTimers = useRef({})
+  const teamEndRef   = useRef(null)
+  const endedRef     = useRef(false)
 
   /* Read events. Buffered across a dropped socket and flushed on reconnect with
    * their ORIGINAL client_ts, because a flaky network must not silently eat
@@ -321,6 +329,23 @@ export default function CoachWorkspace() {
       case 'eval': setIsEval(false); setEvalData(data.data); setTurnCount(t => t + 1); break
       case 'eval_error': setIsEval(false); break
       case 'presence': if (Array.isArray(data.members)) setMembers(data.members); break
+      case 'team_chat_history':
+        if (Array.isArray(data.messages)) {
+          setTeamChat(data.messages.map(m => ({
+            senderName: m.sender_name, content: m.content, isSelf: m.sender_name === myName,
+          })))
+        }
+        break
+      case 'team_chat':
+        // Human-only backchannel. Never enters a coach prompt or the evaluator;
+        // whether it enters the research record at all is an open question, so
+        // nothing here emits a study event.
+        setTeamChat(prev => [...prev, { senderName: data.sender_name, content: data.content, isSelf: false }])
+        break
+      case 'session_ended':
+        endedRef.current = true
+        setEnded(true)
+        break
       case 'error':
         setIsStreaming(false); setIsTyping(false); setIsEval(false)
         console.error('Server error:', data.message)
@@ -347,6 +372,7 @@ export default function CoachWorkspace() {
         navigate('/login', { replace: true }); return
       }
       if (e.code === 4003 || e.code === 4005) { setConn('error'); return }
+      if (endedRef.current) return
       reconnectRef.current = setTimeout(connect, 3000)
     }
     ws.onerror = () => setConn('error')
@@ -364,6 +390,7 @@ export default function CoachWorkspace() {
   }, [connect, token, navigate])
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streaming])
+  useEffect(() => { teamEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [teamChat])
 
   const send = useCallback(() => {
     const content = input.trim()
@@ -374,13 +401,37 @@ export default function CoachWorkspace() {
     setInput('')
   }, [input, isStreaming, isTyping, isEvaluating])
 
+  const sendTeamChat = useCallback(() => {
+    const content = teamInput.trim()
+    if (!content || wsRef.current?.readyState !== WebSocket.OPEN) return
+    setTeamChat(prev => [...prev, { senderName: myName, content, isSelf: true }])
+    wsRef.current.send(JSON.stringify({ type: 'team_chat', content }))
+    setTeamInput('')
+  }, [teamInput, myName])
+
+  const endSession = useCallback(async () => {
+    if (!window.confirm('End this session for the whole team? Everyone will be disconnected.')) return
+    setEnding(true)
+    try {
+      const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/end`,
+        { method: 'POST', headers: authHeaders() })
+      if (r.ok) setSummary(await r.json())
+      endedRef.current = true
+      setEnded(true)
+    } catch (e) {
+      console.error('could not end session', e)
+    } finally {
+      setEnding(false)
+    }
+  }, [groupId, sessionNum])
+
   const nameFor = (uidStr) => {
     if (uidStr && user?.id === uidStr) return 'You'
     return members.find(m => m.user_id === uidStr)?.name
   }
 
   const pei = evalData?.scores?.PEI ?? 0
-  const busy = isStreaming || isTyping || isEvaluating
+  const busy = isStreaming || isTyping || isEvaluating || sessionEnded
 
   return (
     <div className="h-screen flex flex-col bg-[#F7F3EE]">
@@ -416,7 +467,34 @@ export default function CoachWorkspace() {
             <div className="text-[9px] font-bold text-[#9A948E] uppercase tracking-[0.5px]">Your PEI</div>
           </div>
         )}
+        {!sessionEnded && (
+          <button onClick={endSession} disabled={ending}
+                  className="px-3 py-1.5 text-[12px] font-bold text-[#C8102E] bg-[#FDFCFB] border border-[#E7E0D8] rounded-[8px] hover:bg-[#FDE8EC] disabled:opacity-50 cursor-pointer"
+                  style={{ borderWidth: '1.5px' }}>
+            {ending ? 'Ending…' : 'End session'}
+          </button>
+        )}
       </div>
+
+      {sessionEnded && (
+        <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex items-center gap-4 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+          <span className="text-[13px] font-bold text-[#0D9488]">Session ended.</span>
+          {summary && (
+            <span className="text-[12px] text-[#4A4440]">
+              Team mean PEI {summary.session_avg_pei ?? '—'} across {summary.turns} turn{summary.turns === 1 ? '' : 's'}
+              {summary.per_student && Object.keys(summary.per_student).length > 1 && (
+                <> · {Object.entries(summary.per_student)
+                  .map(([uidStr, v]) => `${nameFor(uidStr) || 'member'}: ${v.avg_pei ?? '—'} (${v.turns})`)
+                  .join(' · ')}</>
+              )}
+            </span>
+          )}
+          <button onClick={() => navigate('/challenges')}
+                  className="ml-auto text-[12px] font-bold text-[#0D9488] underline cursor-pointer">
+            Back to challenges
+          </button>
+        </div>
+      )}
 
       {connStatus === 'error' && (
         <div className="px-6 py-2 bg-[#FDE8EC] text-[12px] text-[#C8102E] font-bold flex-shrink-0">
@@ -518,7 +596,7 @@ export default function CoachWorkspace() {
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+              <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3 min-h-0">
                 {!artifact && <div className="text-[13px] text-[#9A948E]">Loading…</div>}
                 {artifact?.sections?.map(s => (
                   <Section
@@ -534,6 +612,48 @@ export default function CoachWorkspace() {
                     justUpdatedBy={recentEdits[s.key]}
                   />
                 ))}
+              </div>
+
+              {/* Team backchannel: student-to-student only. Firewalled by design
+                  from the coach prompt and the evaluator, and currently emits no
+                  study event — whether human deliberation enters the research
+                  record is an open question for the PI. Messages are persisted
+                  in group_chat_messages either way, so deciding later is free. */}
+              <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: 240 }}>
+                <div className="px-4 py-2 flex items-center gap-2 flex-shrink-0">
+                  <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Team chat</span>
+                  <span className="text-[10px] text-[#9A948E]">· not seen by any coach</span>
+                </div>
+                <div className="flex-1 overflow-y-auto px-4 pb-2 flex flex-col gap-2">
+                  {teamChat.length === 0 && (
+                    <div className="text-[12px] text-[#9A948E] italic">Talk to your teammates here.</div>
+                  )}
+                  {teamChat.map((m, i) => (
+                    <div key={i} className={`flex ${m.isSelf ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[85%] px-3 py-1.5 rounded-[10px] text-[12px] ${
+                        m.isSelf ? 'bg-[#EDE9FE] text-[#16120E]' : 'bg-[#F7F3EE] text-[#16120E]'}`}>
+                        {!m.isSelf && <div className="text-[10px] font-bold text-[#6B6560] mb-0.5">{m.senderName}</div>}
+                        <span className="whitespace-pre-wrap">{m.content}</span>
+                      </div>
+                    </div>
+                  ))}
+                  <div ref={teamEndRef} />
+                </div>
+                <div className="p-3 flex gap-2 flex-shrink-0">
+                  <input
+                    value={teamInput}
+                    onChange={e => setTeamInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); sendTeamChat() } }}
+                    placeholder="Message your team…"
+                    disabled={sessionEnded || connStatus !== 'connected'}
+                    className="flex-1 px-3 py-1.5 text-[12px] bg-white border border-[#E7E0D8] rounded-[8px] focus:outline-none focus:border-[#7C3AED] disabled:opacity-60"
+                    style={{ borderWidth: '1.5px' }}
+                  />
+                  <button onClick={sendTeamChat} disabled={sessionEnded || !teamInput.trim() || connStatus !== 'connected'}
+                          className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#7C3AED] rounded-[8px] disabled:opacity-40 cursor-pointer">
+                    Send
+                  </button>
+                </div>
               </div>
             </div>
           )}

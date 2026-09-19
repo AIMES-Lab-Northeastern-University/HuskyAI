@@ -20,10 +20,14 @@ from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
 from sqlalchemy import select, update, func
 
-from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage
+from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership
 from group_room import rooms
 from events import log_event
 import artifacts
+
+# Version of the study event schema (docs/event-schema.md). Echoed in research
+# responses so an exported dataset is interpretable against a fixed spec.
+STUDY_SCHEMA_VERSION = "1.0.0"
 from auth import router as auth_router, resolve_token_user_id, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
@@ -2431,6 +2435,143 @@ async def _group_session_or_403(db, group_id: str, session_num: int, user_id: st
     return gs
 
 
+
+# ============================================================================
+# Research endpoints
+# ============================================================================
+
+
+async def _assert_can_read_research(db, user_id: str, classroom_id: str | None) -> None:
+    """Instructor- and admin-scoped. Students may not read their own team's
+    turn-taking numbers: contribution share and read-before-write are research
+    measures, and showing them live would turn the measurement into an incentive
+    and change the behaviour being studied."""
+    user = await db.get(User, user_id)
+    if user is not None and user.is_platform_admin:
+        return
+    if classroom_id:
+        room = await db.get(Classroom, classroom_id)
+        if room is not None:
+            if room.instructor_user_id == user_id:
+                return
+            member = (await db.execute(
+                select(ClassroomMembership).where(
+                    ClassroomMembership.user_id == user_id,
+                    ClassroomMembership.classroom_id == classroom_id,
+                    ClassroomMembership.role.in_(("instructor", "admin")),
+                )
+            )).scalar_one_or_none()
+            if member is not None:
+                return
+    raise HTTPException(status_code=403, detail="Instructor or admin access required")
+
+
+@app.get("/research/sessions/{group_session_id}/turn-taking")
+async def get_turn_taking(
+    group_session_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Turn-taking metrics for one collaborative session.
+
+    Definitions live in docs/metrics-codebook.md and are versioned; the response
+    carries `metrics_version` so a published number stays traceable to the
+    definition that produced it."""
+    from analysis.turn_taking import compute_turn_taking, events_for_group_session
+
+    gs = await db.get(GroupSession, group_session_id)
+    if gs is None:
+        raise HTTPException(status_code=404, detail="Group session not found")
+    team = await db.get(GroupChallenge, gs.group_id)
+    await _assert_can_read_research(db, user_id, team.classroom_id if team else None)
+
+    members = [
+        row for (row,) in (await db.execute(
+            select(GroupMember.user_id).where(GroupMember.group_id == gs.group_id)
+        )).all()
+    ]
+    events = await events_for_group_session(db, group_session_id)
+    metrics = compute_turn_taking(events, members)
+
+    names = {}
+    if members:
+        for u in (await db.execute(select(User).where(User.id.in_(members)))).scalars().all():
+            names[u.id] = u.name
+
+    return {
+        "group_session_id": group_session_id,
+        "group_id": gs.group_id,
+        "session_number": gs.session_number,
+        "schema_version": STUDY_SCHEMA_VERSION,
+        "member_names": names,
+        **metrics,
+    }
+
+
+async def _end_coach_session(db, gs, private_conversations: list) -> dict:
+    """Finalise a session in the private-coach arm.
+
+    Reports a team mean across every member's turns AND each member's own
+    average, rather than collapsing to one number. What a *team's* single PEI
+    should mean when each student has their own coach and their own score is a
+    research question, not an engineering default — so this exposes both and
+    decides nothing. `session_avg_pei` is set to the team mean only so existing
+    instructor views keep rendering something truthful.
+
+    Narrative session analysis is deliberately NOT generated here: it would be
+    per-student, and GroupSession.session_analysis is a single blob shaped for
+    the shared-coach arm. Storing N analyses needs a schema decision that has
+    not been made, and writing one student's narrative into a team-level field
+    would be worse than omitting it.
+    """
+    per_student: dict[str, dict] = {}
+    all_pei: list[float] = []
+    now = datetime.utcnow()
+
+    for conv in private_conversations:
+        row = (await db.execute(
+            select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
+                EvalResult.conversation_id == conv.id,
+                EvalResult.pei.is_not(None),
+            )
+        )).one_or_none()
+        avg, n = (row[0], row[1]) if row else (None, 0)
+        peis = (await db.execute(
+            select(EvalResult.pei).where(
+                EvalResult.conversation_id == conv.id, EvalResult.pei.is_not(None)
+            )
+        )).scalars().all()
+        all_pei.extend(float(p) for p in peis)
+        per_student[conv.user_id] = {
+            "avg_pei": round(float(avg), 1) if avg is not None else None,
+            "turns": int(n or 0),
+        }
+        if conv.ended_at is None:
+            conv.ended_at = now
+
+    team_mean = round(sum(all_pei) / len(all_pei), 2) if all_pei else None
+    if team_mean is not None:
+        gs.session_avg_pei = team_mean
+    gs.status = "completed"
+    gs.completed_at = now
+    if gs.end_reason is None:
+        gs.end_reason = "manual"
+    await db.commit()
+
+    room = rooms.peek(gs.id)
+    if room is not None:
+        await room.broadcast({"type": "session_ended"})
+
+    return {
+        "arm": "collab_coach_artifact",
+        "session_avg_pei": round(team_mean, 1) if team_mean is not None else None,
+        "turns": len(all_pei),
+        "per_student": per_student,
+        "analysis_status": None,
+        "end_reason": gs.end_reason,
+    }
+
+
 @app.post("/groups/{group_id}/sessions/{session_num}/end")
 async def end_group_session(
     group_id: str,
@@ -2441,6 +2582,21 @@ async def end_group_session(
     """Any member can end the shared session: finalize the team's avg PEI, kick off
     the shared post-session analysis, and lock the live room for everyone."""
     gs = await _group_session_or_403(db, group_id, session_num, user_id)
+
+    # Collaborative-study arm: every member has their OWN coach conversation, so
+    # the team's turns are spread across N private conversations and the shared
+    # one (still created by _ensure_group_session) is empty. Averaging over it
+    # would report avg_pei=None, turns=0 and then run a narrative analysis over
+    # an empty transcript.
+    private = (await db.execute(
+        select(Conversation).where(
+            Conversation.group_session_id == gs.id,
+            Conversation.kind == "coach_private",
+        )
+    )).scalars().all()
+
+    if private:
+        return await _end_coach_session(db, gs, private)
 
     avg_pei = turn_count = None
     if gs.conversation_id:
