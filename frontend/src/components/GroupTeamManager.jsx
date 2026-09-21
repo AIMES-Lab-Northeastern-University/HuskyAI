@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 import ContributionAnalytics from './ContributionAnalytics'
+import TurnTakingPanel from './TurnTakingPanel'
 
 /**
  * Instructor team builder for a group-mode challenge. Lists teams + members,
@@ -171,7 +172,10 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
                 </div>
 
                 {analyticsFor === t.id && (
-                  <ContributionAnalytics classroomId={classroomId} challengeId={challengeId} teamId={t.id} />
+                  <>
+                    <ContributionAnalytics classroomId={classroomId} challengeId={challengeId} teamId={t.id} />
+                    <TurnTakingPanel classroomId={classroomId} challengeId={challengeId} teamId={t.id} />
+                  </>
                 )}
               </div>
             )

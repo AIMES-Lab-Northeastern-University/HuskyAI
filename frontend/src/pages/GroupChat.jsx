@@ -754,6 +754,7 @@ export default function GroupChat() {
                   meId={meId}
                   groupSessionId={sessionScopeId}
                   send={sendArtifact}
+                  connected={connStatus === 'connected'}
                   onRequestLock={requestSectionLock}
                   onReleaseLock={releaseSectionLock}
                   onWrite={writeSection}

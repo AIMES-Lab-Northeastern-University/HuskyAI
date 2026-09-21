@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
+import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
 import InfoIcon from '../components/InfoIcon'
 import { PEI_INFO } from '../lib/metricInfo'
 import { DEMO_CHALLENGE_LIST } from '../demo/demoData'
@@ -24,6 +25,104 @@ const DIFF_STYLES = {
   'Beginner':     { color: '#16A34A', bg: '#DCFCE7' },
   'Intermediate': { color: '#F97316', bg: '#FEF3E8' },
   'Advanced':     { color: '#C8102E', bg: '#FDE8EC' },
+}
+
+/**
+ * Section picker.
+ *
+ * Not a <select>. `appearance: none` restyles the closed control, but the open
+ * options panel is drawn by the OS -- on Windows that is a hard square with its
+ * own fonts and colours, and no CSS reaches it. The only way to round it is to
+ * render the menu ourselves.
+ *
+ * What a native select gave us for free and is re-added by hand: close on
+ * outside click, close on Escape, and listbox/option roles so it is still
+ * announced as a picker.
+ */
+function SectionPicker({ sections, value, onChange }) {
+  const [open, setOpen] = useState(false)
+  const [hovered, setHovered] = useState(null)
+  const boxRef = useRef(null)
+  const current = sections.find(x => x.id === value) || sections[0]
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => { if (!boxRef.current?.contains(e.target)) setOpen(false) }
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  return (
+    <div ref={boxRef} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen(v => !v)}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: '10px',
+          fontSize: '14px', fontWeight: 600, color: '#16120E',
+          padding: '9px 16px', borderRadius: '999px',
+          border: '1.5px solid #E7E0D8', background: '#FDFCFB', cursor: 'pointer',
+        }}
+      >
+        {current?.name}
+        <svg width="12" height="8" viewBox="0 0 12 8" fill="none"
+             style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }}>
+          <path d="M1 1l5 5 5-5" stroke="#9A948E" strokeWidth="2"
+                strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          role="listbox"
+          style={{
+            position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 30,
+            minWidth: '100%', padding: '6px',
+            background: '#FDFCFB', border: '1.5px solid #E7E0D8',
+            borderRadius: '14px', boxShadow: '0 8px 24px rgba(22,18,14,0.10)',
+          }}
+        >
+          {sections.map(sec => {
+            const selected = sec.id === value
+            return (
+              <button
+                key={sec.id}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                onMouseEnter={() => setHovered(sec.id)}
+                onMouseLeave={() => setHovered(null)}
+                onClick={() => { onChange(sec.id); setOpen(false) }}
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  gap: '16px', width: '100%', textAlign: 'left', whiteSpace: 'nowrap',
+                  fontSize: '14px', fontWeight: selected ? 600 : 500,
+                  color: selected ? '#16120E' : '#4A4440',
+                  padding: '9px 12px', borderRadius: '10px', border: 'none', cursor: 'pointer',
+                  background: hovered === sec.id ? '#F7F3EE' : 'transparent',
+                }}
+              >
+                {sec.name}
+                {selected && (
+                  <svg width="13" height="10" viewBox="0 0 13 10" fill="none">
+                    <path d="M1 5l4 4 7-8" stroke="#C8102E" strokeWidth="2"
+                          strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function categoryStyle(cat) {
@@ -52,6 +151,7 @@ export default function Challenges() {
   const [createTitle, setCreateTitle] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createCategory, setCreateCategory] = useState('General')
+  const [createSections, setCreateSections] = useState([])
   const [createDifficulty, setCreateDifficulty] = useState('Beginner')
   const [createWeek, setCreateWeek] = useState('')
   const [createTotalSessions, setCreateTotalSessions] = useState(3)
@@ -63,6 +163,13 @@ export default function Challenges() {
   const [createTeamMin, setCreateTeamMin] = useState(2)
   const [createTeamMax, setCreateTeamMax] = useState(4)
   const [manageTeamsId, setManageTeamsId] = useState(null)
+  // Which half of this page an instructor is looking at. Defaults to the
+  // student view, so a non-instructor's experience is unchanged.
+  // null until /classrooms/me answers. Rendering a default first made the
+  // page show the student view for a beat and then swap -- the role is not
+  // known at mount, so there is no honest default to paint.
+  const [pageTab, setPageTab] = useState(null)
+  const [showCreate, setShowCreate] = useState(false)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
@@ -99,16 +206,23 @@ export default function Challenges() {
 
   // Load instructor sections
   useEffect(() => {
-    if (isDemo) return
+    if (isDemo) { setPageTab('mine'); return }
     fetch(`${API_URL}/classrooms/me`, { headers: authHeaders() })
       .then(r => r.json())
       .then(data => {
-        if (!Array.isArray(data)) return
-        const inst = data.filter(c => c.role === 'instructor' || c.role === 'admin')
+        const inst = Array.isArray(data)
+          ? data.filter(c => c.role === 'instructor' || c.role === 'admin')
+          : []
         setInstructorSections(inst)
-        if (inst.length > 0) setSelectedSectionId(inst[0].id)
+        if (inst.length > 0) {
+          setSelectedSectionId(inst[0].id)
+          setPageTab('manage')      // land on the first tab
+        } else {
+          setPageTab('mine')
+        }
       })
-      .catch(() => {})
+      // Every path must resolve the tab, or the page stays blank forever.
+      .catch(() => setPageTab('mine'))
   }, [isDemo])
 
   const loadSectionChallenges = useCallback(async () => {
@@ -140,6 +254,8 @@ export default function Challenges() {
       if (Number.isNaN(n)) { setCreateMsg('Week must be a number'); return }
       weekNum = n
     }
+    const secProblem = sectionsProblem(createSections)
+    if (secProblem) { setCreateMsg(secProblem); return }
     setCreateMsg('')
     if (publish) setCreating(true); else setCreatingDraft(true)
     try {
@@ -157,14 +273,21 @@ export default function Challenges() {
           min_turns: createTimed ? createMinTurns : null,
           is_active: publish,
           mode: createGroup ? 'group' : 'solo',
+          sections: createSections.map(x => ({
+            key: (x.key || '').trim(),
+            title: (x.title || '').trim(),
+            prompt: (x.prompt || '').trim(),
+          })),
           team_min: createTeamMin,
           team_max: createTeamMax,
         }),
       })
       const d = await r.json().catch(() => ({}))
       if (!r.ok) { setCreateMsg(typeof d.detail === 'string' ? d.detail : 'Could not create challenge'); return }
-      setCreateMsg(publish ? 'Challenge published - students can see it now.' : 'Draft saved.')
-      setCreateTitle(''); setCreateDesc(''); setCreateWeek('')
+      setCreateMsg(publish
+        ? 'Challenge published - students can see it now.'
+        : 'Draft saved. Use Publish to make it visible to students.')
+      setCreateTitle(''); setCreateDesc(''); setCreateWeek(''); setCreateSections([])
       await loadSectionChallenges()
     } catch { setCreateMsg('Network error') }
     finally { setCreating(false); setCreatingDraft(false) }
@@ -226,6 +349,37 @@ export default function Challenges() {
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-8">
 
+          {/* Two modes for an instructor: the challenges they are enrolled in,
+              and the section they manage. They used to be stacked down one
+              scroll with the create form permanently open; now one at a time.
+              A student has no instructor sections, so no strip renders and the
+              page is byte-for-byte what it always was for them. */}
+          {!isDemo && instructorSections.length > 0 && (
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', borderBottom: '1.5px solid #E7E0D8' }}>
+              {/* Named by the ROLE you are acting in, not by ownership. "My
+                  challenges" read as "the ones I own", which to an instructor is
+                  the other tab -- and the manage tab is not ownership anyway: it
+                  lists everything linked to the section, including challenges
+                  someone else authored or the server seeded. */}
+              {[['manage', 'As instructor'], ['mine', 'As a student']].map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setPageTab(key)}
+                  style={{ padding: '8px 16px', fontSize: '13px', cursor: 'pointer',
+                    background: 'none', border: 'none', marginBottom: '-1.5px',
+                    fontWeight: pageTab === key ? 700 : 500,
+                    color: pageTab === key ? '#16120E' : '#9A948E',
+                    borderBottom: pageTab === key ? '2px solid #C8102E' : '2px solid transparent' }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {pageTab === 'mine' && (
+          <>
           {/* Filter bar */}
           <div style={{ display: 'flex', gap: '8px', marginBottom: '24px', flexWrap: 'wrap' }}>
             {filters.map(f => (
@@ -436,30 +590,32 @@ export default function Challenges() {
               })}
             </div>
           )}
+          </>
+          )}
 
           {/* Instructor: Manage Challenges */}
-          {!isDemo && instructorSections.length > 0 && (
-            <div style={{ marginTop: '40px', borderTop: '1.5px solid #E7E0D8', paddingTop: '32px' }}>
+          {!isDemo && instructorSections.length > 0 && pageTab === 'manage' && (
+            <div>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px', flexWrap: 'wrap', gap: '10px' }}>
                 <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', color: '#16120E' }}>
                   Manage challenges
                 </div>
-                {instructorSections.length > 1 && (
-                  <select
-                    value={selectedSectionId}
-                    onChange={e => setSelectedSectionId(e.target.value)}
-                    style={{ ...inputStyle, width: 'auto', fontSize: '13px' }}
-                  >
-                    {instructorSections.map(s => (
-                      <option key={s.id} value={s.id}>{s.name}</option>
-                    ))}
-                  </select>
-                )}
-                {instructorSections.length === 1 && (
-                  <span style={{ fontSize: '13px', color: '#9A948E' }}>
-                    {instructorSections[0].name}
+<div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '12px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
+                    Section
                   </span>
-                )}
+                  {instructorSections.length > 1 ? (
+                    <SectionPicker
+                      sections={instructorSections}
+                      value={selectedSectionId}
+                      onChange={setSelectedSectionId}
+                    />
+                  ) : (
+                    <span style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>
+                      {instructorSections[0].name}
+                    </span>
+                  )}
+                </div>
               </div>
 
               {/* Existing section challenges */}
@@ -468,41 +624,55 @@ export default function Challenges() {
               ) : sectionChallenges.length === 0 ? (
                 <div style={{ fontSize: '13px', color: '#9A948E', marginBottom: '20px' }}>No challenges linked to this section yet.</div>
               ) : (
-                <div style={{ marginBottom: '24px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <div style={{ marginBottom: '24px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                   {sectionChallenges.map(c => {
                     const badge = c.is_active
                       ? { label: 'Published', color: '#15803D', bg: '#DCFCE7' }
                       : { label: 'Draft', color: '#9A948E', bg: '#F7F3EE' }
                     return (
-                      <div key={c.id} style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '10px', padding: '12px 16px' }}>
+                      <div key={c.id} style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '14px', padding: '22px 24px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                           <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>{c.title}</div>
-                            <div style={{ fontSize: '11px', color: '#9A948E', marginTop: '2px' }}>
-                              {c.week != null ? `Week ${c.week}` : ''}
-                              {c.mode === 'group' ? `${c.week != null ? ' · ' : ''}👥 group ${c.team_min}–${c.team_max}` : ''}
+                            <div style={{ fontSize: '17px', fontWeight: 600, color: '#16120E' }}>{c.title}</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '7px', flexWrap: 'wrap' }}>
+                              {c.week != null && (
+                                <span style={{ fontSize: '12px', color: '#9A948E' }}>Week {c.week}</span>
+                              )}
+                              {c.mode === 'group' && (
+                                <span style={{
+                                  display: 'inline-flex', alignItems: 'center', gap: '5px',
+                                  fontSize: '11px', fontWeight: 700, letterSpacing: '0.3px',
+                                  padding: '3px 10px', borderRadius: '999px',
+                                  background: '#F3EDFF', color: '#7C3AED',
+                                }}>
+                                  Group
+                                  <span style={{ fontWeight: 600, opacity: 0.75 }}>
+                                    {c.team_min}–{c.team_max}
+                                  </span>
+                                </span>
+                              )}
                             </div>
                           </div>
-                          <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: badge.bg, color: badge.color, flexShrink: 0 }}>
+                          <span style={{ fontSize: '12px', fontWeight: 700, padding: '4px 10px', borderRadius: '20px', background: badge.bg, color: badge.color, flexShrink: 0 }}>
                             {badge.label}
                           </span>
                           {c.mode === 'group' && (
                             <button
                               onClick={() => setManageTeamsId(manageTeamsId === c.id ? null : c.id)}
-                              style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid', borderColor: manageTeamsId === c.id ? '#7C3AED' : '#E7E0D8', background: manageTeamsId === c.id ? '#7C3AED' : '#fff', cursor: 'pointer', color: manageTeamsId === c.id ? '#fff' : '#4A4440', flexShrink: 0 }}
+                              style={{ fontSize: '13px', padding: '8px 14px', borderRadius: '8px', border: '1.5px solid', borderColor: manageTeamsId === c.id ? '#7C3AED' : '#E7E0D8', background: manageTeamsId === c.id ? '#7C3AED' : '#fff', cursor: 'pointer', color: manageTeamsId === c.id ? '#fff' : '#4A4440', flexShrink: 0 }}
                             >
                               {manageTeamsId === c.id ? 'Hide teams' : 'Manage teams'}
                             </button>
                           )}
                           <button
                             onClick={() => setChallengeActive(c.id, !c.is_active)}
-                            style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #E7E0D8', background: '#fff', cursor: 'pointer', color: '#4A4440', flexShrink: 0 }}
+                            style={{ fontSize: '13px', padding: '8px 14px', borderRadius: '8px', border: '1.5px solid #E7E0D8', background: '#fff', cursor: 'pointer', color: '#4A4440', flexShrink: 0 }}
                           >
                             {c.is_active ? 'Unpublish' : 'Publish'}
                           </button>
                           <button
                             onClick={() => unlinkChallenge(c.id)}
-                            style={{ fontSize: '12px', padding: '4px 10px', borderRadius: '6px', border: '1.5px solid #FDE8EC', background: '#FDE8EC', cursor: 'pointer', color: '#C8102E', flexShrink: 0 }}
+                            style={{ fontSize: '13px', padding: '8px 14px', borderRadius: '8px', border: '1.5px solid #FDE8EC', background: '#FDE8EC', cursor: 'pointer', color: '#C8102E', flexShrink: 0 }}
                           >
                             Remove
                           </button>
@@ -517,7 +687,21 @@ export default function Challenges() {
                 </div>
               )}
 
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowCreate(v => !v)}
+                  style={{ fontSize: '14px', fontWeight: 600, padding: '10px 20px', borderRadius: '10px', cursor: 'pointer',
+                    border: showCreate ? '1.5px solid #E7E0D8' : 'none',
+                    background: showCreate ? 'transparent' : '#C8102E',
+                    color: showCreate ? '#4A4440' : '#fff' }}
+                >
+                  {showCreate ? 'Cancel' : 'New challenge'}
+                </button>
+              </div>
+
               {/* Create challenge form */}
+              {showCreate && (
               <div style={{ background: '#FDFCFB', border: '1.5px solid #E7E0D8', borderRadius: '12px', padding: '20px' }}>
                 <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: '14px' }}>
                   Create challenge for this section
@@ -537,11 +721,13 @@ export default function Challenges() {
                     style={{ ...inputStyle, resize: 'vertical' }}
                   />
                   <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                    <select value={createCategory} onChange={e => setCreateCategory(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
-                      {['General', 'Technical', 'Creative & Strategy', 'Data & Analysis', 'Product & Business'].map(c => (
-                        <option key={c}>{c}</option>
-                      ))}
-                    </select>
+                    <input
+                      type="text"
+                      placeholder="Category"
+                      value={createCategory}
+                      onChange={e => setCreateCategory(e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
                     <select value={createDifficulty} onChange={e => setCreateDifficulty(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
                       {['Beginner', 'Intermediate', 'Advanced'].map(d => <option key={d}>{d}</option>)}
                     </select>
@@ -604,6 +790,11 @@ export default function Challenges() {
                       </span>
                     </div>
                   )}
+                  <SectionsEditor
+                    sections={createSections}
+                    onChange={setCreateSections}
+                    disabled={creating || creatingDraft}
+                  />
                   {createMsg && <div style={{ fontSize: '12px', color: createMsg.includes('published') || createMsg.includes('saved') ? '#16A34A' : '#C8102E' }}>{createMsg}</div>}
                   <div style={{ display: 'flex', gap: '10px' }}>
                     <button
@@ -623,6 +814,7 @@ export default function Challenges() {
                   </div>
                 </div>
               </div>
+              )}
             </div>
           )}
 

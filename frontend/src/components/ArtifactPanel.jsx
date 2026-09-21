@@ -37,6 +37,7 @@ export default function ArtifactPanel({
   meId,
   groupSessionId,
   send,
+  connected,
   onRequestLock,
   onReleaseLock,
   onWrite,
@@ -67,10 +68,25 @@ export default function ArtifactPanel({
     onTracker?.(tracker)
   }, [onTracker, tracker])
 
-  // Replay anything still unacked whenever the socket comes back.
+  /**
+   * Replay anything still unacked whenever the socket comes back.
+   *
+   * Keyed on `connected`, NOT on `send`. A reconnect swaps wsRef.current in
+   * place and never remounts this pane, and `send` is a useCallback with no
+   * deps whose identity therefore never changes -- so an effect keyed on
+   * [send, tracker] ran exactly once, at mount, and no reconnect ever replayed
+   * anything. Reads buffered during a drop then sat in localStorage until the
+   * pane happened to remount (an in-app tab switch), and were destroyed
+   * outright by the clearAllReadBuffers() on logout. Silent loss of the primary
+   * read signal, concentrated in students with unstable connections.
+   *
+   * The mount case is covered too: `connected` is false until the socket opens,
+   * so the flush now waits for a socket that can actually carry it instead of
+   * firing into a CONNECTING one and silently no-opping.
+   */
   useEffect(() => {
-    if (send) tracker.flush()
-  }, [send, tracker])
+    if (connected && send) tracker.flush()
+  }, [connected, send, tracker])
 
   const lockFor = (key) => locks.find((l) => l.section_key === key) || null
 

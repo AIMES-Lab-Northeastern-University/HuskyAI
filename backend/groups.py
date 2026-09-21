@@ -20,7 +20,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from challenges import get_current_user, get_db, _assert_user_manages_classroom
-from turn_taking import session_turn_authors, share_pct
+from turn_taking import session_turn_authors, session_turn_taking, share_pct
 from database import (
     ClassroomChallenge,
     ClassroomMembership,
@@ -391,6 +391,46 @@ async def team_analytics(
     await _assert_user_manages_classroom(db, user_id, classroom_id)
     team = await _team_or_404(db, team_id, classroom_id, challenge_id)
     return await _team_analytics(db, team)
+
+
+@team_router.get("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/turn-taking")
+async def team_turn_taking(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: turn-taking metrics for one team, one entry per session.
+
+    Same numbers as /research/sessions/{id}/turn-taking, reached through a
+    different door. The research route is platform-admin and unscoped, because
+    it can read any session in the deployment; this one is scoped to a classroom
+    the caller actually manages, which is the same boundary the team's
+    contribution analytics already sits behind. Deliberately two endpoints
+    rather than one relaxed guard: widening the research route would hand every
+    instructor every section's data.
+
+    NOT aggregated across sessions. Alternation and read-before-write are
+    defined per session, and averaging rates over sessions of different lengths
+    would let a two-turn session outweigh a twenty-turn one. The caller gets the
+    per-session list and may not blend it.
+    """
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+
+    sessions = (
+        await db.execute(
+            select(GroupSession)
+            .where(GroupSession.group_id == team.id)
+            .order_by(GroupSession.session_number)
+        )
+    ).scalars().all()
+
+    return {
+        "team_id": team.id,
+        "sessions": [await session_turn_taking(db, s) for s in sessions],
+    }
 
 
 @team_router.post("/{classroom_id}/challenges/{challenge_id}/teams", status_code=201)

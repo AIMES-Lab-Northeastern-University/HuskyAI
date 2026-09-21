@@ -227,6 +227,11 @@ async def session_turn_taking(db: AsyncSession, session: GroupSession) -> dict:
         "conversation_turns": total,
         "turns_without_author": unattributed,
         "contribution": contribution,
+        # The turns in order, as user ids, with None kept for unattributed rows
+        # rather than dropped. A consumer drawing the sequence can then show the
+        # gap honestly instead of silently closing it and implying the two turns
+        # either side were adjacent.
+        "sequence": authors,
         "alternation": {
             # Primary: the shared conversation, which is what a "turn" means
             # everywhere else in the app.

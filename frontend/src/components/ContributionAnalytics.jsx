@@ -18,7 +18,9 @@ import InfoIcon from './InfoIcon'
 
 const AVATAR_COLORS = ['#C8102E', '#0D9488', '#7C3AED', '#D97706', '#2563EB', '#DB2777']
 
-function colorFor(name) {
+// Exported so a sibling panel gives the same person the same hue on the same
+// screen. Colour follows the entity, never its rank in a list.
+export function colorFor(name) {
   let h = 0
   for (const ch of (name || '')) h = (h * 31 + ch.charCodeAt(0)) >>> 0
   return AVATAR_COLORS[h % AVATAR_COLORS.length]
