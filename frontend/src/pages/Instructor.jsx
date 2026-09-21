@@ -88,7 +88,7 @@ function StudySettings({ cc, onSaved }) {
         body: JSON.stringify({ study_arm: arm, coach_prominence: prominence,
                                verification_policy: verification }),
       })
-      if (r.ok) { setMsg('Saved.'); onSaved?.() }
+      if (r.ok) { setMsg('Saved.'); onSaved?.(await r.json()) }
       else setMsg((await r.json()).detail || 'Could not save')
     } catch (e) { setMsg(String(e)) } finally { setSaving(false) }
   }
@@ -1624,7 +1624,9 @@ export default function Instructor() {
                                   <div style={{ marginTop: '10px', display: 'grid', gap: '10px' }}>
                                     <StudySettings
                                       cc={c}
-                                      onSaved={loadChallenges}
+                                      onSaved={(saved) => setChallenges(prev => prev.map(x =>
+                                        x.classroom_challenge_id === saved.classroom_challenge_id
+                                          ? { ...x, ...saved } : x))}
                                     />
                                     <CorpusManager
                                       classroomChallengeId={c.classroom_challenge_id}

@@ -52,8 +52,12 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
   useEffect(() => {
     clearInterval(pollRef.current)
     if (!corpus) return
-    const settling = corpus.status === 'building' ||
-      (corpus.documents || []).some(d => d.status === 'pending')
+    const docs = corpus.documents || []
+    // An empty corpus stays at "building" until the first upload, so polling on
+    // status alone would hit the API every 2.5s forever and re-render the panel
+    // for no reason. Only poll while a document is actually settling.
+    const settling = docs.length > 0 &&
+      (corpus.status === 'building' || docs.some(d => d.status === 'pending'))
     if (!settling) return
     pollRef.current = setInterval(() => load(corpus.id), 2500)
     return () => clearInterval(pollRef.current)
@@ -100,6 +104,8 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
     setCorpus(null)
   }
 
+  const docs = corpus?.documents || []
+
   if (!corpus) {
     return (
       <div className="border border-[#E7E0D8] rounded-[12px] p-4 bg-[#FDFCFB]" style={{ borderWidth: '1.5px' }}>
@@ -117,7 +123,6 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
     )
   }
 
-  const docs = corpus.documents || []
   const ready = docs.filter(d => d.status === 'ready').length
   const failed = docs.filter(d => d.status === 'failed')
 
@@ -129,9 +134,11 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
       </div>
 
       <p className="text-[12px] text-[#6B6560] leading-relaxed mb-3">
-        {corpus.status === 'ready'
-          ? `The evaluator scores student work against these ${ready} document${ready === 1 ? '' : 's'}.`
-          : 'Not in use yet — until indexing finishes, scoring falls back to the rubric only.'}
+        {docs.length === 0
+          ? 'No documents yet. Upload one below — scoring stays rubric-only until then.'
+          : corpus.status === 'ready'
+            ? `The evaluator scores student work against these ${ready} document${ready === 1 ? '' : 's'}.`
+            : 'Not in use yet — until indexing finishes, scoring falls back to the rubric only.'}
       </p>
 
       {docs.length > 0 && (
