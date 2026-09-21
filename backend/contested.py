@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from challenges import get_current_user, get_db
 from database import (ContestedPair, ContestedResponse, GroupMember, GroupSession,
-                      StudyEvent)
+                      StudyEvent, User)
 from events import log_event
 
 log = logging.getLogger("contested")
@@ -219,8 +219,10 @@ async def adopt(
 
     inspected_a, inspected_b = await derive_inspection(db, pair)
 
+    student = await db.get(User, user_id)
     resp = ContestedResponse(
         pair_id=pair_id, user_id=user_id, adopted=body.adopted,
+        consent_research=bool(student.consent_research) if student else False,
         inspected_a=inspected_a, inspected_b=inspected_b,
         dwell_ms_a=body.dwell_ms_a, dwell_ms_b=body.dwell_ms_b,
         rationale_text=body.rationale_text,

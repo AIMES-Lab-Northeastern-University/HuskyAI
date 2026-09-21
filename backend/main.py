@@ -37,6 +37,7 @@ from groups import router as groups_router, team_router as group_teams_router
 from corpus import router as corpus_router, resolve_corpus_store
 from verification import router as verification_router, assign_review
 from contested import router as contested_router
+from research_export import router as research_export_router
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / ".env")
@@ -222,6 +223,7 @@ app.include_router(groups_router)
 app.include_router(corpus_router)
 app.include_router(verification_router)
 app.include_router(contested_router)
+app.include_router(research_export_router)
 app.include_router(group_teams_router)
 
 BASE_SYSTEM_PROMPT = (

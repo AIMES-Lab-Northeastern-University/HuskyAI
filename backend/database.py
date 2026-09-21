@@ -504,6 +504,11 @@ class ContestedResponse(Base):
     dwell_ms_a: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dwell_ms_b: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rationale_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Consent snapshotted at write time, matching EvalResult and StudyEvent.
+    # A standing constraint of the study design: the export filters per row, so
+    # a row that never captured consent can only be exported by guessing, and a
+    # later toggle must not retroactively change what was exportable.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     responded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -560,6 +565,11 @@ class VerificationResponse(Base):
     checked_against_corpus: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     evidence_refs: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Consent snapshotted at write time, matching EvalResult and StudyEvent.
+    # A standing constraint of the study design: the export filters per row, so
+    # a row that never captured consent can only be exported by guessing, and a
+    # later toggle must not retroactively change what was exportable.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -799,6 +809,11 @@ class ArtifactRevision(Base):
     origin: Mapped[str] = mapped_column(String(32), nullable=False)
     bytes_added: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     bytes_removed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Consent snapshotted at write time, matching EvalResult and StudyEvent.
+    # A standing constraint of the study design: the export filters per row, so
+    # a row that never captured consent can only be exported by guessing, and a
+    # later toggle must not retroactively change what was exportable.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -817,6 +832,9 @@ _SQLITE_ADDED_COLUMNS = [
     ("eval_results", "is_graded_revision", "BOOLEAN NOT NULL DEFAULT 0"),
     ("eval_results", "grounding", "FLOAT"),
     ("classroom_challenges", "reference_corpus_id", "VARCHAR"),
+    ("artifact_revisions", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("verification_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
 ]
 
 
@@ -902,6 +920,12 @@ async def init_db():
                 "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS grounding FLOAT",
                 "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
                 "reference_corpus_id VARCHAR",
+                "ALTER TABLE artifact_revisions ADD COLUMN IF NOT EXISTS "
+                "consent_research BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE verification_responses ADD COLUMN IF NOT EXISTS "
+                "consent_research BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE contested_responses ADD COLUMN IF NOT EXISTS "
+                "consent_research BOOLEAN NOT NULL DEFAULT false",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens

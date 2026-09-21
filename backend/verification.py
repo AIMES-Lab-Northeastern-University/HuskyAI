@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from challenges import get_current_user, get_db
 from database import (ArtifactRevision, AsyncSessionLocal, GroupMember, GroupSession,
-                      StudyEvent, VerificationAssignment, VerificationResponse)
+                      StudyEvent, User, VerificationAssignment, VerificationResponse)
 from events import log_event
 
 log = logging.getLogger("verification")
@@ -281,9 +281,11 @@ async def respond(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Already reviewed")
 
+    reviewer = await db.get(User, user_id)
     resp = VerificationResponse(
         assignment_id=assignment_id,
         reviewer_user_id=user_id,
+        consent_research=bool(reviewer.consent_research) if reviewer else False,
         verdict=body.verdict,
         comment=body.comment,
         checked_against_corpus=body.checked_against_corpus,

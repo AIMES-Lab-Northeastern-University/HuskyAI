@@ -138,3 +138,32 @@ that disconnects the instant it receives its score cannot cancel the record.
   unique `(scope, seq)` constraint turns that into a retry rather than silent
   corruption, but multi-worker needs a DB sequence or Redis first.
 - **`role_label` is unpopulated** pending the role taxonomy decision.
+
+## Export
+
+`GET /research/sessions/{id}/export?format=json|jsonl` — instructor and admin
+only. Returns the ordered event log, artifact revision history, evaluations,
+verification and contested-input outcomes, and the computed turn-taking
+metrics, with schema and metrics versions travelling alongside the data.
+
+Three rules the bundle enforces:
+
+- **Consent is filtered per row from the snapshot each row captured at write
+  time**, never from the user's current setting. Withdrawing consent today must
+  not retroactively unexport turns shared last month; granting it must not
+  sweep in rows written without it. Every research table carries
+  `consent_research`: `eval_results`, `study_events`, `artifact_revisions`,
+  `verification_responses`, `contested_responses`.
+- **Turn-taking metrics are computed over the FULL session, not the
+  consent-filtered subset.** A contribution share computed over part of a team
+  is not that team's contribution share, and a reader could not detect the
+  difference. Metrics describe the session; the rows are what may be shared.
+- **`include_unconsented=true` is recorded in the bundle** as
+  `consent_filtered: false`, so an archived file can never be mistaken for a
+  consented one. It exists for an instructor reviewing their own section, not
+  for research use.
+
+Ids are pseudonymised with HMAC + `ANONYMIZE_SALT` (stable across exports, so
+longitudinal analysis works), and every student-authored free-text field goes
+through `anonymize.scrub()`. Scrubbing is best-effort pattern matching, not a
+guarantee — see `docs/data-anonymization.md` before sharing anything externally.

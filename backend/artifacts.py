@@ -35,6 +35,7 @@ from database import (
     AsyncSessionLocal,
     GroupChallenge,
     GroupSession,
+    User,
 )
 from events import forget_session as events_forget_session
 from events import log_event
@@ -308,6 +309,7 @@ async def write_section(
             section.updated_at = now
             section.updated_by_user_id = author_user_id
 
+            author = await db.get(User, author_user_id)
             revision = ArtifactRevision(
                 artifact_id=artifact_id,
                 section_id=section.id,
@@ -318,6 +320,7 @@ async def write_section(
                 origin=origin,
                 bytes_added=added,
                 bytes_removed=removed,
+                consent_research=bool(author.consent_research) if author else False,
             )
             db.add(revision)
             await db.flush()
