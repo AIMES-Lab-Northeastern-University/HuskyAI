@@ -2091,6 +2091,9 @@ async def coach_websocket_endpoint(
         "type": "session_init",
         "conversation_id": conversation_id,
         "group_id": group_id,
+        # The client needs this to fetch its review inbox and contested pairs;
+        # both are session-scoped and there is no other way to derive it.
+        "group_session_id": group_session_id,
         "session_num": session_num,
         "turn_count": len(state["history"]) // 2,
         "condition": condition,

@@ -413,7 +413,13 @@ async def list_classroom_linked_challenges(
     await _assert_can_manage_classroom(db, user_id, room)
     q = (
         select(Challenge, ClassroomChallenge.sort_order, ClassroomChallenge.mode,
-               ClassroomChallenge.team_min, ClassroomChallenge.team_max)
+               ClassroomChallenge.team_min, ClassroomChallenge.team_max,
+               # Study configuration, so the instructor UI can show and edit
+               # the arm, prominence and corpus without a second round trip.
+               ClassroomChallenge.id, ClassroomChallenge.study_arm,
+               ClassroomChallenge.coach_prominence,
+               ClassroomChallenge.verification_policy,
+               ClassroomChallenge.reference_corpus_id)
         .join(ClassroomChallenge, ClassroomChallenge.challenge_id == Challenge.id)
         .where(ClassroomChallenge.classroom_id == classroom_id)
         .order_by(ClassroomChallenge.sort_order, Challenge.title)
@@ -433,9 +439,63 @@ async def list_classroom_linked_challenges(
             "mode": mode or "solo",
             "team_min": int(team_min) if team_min is not None else 2,
             "team_max": int(team_max) if team_max is not None else 4,
+            "classroom_challenge_id": cc_id,
+            "study_arm": study_arm or "control_solo_feed",
+            "coach_prominence": coach_prominence or "on_request",
+            "verification_policy": verification_policy or "none",
+            "reference_corpus_id": reference_corpus_id,
         }
-        for c, sort_order, mode, team_min, team_max in result.all()
+        for (c, sort_order, mode, team_min, team_max, cc_id, study_arm,
+             coach_prominence, verification_policy, reference_corpus_id) in result.all()
     ]
+
+
+class StudySettingsBody(BaseModel):
+    study_arm: str | None = Field(None, pattern="^(control_solo_feed|collab_coach_artifact)$")
+    coach_prominence: str | None = Field(None, pattern="^(ambient|on_request|isolated)$")
+    verification_policy: str | None = Field(
+        None, pattern="^(none|round_robin|random|instructor_assigned)$"
+    )
+
+
+@router.patch("/assignments/{classroom_challenge_id}/study")
+async def update_study_settings(
+    classroom_challenge_id: str,
+    body: StudySettingsBody,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the experimental condition for one assignment.
+
+    Values are pattern-constrained rather than free strings: an unrecognised
+    condition would be silently normalised away by study_policy._clean at read
+    time, leaving a config row that says one thing and a session that does
+    another. Rejecting it here keeps the two in agreement.
+
+    Sessions already running keep the condition they resolved at connect, so a
+    mid-task change never shifts a student's condition underneath them.
+    """
+    cc = await db.get(ClassroomChallenge, classroom_challenge_id)
+    if cc is None:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    room = await db.get(Classroom, cc.classroom_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Section not found")
+    await _assert_can_manage_classroom(db, user_id, room)
+
+    if body.study_arm is not None:
+        cc.study_arm = body.study_arm
+    if body.coach_prominence is not None:
+        cc.coach_prominence = body.coach_prominence
+    if body.verification_policy is not None:
+        cc.verification_policy = body.verification_policy
+    await db.commit()
+    return {
+        "classroom_challenge_id": cc.id,
+        "study_arm": cc.study_arm,
+        "coach_prominence": cc.coach_prominence,
+        "verification_policy": cc.verification_policy,
+    }
 
 
 @router.get("/{classroom_id}/summary")

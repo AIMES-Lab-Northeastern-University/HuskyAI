@@ -196,3 +196,76 @@ async def test_classroom_analytics_instructor_200_student_forbidden(asgi_app):
         fake_stu = str(uuid.uuid4())
         nf = await client.get(f"/classrooms/{cid}/students/{fake_stu}/activity", headers=hi)
         assert nf.status_code == 404
+
+
+# ── Study settings (Phase 3/6 instructor controls) ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_study_settings_reject_an_unrecognised_condition():
+    """Pattern-constrained rather than free strings: an unknown value would be
+    normalised away by study_policy._clean at read time, leaving a config row
+    that says one thing and a session that does another."""
+    import uuid as _uuid
+
+    from httpx import ASGITransport, AsyncClient
+
+    from auth import create_token
+    from database import (AsyncSessionLocal, Challenge, Classroom, ClassroomChallenge,
+                          ClassroomMembership, User)
+    from main import app
+
+    async with AsyncSessionLocal() as db:
+        inst = User(email=f"ss_{_uuid.uuid4().hex[:8]}@e.com", name="I", password_hash="x")
+        db.add(inst); await db.flush()
+        room = Classroom(name="SS", join_code=_uuid.uuid4().hex[:8].upper(),
+                         instructor_user_id=inst.id)
+        ch = Challenge(title="SS", description="d", category="c", difficulty="e",
+                       sessions_data=[{}])
+        db.add_all([room, ch]); await db.flush()
+        db.add(ClassroomMembership(user_id=inst.id, classroom_id=room.id, role="instructor"))
+        cc = ClassroomChallenge(classroom_id=room.id, challenge_id=ch.id)
+        db.add(cc); await db.commit()
+        cc_id, tok = cc.id, create_token(inst.id)
+
+    hdr = {"Authorization": f"Bearer {tok}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        bad = await c.patch(f"/classrooms/assignments/{cc_id}/study",
+                            json={"coach_prominence": "very_loud"}, headers=hdr)
+        assert bad.status_code == 422
+
+        ok = await c.patch(f"/classrooms/assignments/{cc_id}/study",
+                           json={"study_arm": "collab_coach_artifact",
+                                 "coach_prominence": "isolated",
+                                 "verification_policy": "round_robin"}, headers=hdr)
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["coach_prominence"] == "isolated"
+
+
+@pytest.mark.asyncio
+async def test_only_a_section_instructor_can_change_study_settings():
+    import uuid as _uuid
+
+    from httpx import ASGITransport, AsyncClient
+
+    from auth import create_token
+    from database import (AsyncSessionLocal, Challenge, Classroom, ClassroomChallenge, User)
+    from main import app
+
+    async with AsyncSessionLocal() as db:
+        owner = User(email=f"so_{_uuid.uuid4().hex[:8]}@e.com", name="O", password_hash="x")
+        other = User(email=f"sx_{_uuid.uuid4().hex[:8]}@e.com", name="X", password_hash="x")
+        db.add_all([owner, other]); await db.flush()
+        room = Classroom(name="SS2", join_code=_uuid.uuid4().hex[:8].upper(),
+                         instructor_user_id=owner.id)
+        ch = Challenge(title="SS2", description="d", category="c", difficulty="e",
+                       sessions_data=[{}])
+        db.add_all([room, ch]); await db.flush()
+        cc = ClassroomChallenge(classroom_id=room.id, challenge_id=ch.id)
+        db.add(cc); await db.commit()
+        cc_id, tok = cc.id, create_token(other.id)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.patch(f"/classrooms/assignments/{cc_id}/study",
+                          json={"study_arm": "collab_coach_artifact"},
+                          headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 403

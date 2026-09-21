@@ -82,7 +82,34 @@ function fmtClock(ms) {
 }
 
 /* ─── Eval Panel ─── */
-function EvalSidebar({ evalData, isEvaluating, turnCount }) {
+function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed }) {
+  // A session can be configured to score every turn without showing the score.
+  // That is an experimental condition, not a failure, so it gets its own
+  // deliberate panel — an empty or errored-looking sidebar would read as the
+  // evaluator being broken and change how students behave for the wrong reason.
+  if (feedSuppressed) {
+    return (
+      <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col" style={{ borderLeftWidth: '1.5px' }}>
+        <div className="px-5 py-4 border-b border-[#E7E0D8] flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+          <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Evaluator</div>
+          {turnCount > 0 && <div className="text-[12px] text-[#9A948E] mt-0.5">Turn {turnCount}</div>}
+        </div>
+        <div className="p-5 flex flex-col gap-3">
+          <div className="bg-[#F7F3EE] border border-[#E7E0D8] rounded-[14px] p-5" style={{ borderWidth: '1.5px' }}>
+            <div className="text-[13px] font-bold text-[#16120E] mb-2">No feedback this session</div>
+            <p className="text-[13px] text-[#4A4440] leading-relaxed">
+              This session runs without the score panel. Your work is still being
+              recorded and evaluated — you just won't see the numbers while you work.
+            </p>
+            <p className="text-[12px] text-[#6B6560] leading-relaxed mt-3">
+              Rely on your own judgement about what makes a good prompt.
+            </p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   const pei = evalData?.scores?.PEI ?? 0
   const scores = evalData?.scores || {}
   const suggestions = evalData?.suggestions || []
@@ -407,6 +434,12 @@ export default function Workspace() {
   const [briefExpanded, setBriefExpanded] = useState(true)
   const [conversationId, setConversationId] = useState(null)
   const [sessionEnded, setSessionEnded]   = useState(false)
+  // Study arm (Phase 3). feedSuppressed: this session is scored server-side but
+  // the score is deliberately not shown. revisionRequired: the feed has been
+  // shown for the designated turn and the next submission is the one that counts.
+  const [feedSuppressed, setFeedSuppressed] = useState(false)
+  const [revisionRequired, setRevisionRequired] = useState(null)
+  const [revisionDone, setRevisionDone]   = useState(false)
   const [endingSession, setEndingSession] = useState(false)
   const [sessionScore, setSessionScore]   = useState(null)
   const [endReason, setEndReason]         = useState(null) // "manual" | "timer_expired" | null
@@ -606,6 +639,17 @@ export default function Workspace() {
         break
       }
       case 'eval_error': setIsEvaluating(false); break
+      case 'eval_suppressed':
+        // The turn WAS scored and stored — only the display is withheld. Shown
+        // as a deliberate state rather than silence, so a suppressed feed is
+        // never mistaken for the evaluator having failed.
+        setIsEvaluating(false)
+        setFeedSuppressed(true)
+        setTurnCount(t => t + 1)
+        break
+      case 'revision_required':
+        setRevisionRequired(data.after_turn ?? true)
+        break
       case 'citations': {
         // Arrives shortly after 'done', for the assistant message that was just
         // appended -- attach to the most recent assistant message.
@@ -825,7 +869,15 @@ export default function Workspace() {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     const outFiles = attachments.map(a => ({ filename: a.name, mime_type: a.mime, data: a.data }))
     setMessages(prev => [...prev, { role: 'user', content, attachments: fileChips }])
-    wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: outFiles }))
+    // When a revision is owed, this submission IS it — the scored artifact of
+    // record for the session. The server ignores the flag unless the assignment
+    // actually requires one, so a client cannot nominate its own graded turn.
+    const isRevision = Boolean(revisionRequired) && !revisionDone
+    wsRef.current.send(JSON.stringify({
+      type: 'message', content, attachments: outFiles,
+      ...(isRevision ? { is_revision: true } : {}),
+    }))
+    if (isRevision) { setRevisionDone(true); setRevisionRequired(null) }
     // Track this chat's running file usage so the next pick can be capped client-side.
     if (attachments.length) {
       setChatFiles(c => c + attachments.length)
@@ -833,7 +885,7 @@ export default function Workspace() {
     }
     setInput(''); setAttachments([])
     if (textareaRef.current) { textareaRef.current.style.height = 'auto' }
-  }, [input, attachments, pendingBytes, isStreaming, isTyping, isEvaluating, isDemo])
+  }, [input, attachments, pendingBytes, isStreaming, isTyping, isEvaluating, isDemo, revisionRequired, revisionDone])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
@@ -1102,7 +1154,26 @@ export default function Workspace() {
                   </div>
                 </div>
               ) : (
-                <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3" style={{ borderWidth: '1.5px' }}>
+                <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3"
+                     style={{ borderWidth: '1.5px',
+                              borderColor: revisionRequired && !revisionDone ? '#C8102E' : undefined }}>
+                  {/* Consequential revision (Phase 3). The next submission is the
+                      scored artifact of record, and the server refuses to complete
+                      the session without it — so the prompt has to be unmissable
+                      rather than a hint. */}
+                  {revisionRequired && !revisionDone && (
+                    <div className="mb-2.5 px-3 py-2 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]"
+                         style={{ borderWidth: '1.5px' }}>
+                      <div className="text-[12px] font-bold text-[#C8102E] mb-0.5">
+                        One revision required
+                      </div>
+                      <div className="text-[12px] text-[#4A4440] leading-relaxed">
+                        You've seen the feedback. Send one revised attempt — it replaces
+                        your score for this session, and the session can't be completed
+                        until you do.
+                      </div>
+                    </div>
+                  )}
                   {/* Pending attachments */}
                   {attachments.length > 0 && (
                     <div className="flex flex-wrap gap-1.5 mb-2.5">
@@ -1150,7 +1221,9 @@ export default function Workspace() {
                       value={input}
                       onChange={handleTextarea}
                       onKeyDown={handleKeyDown}
-                      placeholder={challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)'}
+                      placeholder={revisionRequired && !revisionDone
+                        ? 'Write your revised attempt — this one counts…'
+                        : (challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)')}
                       rows={1}
                       className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
                       style={{ fontFamily: "'DM Sans', sans-serif" }}
@@ -1177,7 +1250,7 @@ export default function Workspace() {
 
           {/* Eval panel */}
           <div className="w-[380px] flex-shrink-0 overflow-hidden">
-            <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} />
+            <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} />
           </div>
         </div>
       </div>

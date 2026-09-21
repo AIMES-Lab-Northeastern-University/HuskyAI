@@ -188,6 +188,10 @@ export default function CoachWorkspace() {
   const [sessionEnded, setEnded]      = useState(false)
   const [ending, setEnding]           = useState(false)
   const [summary, setSummary]         = useState(null)
+  const [groupSessionId, setGsId]     = useState(null)
+  const [inbox, setInbox]             = useState([])
+  const [pairs, setPairs]             = useState([])
+  const [inboxDirty, setInboxDirty]   = useState(0)
   const [recentEdits, setRecentEdits] = useState({})
 
   const wsRef        = useRef(null)
@@ -265,6 +269,7 @@ export default function CoachWorkspace() {
       case 'session_init':
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         if (data.condition) setCondition(data.condition)
+        if (data.group_session_id) setGsId(data.group_session_id)
         break
       case 'challenge_context': setCtx(data.data); break
       case 'history':
@@ -329,6 +334,10 @@ export default function CoachWorkspace() {
       case 'eval': setIsEval(false); setEvalData(data.data); setTurnCount(t => t + 1); break
       case 'eval_error': setIsEval(false); break
       case 'presence': if (Array.isArray(data.members)) setMembers(data.members); break
+      case 'verification_assigned':
+        // A teammate's save was routed to someone; refresh in case it is mine.
+        setInboxDirty(n => n + 1)
+        break
       case 'team_chat_history':
         if (Array.isArray(data.messages)) {
           setTeamChat(data.messages.map(m => ({
@@ -424,6 +433,48 @@ export default function CoachWorkspace() {
       setEnding(false)
     }
   }, [groupId, sessionNum])
+
+  // Review inbox and contested pairs. Polled on change rather than pushed:
+  // both are low-frequency, and a dedicated socket message for each would add
+  // two more frame types to a handler that already carries the measurement.
+  useEffect(() => {
+    if (!groupSessionId) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const [iRes, pRes] = await Promise.all([
+          fetch(`${API_URL}/verification/inbox/${groupSessionId}`, { headers: authHeaders() }),
+          fetch(`${API_URL}/contested/sessions/${groupSessionId}/mine`, { headers: authHeaders() }),
+        ])
+        if (cancelled) return
+        if (iRes.ok) setInbox((await iRes.json()).filter(x => !x.answered))
+        if (pRes.ok) setPairs((await pRes.json()).filter(x => !x.answered))
+      } catch (e) {
+        console.error('could not load review work', e)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [groupSessionId, inboxDirty])
+
+  const submitReview = useCallback(async (assignmentId, verdict) => {
+    try {
+      const r = await fetch(`${API_URL}/verification/${assignmentId}/respond`, {
+        method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ verdict }),
+      })
+      if (r.ok) setInbox(prev => prev.filter(x => x.assignment_id !== assignmentId))
+    } catch (e) { console.error('review failed', e) }
+  }, [])
+
+  const adoptOption = useCallback(async (pairId, adopted) => {
+    try {
+      const r = await fetch(`${API_URL}/contested/pairs/${pairId}/adopt`, {
+        method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adopted }),
+      })
+      if (r.ok) setPairs(prev => prev.filter(x => x.pair_id !== pairId))
+    } catch (e) { console.error('adopt failed', e) }
+  }, [])
 
   const nameFor = (uidStr) => {
     if (uidStr && user?.id === uidStr) return 'You'
@@ -597,6 +648,70 @@ export default function CoachWorkspace() {
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3 min-h-0">
+                {/* Contested input (Phase 4). Shown before the artifact because
+                    it is a decision the student owes, not reference material.
+                    The two options are deliberately unlabelled — saying which
+                    came from the coach would measure trust in the label. */}
+                {pairs.map(p => (
+                  <div key={p.pair_id} className="border border-[#D8B4FE] rounded-[12px] bg-[#FAF5FF] p-4"
+                       style={{ borderWidth: '1.5px' }}>
+                    <div className="text-[11px] font-bold text-[#7C3AED] uppercase tracking-[0.7px] mb-1">
+                      Two answers disagree
+                    </div>
+                    <div className="text-[12px] text-[#6B6560] mb-3">
+                      Section “{p.subproblem_key}”. Which do you go with?
+                    </div>
+                    {[['a', p.option_a], ['b', p.option_b]].map(([k, text]) => (
+                      <div key={k} className="mb-2 p-3 rounded-[10px] bg-white border border-[#E7E0D8]"
+                           style={{ borderWidth: '1.5px' }}>
+                        <div className="text-[13px] text-[#16120E] whitespace-pre-wrap mb-2">{text}</div>
+                        <button onClick={() => adoptOption(p.pair_id, k)}
+                                className="px-3 py-1 text-[12px] font-bold text-white bg-[#7C3AED] rounded-[8px] cursor-pointer">
+                          Use this one
+                        </button>
+                      </div>
+                    ))}
+                    <div className="flex gap-2 mt-1">
+                      <button onClick={() => adoptOption(p.pair_id, 'merged')}
+                              className="px-3 py-1 text-[12px] font-bold text-[#7C3AED] bg-white border border-[#D8B4FE] rounded-[8px] cursor-pointer"
+                              style={{ borderWidth: '1.5px' }}>Combine both</button>
+                      <button onClick={() => adoptOption(p.pair_id, 'neither')}
+                              className="px-3 py-1 text-[12px] font-bold text-[#6B6560] bg-white border border-[#E7E0D8] rounded-[8px] cursor-pointer"
+                              style={{ borderWidth: '1.5px' }}>Neither</button>
+                    </div>
+                  </div>
+                ))}
+
+                {/* Review inbox (Phase 5). Whether the reviewer actually reads
+                    the work is measured from their section reads, not from a
+                    checkbox here — so there deliberately isn't one. */}
+                {inbox.map(item => (
+                  <div key={item.assignment_id} className="border border-[#FDBA74] rounded-[12px] bg-[#FFF7ED] p-4"
+                       style={{ borderWidth: '1.5px' }}>
+                    <div className="text-[11px] font-bold text-[#D97706] uppercase tracking-[0.7px] mb-1">
+                      Review a teammate's work
+                    </div>
+                    <div className="text-[12px] text-[#6B6560] mb-2">
+                      Section “{item.section_key}”, v{item.version}
+                    </div>
+                    <div className="p-3 rounded-[10px] bg-white border border-[#E7E0D8] text-[13px] text-[#16120E] whitespace-pre-wrap mb-3"
+                         style={{ borderWidth: '1.5px' }}>
+                      {item.content || <span className="italic text-[#9A948E]">Empty</span>}
+                    </div>
+                    <div className="flex gap-2">
+                      {[['correct', 'Looks right', '#16A34A'],
+                        ['incorrect', 'Has a problem', '#C8102E'],
+                        ['unsure', 'Not sure', '#6B6560']].map(([v, label, col]) => (
+                        <button key={v} onClick={() => submitReview(item.assignment_id, v)}
+                                className="px-3 py-1.5 text-[12px] font-bold rounded-[8px] bg-white cursor-pointer"
+                                style={{ color: col, border: `1.5px solid ${col}40` }}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+
                 {!artifact && <div className="text-[13px] text-[#9A948E]">Loading…</div>}
                 {artifact?.sections?.map(s => (
                   <Section
