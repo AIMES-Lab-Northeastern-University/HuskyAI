@@ -308,7 +308,7 @@ async def write_section(
             section.updated_at = now
             section.updated_by_user_id = author_user_id
 
-            db.add(ArtifactRevision(
+            revision = ArtifactRevision(
                 artifact_id=artifact_id,
                 section_id=section.id,
                 section_key=section.key,
@@ -318,7 +318,10 @@ async def write_section(
                 origin=origin,
                 bytes_added=added,
                 bytes_removed=removed,
-            ))
+            )
+            db.add(revision)
+            await db.flush()
+            revision_id = revision.id
 
             artifact = await db.get(Artifact, artifact_id)
             if artifact is not None:
@@ -346,7 +349,13 @@ async def write_section(
         },
         **scope,
     )
-    return {"ok": True, "version": new_version, "bytes_added": added, "bytes_removed": removed}
+    return {
+        "ok": True, "version": new_version,
+        "bytes_added": added, "bytes_removed": removed,
+        # Returned so the caller can route this contribution for review (Phase 5)
+        # without re-querying for the revision it just created.
+        "revision_id": revision_id,
+    }
 
 
 async def revisions(group_session_id: str, section_key: str | None = None) -> list[dict]:

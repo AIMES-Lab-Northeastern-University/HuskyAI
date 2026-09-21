@@ -437,6 +437,62 @@ class GroupChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class VerificationAssignment(Base):
+    """One student's contribution routed to a teammate to check.
+
+    `target_section_key` is denormalised alongside the revision id because the
+    outcome is derived from read events, and a read names a section. Without it,
+    deciding whether the reviewer actually looked would need a join back through
+    the revision on every classification.
+    """
+
+    __tablename__ = "verification_assignments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    target_revision_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifact_revisions.id"), nullable=False, index=True
+    )
+    target_section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    reviewer_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    # none | round_robin | random | instructor_assigned — recorded per row so a
+    # mid-study policy change stays visible in the data rather than being
+    # inferred from a config table that has since moved on.
+    routing_policy: Mapped[str] = mapped_column(String(32), default="round_robin", nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    due_turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Stored status is only ever "pending" or "expired". Every other outcome is
+    # DERIVED from the response and the read log at classification time — a
+    # self-reported "completed" would record that a reviewer pressed a button,
+    # not that they read anything.
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+
+
+class VerificationResponse(Base):
+    """A reviewer's verdict. Note what is absent: no "did you read it?" field.
+
+    Whether the check actually happened is derived from read events, because a
+    self-report measures willingness to claim, not behaviour — and the whole
+    reason reads are first-class in the log is to make that distinction."""
+
+    __tablename__ = "verification_responses"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    assignment_id: Mapped[str] = mapped_column(
+        String, ForeignKey("verification_assignments.id"), nullable=False, index=True
+    )
+    reviewer_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)  # correct | incorrect | unsure
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    checked_against_corpus: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    evidence_refs: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ReferenceCorpus(Base):
     """Ground-truth material an instructor attaches to one assignment, which the
     evaluator scores student work against.

@@ -68,6 +68,19 @@ Three properties follow, and they are structural rather than conventional:
 |---|---|---|
 | `turn` | A completed coach turn is persisted. | `turn`, `pei` |
 
+### `target = verification` (Phase 5)
+
+| Action | Emitted when | Payload |
+|---|---|---|
+| `assigned` | A contribution is routed to a teammate. Written *before* the write is acked, so a client that closes immediately cannot leave a contribution unrouted. | `section_key`, `author`, `policy` |
+| `responded` | A reviewer submits a verdict. Whether they actually read the work is **not** recorded here — it is derived from their `section_expand` events. | `verdict`, `section_key` |
+
+Outcomes (`happened`, `skipped_unread`, `skipped_no_response`, `duplicated`,
+`expired`) are computed by `verification.classify`, never stored. A reviewer who
+answers without reading has told you they were willing to claim a check, not
+that they performed one; that distinction only survives because reads are
+first-class events sharing one sequence with writes.
+
 ### `target = feed` (control arm)
 
 Whether the PEI feed appeared **is** the intervention, so it is recorded per

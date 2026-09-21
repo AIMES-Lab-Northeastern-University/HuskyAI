@@ -116,7 +116,11 @@ async def test_stale_write_is_rejected_and_teammate_text_survives(db_ready):
         group_session_id=gs, section_key=k, content="Alice's analysis",
         author_user_id=alice, expected_version=0,
     )
-    assert first == {"ok": True, "version": 1, "bytes_added": 16, "bytes_removed": 0}
+    # Field-wise rather than exact-dict: the result grows over time (revision_id
+    # arrived with routed verification) and this test is about the write, not
+    # the payload's shape.
+    assert first["ok"] is True
+    assert (first["version"], first["bytes_added"], first["bytes_removed"]) == (1, 16, 0)
 
     # Bob was still looking at version 0.
     stale = await artifacts.write_section(

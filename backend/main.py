@@ -35,6 +35,7 @@ from classrooms import router as classrooms_router, seed_demo_classroom, seed_pi
 from admin import router as admin_router
 from groups import router as groups_router, team_router as group_teams_router
 from corpus import router as corpus_router, resolve_corpus_store
+from verification import router as verification_router, assign_review
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / ".env")
@@ -218,6 +219,7 @@ app.include_router(classrooms_router)
 app.include_router(admin_router)
 app.include_router(groups_router)
 app.include_router(corpus_router)
+app.include_router(verification_router)
 app.include_router(group_teams_router)
 
 BASE_SYSTEM_PROMPT = (
@@ -2203,12 +2205,33 @@ async def coach_websocket_endpoint(
                 # teammates get it via artifact_updated, but the sender is excluded
                 # from that broadcast, so without this the author's own section
                 # renders as empty until they reload.
+                # Route for review BEFORE acking, for the same reason the feed
+                # events are logged before notifying: a client that closes the
+                # moment it sees its save confirmed would otherwise cancel this,
+                # and the contribution would silently never be assigned to
+                # anyone. Inert unless the assignment sets a verification_policy,
+                # and wrapped so a routing failure never costs a student text
+                # that is already committed.
+                assignment_id = None
+                if policy.verification_policy != "none" and result.get("revision_id"):
+                    try:
+                        assignment_id = await assign_review(
+                            group_session_id, result["revision_id"], key, user_id,
+                            policy=policy.verification_policy,
+                        )
+                    except Exception as e:
+                        log.error(f"[WS-COACH] could not route review: {e}")
+
                 await websocket.send_text(json.dumps({
                     "type": "artifact_write_ok",
                     "section_key": key,
                     "version": result["version"],
                     "content": content,
                 }))
+                if assignment_id:
+                    await room.broadcast({"type": "verification_assigned",
+                                          "assignment_id": assignment_id,
+                                          "section_key": key})
                 # Teammates see the change live. This is a render, not a read —
                 # their client emits artifact_expand if a person actually looks.
                 await room.broadcast(
