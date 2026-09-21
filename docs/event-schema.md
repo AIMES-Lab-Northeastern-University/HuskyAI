@@ -81,6 +81,28 @@ answers without reading has told you they were willing to claim a check, not
 that they performed one; that distinction only survives because reads are
 first-class events sharing one sequence with writes.
 
+### `target = contested` (Phase 4)
+
+| Action | Emitted when | Payload |
+|---|---|---|
+| `surfaced` | A scripted divergent pair is shown to a student. | `subproblem_key` |
+| `adopted` | The student picks a side. | `adopted` (a/b/neither/merged), `inspected_a`, `inspected_b`, `uninspected`, `subproblem_key` |
+
+The subproblem is the artifact section key — choosing a sectioned artifact is
+what answered the plan's blocking question about how two contributions are
+known to address the same subproblem.
+
+`inspected_a` / `inspected_b` are **derived from the log**, never asked of the
+student, and the windows start when the pair was surfaced: reading the section
+before the pair existed is not inspecting this contested option. `uninspected:
+true` is the case the phase exists to catch — a student taking a side without
+opening either answer.
+
+Option A is always the human contribution and option B always the coach output,
+fixed so "adopted A" means the same thing in every row. The API does not label
+which is which, because labelling the source would measure trust in labels
+rather than in the work.
+
 ### `target = feed` (control arm)
 
 Whether the PEI feed appeared **is** the intervention, so it is recorded per

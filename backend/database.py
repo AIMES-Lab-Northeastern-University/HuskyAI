@@ -437,6 +437,76 @@ class GroupChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class ContestedPair(Base):
+    """Two answers to the same subproblem that disagree: one from a teammate,
+    one from the student's own coach.
+
+    `subproblem_key` is the artifact section key. That is what made this phase
+    buildable — the build plan lists "how does the system know two contributions
+    address the same subproblem?" as a blocking open question, and choosing a
+    sectioned artifact answered it without inventing a second decomposition.
+
+    Option A is always the human contribution and option B always the coach
+    output. Fixing the order matters: if it varied, "adopted A" would mean
+    different things in different rows and the adoption rate would be
+    uninterpretable. Presentation order is a separate UI concern.
+    """
+
+    __tablename__ = "contested_pairs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    subproblem_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    # A: a teammate's artifact revision. B: a coach message.
+    option_a_revision_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("artifact_revisions.id"), nullable=True
+    )
+    option_a_text: Mapped[str] = mapped_column(Text, nullable=False)
+    option_b_message_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("messages.id"), nullable=True
+    )
+    option_b_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # instructor_scripted | auto_detected. Scripted is study v1: deterministic,
+    # reliably triggered, and comparable across teams, which matters more than
+    # realism for a first run.
+    origin: Mapped[str] = mapped_column(String(32), default="instructor_scripted", nullable=False)
+    # Which option the ground truth actually supports, when a reference corpus
+    # makes that knowable. NULL when unknown — adoption is then a preference,
+    # not an accuracy.
+    better_option: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    surfaced_to_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False, index=True
+    )
+    surfaced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ContestedResponse(Base):
+    """What the student did when the two answers disagreed.
+
+    `inspected_a` / `inspected_b` are DERIVED from the event log at submission
+    time, never asked of the student. A self-report measures willingness to
+    claim, and the case worth catching is the student who adopts an option
+    without opening either — an uninspected adoption."""
+
+    __tablename__ = "contested_responses"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    pair_id: Mapped[str] = mapped_column(
+        String, ForeignKey("contested_pairs.id"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    adopted: Mapped[str] = mapped_column(String(16), nullable=False)  # a | b | neither | merged
+    inspected_a: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    inspected_b: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    dwell_ms_a: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dwell_ms_b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rationale_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    responded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class VerificationAssignment(Base):
     """One student's contribution routed to a teammate to check.
 
