@@ -354,15 +354,30 @@ export default function ChallengeDetail() {
                     <p style={{ fontSize: '13px', color: '#4A4440', lineHeight: 1.7, margin: '4px 0 14px' }}>
                       You're on a team with {challenge.group.member_names.filter(n => n !== myName).join(', ') || 'your teammates'}.
                     </p>
-                    <button
-                      onClick={() => navigate(`/group/${challenge.group.group_id}`)}
-                      style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', background: '#7C3AED', color: '#fff', border: 'none', borderRadius: '9px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                      </svg>
-                      Open group challenge
-                    </button>
+                    {/* Arm-driven: the section's study_arm decides which workspace
+                        a student enters. Offering both would let two students in the
+                        same section experience different conditions. */}
+                    {challenge.group.study_arm === 'collab_coach_artifact' ? (
+                      <button
+                        onClick={() => navigate(`/coach/${challenge.group.group_id}`)}
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', background: '#7C3AED', color: '#fff', border: 'none', borderRadius: '9px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+                        </svg>
+                        Open team workspace
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => navigate(`/group/${challenge.group.group_id}`)}
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', background: '#7C3AED', color: '#fff', border: 'none', borderRadius: '9px', padding: '9px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                        </svg>
+                        Open group challenge
+                      </button>
+                    )}
                   </>
                 ) : (
                   <p style={{ fontSize: '13px', color: '#4A4440', lineHeight: 1.7, margin: '10px 0 0' }}>

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
+import CorpusManager from '../components/CorpusManager'
+import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 
 const STUDENTS = [
@@ -65,6 +67,89 @@ function initialsFromName(name) {
   return s.slice(0, 2).toUpperCase()
 }
 
+/* Per-assignment study configuration (Phases 3 and 6).
+ *
+ * These were previously settable only by editing the database, which meant the
+ * study could not actually be run by an instructor. Every control defaults to
+ * today's behaviour, and the copy says what each setting does to the student
+ * rather than naming the phase it came from. */
+function StudySettings({ cc, onSaved }) {
+  const [arm, setArm] = useState(cc.study_arm || 'control_solo_feed')
+  const [prominence, setProminence] = useState(cc.coach_prominence || 'on_request')
+  const [verification, setVerification] = useState(cc.verification_policy || 'none')
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState(null)
+
+  const save = async () => {
+    setSaving(true); setMsg(null)
+    try {
+      const r = await fetch(`${API_URL}/classrooms/assignments/${cc.classroom_challenge_id}/study`, {
+        method: 'PATCH',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ study_arm: arm, coach_prominence: prominence,
+                               verification_policy: verification }),
+      })
+      if (r.ok) { setMsg('Saved.'); onSaved?.(await r.json()) }
+      else setMsg((await r.json()).detail || 'Could not save')
+    } catch (e) { setMsg(String(e)) } finally { setSaving(false) }
+  }
+
+  const sel = { fontSize: '12px', padding: '5px 8px', borderRadius: '7px',
+                border: '1.5px solid #E7E0D8', background: '#fff', color: '#16120E' }
+  const row = { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }
+  const lbl = { fontSize: '12px', color: '#4A4440', width: '150px', flexShrink: 0 }
+
+  return (
+    <div style={{ border: '1.5px solid #E7E0D8', borderRadius: '12px', padding: '16px',
+                  background: '#FDFCFB' }}>
+      <div style={{ fontSize: '13px', fontWeight: 700, color: '#16120E', marginBottom: '10px' }}>
+        Study settings
+      </div>
+
+      <div style={row}>
+        <span style={lbl}>Workspace</span>
+        <select value={arm} onChange={e => setArm(e.target.value)} style={sel}>
+          <option value="control_solo_feed">Solo chat with score feed</option>
+          <option value="collab_coach_artifact">Private coach each + shared document</option>
+        </select>
+      </div>
+
+      <div style={row}>
+        <span style={lbl}>Coach behaviour</span>
+        <select value={prominence} onChange={e => setProminence(e.target.value)} style={sel}>
+          <option value="on_request">Answers when asked</option>
+          <option value="ambient">Reacts to the document unprompted</option>
+          <option value="isolated">Cannot see the team's document</option>
+        </select>
+      </div>
+
+      <div style={row}>
+        <span style={lbl}>Peer review</span>
+        <select value={verification} onChange={e => setVerification(e.target.value)} style={sel}>
+          <option value="none">Off</option>
+          <option value="round_robin">Round robin</option>
+          <option value="random">Random teammate</option>
+          <option value="instructor_assigned">I assign manually</option>
+        </select>
+      </div>
+
+      <div style={{ fontSize: '11px', color: '#9A948E', lineHeight: 1.6, marginTop: '4px' }}>
+        Changing these affects new sessions. Sessions already in progress keep the
+        settings they started with, so a student's conditions never shift mid-task.
+      </div>
+
+      <button onClick={save} disabled={saving}
+              style={{ marginTop: '10px', background: '#C8102E', color: '#fff', border: 'none',
+                       borderRadius: '8px', padding: '6px 14px', fontSize: '12px',
+                       fontWeight: 600, cursor: 'pointer', opacity: saving ? 0.5 : 1 }}>
+        {saving ? 'Saving…' : 'Save study settings'}
+      </button>
+      {msg && <span style={{ fontSize: '12px', color: '#6B6560', marginLeft: '10px' }}>{msg}</span>}
+    </div>
+  )
+}
+
+
 export default function Instructor() {
   const navigate = useNavigate()
   const location = useLocation()
@@ -92,9 +177,15 @@ export default function Instructor() {
   const [createTeamMin, setCreateTeamMin] = useState(2)
   const [createTeamMax, setCreateTeamMax] = useState(4)
   const [manageTeamsId, setManageTeamsId] = useState(null)
+  const [studySettingsId, setStudySettingsId] = useState(null)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
+  // Shared-artifact sections. One list per challenge, applied to every session
+  // by the API — see SectionsEditor and challenges.py::_apply_sections.
+  const [createSections, setCreateSections] = useState([])
+  const [editSections, setEditSections] = useState([])
+
   const [editingId, setEditingId] = useState(null)
   const [editTitle, setEditTitle] = useState('')
   const [editDesc, setEditDesc] = useState('')
@@ -379,6 +470,11 @@ export default function Instructor() {
       setActionMsg('Title and description are required')
       return
     }
+    const secProblem = sectionsProblem(editSections)
+    if (secProblem) {
+      setActionMsg(secProblem)
+      return
+    }
     setActionMsg('')
     try {
       const r = await fetch(`${API_URL}/challenges/${challengeId}`, {
@@ -389,6 +485,13 @@ export default function Instructor() {
           description,
           time_limit_minutes: editTimed ? editTimeLimit : null,
           min_turns: editTimed ? editMinTurns : null,
+          // Always sent, so clearing every section clears the decomposition.
+          // The API distinguishes an explicit [] from an absent field.
+          sections: editSections.map(s => ({
+            key: (s.key || '').trim(),
+            title: (s.title || '').trim(),
+            prompt: (s.prompt || '').trim(),
+          })),
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -463,6 +566,11 @@ export default function Instructor() {
       }
       weekNum = n
     }
+    const secProblem = sectionsProblem(createSections)
+    if (secProblem) {
+      setCreateMsg(secProblem)
+      return
+    }
     setCreateMsg('')
     if (publish) setCreating(true)
     else setCreatingDraft(true)
@@ -484,6 +592,11 @@ export default function Instructor() {
           mode: createGroup ? 'group' : 'solo',
           team_min: createTeamMin,
           team_max: createTeamMax,
+          sections: createSections.map(s => ({
+            key: (s.key || '').trim(),
+            title: (s.title || '').trim(),
+            prompt: (s.prompt || '').trim(),
+          })),
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -497,6 +610,7 @@ export default function Instructor() {
       setCreateTitle('')
       setCreateDesc('')
       setCreateWeek('')
+      setCreateSections([])
       await loadChallenges()
     } catch {
       setCreateMsg('Network error')
@@ -1415,6 +1529,10 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
+                                        <SectionsEditor
+                                          sections={editSections}
+                                          onChange={setEditSections}
+                                        />
                                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                                           <button
                                             type="button"
@@ -1467,6 +1585,9 @@ export default function Instructor() {
                                             setEditTimed(c.time_limit_minutes != null || c.min_turns != null)
                                             setEditTimeLimit(c.time_limit_minutes ?? 15)
                                             setEditMinTurns(c.min_turns ?? 5)
+                                            // Copied, not aliased: editing rows
+                                            // must not mutate the loaded list.
+                                            setEditSections((c.sections || []).map(s => ({ ...s })))
                                           }}
                                           style={btnSm}
                                         >
@@ -1518,10 +1639,36 @@ export default function Instructor() {
                                     >
                                       Try flow
                                     </button>
+                                    {!isDemo && c.classroom_challenge_id && (
+                                      <button
+                                        onClick={() => setStudySettingsId(
+                                          studySettingsId === c.id ? null : c.id)}
+                                        style={{ background: 'none', border: '1px solid #E7E0D8',
+                                                 borderRadius: '7px', padding: '4px 10px',
+                                                 fontSize: '11px', fontWeight: 600,
+                                                 color: '#6B6560', cursor: 'pointer' }}
+                                      >
+                                        {studySettingsId === c.id ? 'Hide study settings' : 'Study settings'}
+                                      </button>
+                                    )}
                                   </div>
                                 </div>
                                 {c.mode === 'group' && !isDemo && manageTeamsId === c.id && (
                                   <GroupTeamManager classroomId={selectedId} challengeId={c.id} />
+                                )}
+                                {!isDemo && studySettingsId === c.id && c.classroom_challenge_id && (
+                                  <div style={{ marginTop: '10px', display: 'grid', gap: '10px' }}>
+                                    <StudySettings
+                                      cc={c}
+                                      onSaved={(saved) => setChallenges(prev => prev.map(x =>
+                                        x.classroom_challenge_id === saved.classroom_challenge_id
+                                          ? { ...x, ...saved } : x))}
+                                    />
+                                    <CorpusManager
+                                      classroomChallengeId={c.classroom_challenge_id}
+                                      corpusId={c.reference_corpus_id}
+                                    />
+                                  </div>
                                 )}
                               </div>
                             )
@@ -1634,6 +1781,11 @@ export default function Instructor() {
                             </span>
                           </div>
                         )}
+                        <SectionsEditor
+                          sections={createSections}
+                          onChange={setCreateSections}
+                          disabled={creating || creatingDraft}
+                        />
                         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                           <button
                             type="button"

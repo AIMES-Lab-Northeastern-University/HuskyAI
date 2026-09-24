@@ -19,6 +19,7 @@ import RequirePlatformAdmin from './components/RequirePlatformAdmin'
 import ConsentGate from './components/ConsentGate'
 import Admin from './pages/Admin'
 import GroupChat from './pages/GroupChat'
+import CoachWorkspace from './pages/CoachWorkspace'
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
@@ -68,6 +69,8 @@ export default function App() {
         <Route path="/admin"       element={<RequireAuth><RequirePlatformAdmin><Admin /></RequirePlatformAdmin></RequireAuth>} />
         <Route path="/settings"    element={<RequireAuth><Settings /></RequireAuth>} />
         <Route path="/group/:id"   element={<RequireAuth><GroupChat /></RequireAuth>} />
+        {/* Collaborative study arm: private coach per student + one shared artifact. */}
+        <Route path="/coach/:id"   element={<RequireAuth><CoachWorkspace /></RequireAuth>} />
 
         {/* Redirects */}
         <Route path="/app"  element={<Navigate to="/workspace" replace />} />

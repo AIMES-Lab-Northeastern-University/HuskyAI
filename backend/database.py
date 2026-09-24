@@ -27,7 +27,14 @@ _ca = engine_connect_args(_db_url)
 if _ca:
     _engine_kw["connect_args"] = _ca
 
-if is_transaction_pooler(_db_url):
+if _db_url.startswith("sqlite"):
+    # aiosqlite ties each connection to the event loop that opened it, and a
+    # pooled connection handed to a different loop deadlocks rather than erroring.
+    # That bites local dev and the test suite, where setup, a TestClient's
+    # portal loop, and assertions each run their own loop. NullPool opens per
+    # checkout, so a connection never crosses loops. Cheap for a local file DB.
+    _engine_kw["poolclass"] = NullPool
+elif is_transaction_pooler(_db_url):
     # Transaction pooler (Supavisor :6543) does its own connection pooling and
     # rotates server connections per transaction, so a client-side pool would just
     # pin connections and re-introduce the session-mode 'max clients' cap. Use
@@ -128,6 +135,14 @@ class Conversation(Base):
     group_session_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("group_sessions.id"), nullable=True, index=True
     )
+    # What this conversation *is*:
+    #   solo          - the single-user control arm (user_id set, no group session)
+    #   group_shared  - the legacy one-conversation-per-team chat (/ws/group)
+    #   coach_private - one student's private coach inside a group session
+    # A private coach needs no new table: it is a Conversation with BOTH user_id
+    # (whose coach it is) and group_session_id (which team session it belongs to).
+    # Defaults to "solo" so every pre-existing row keeps its meaning.
+    kind: Mapped[str] = mapped_column(String(16), default="solo", nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -188,6 +203,10 @@ class EvalResult(Base):
     tsi: Mapped[float | None] = mapped_column(Float, nullable=True)
     clm: Mapped[float | None] = mapped_column(Float, nullable=True)
     ras: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Does the work cover and stay faithful to the assignment's reference corpus?
+    # NULL when no corpus is attached, so existing rows and corpus-free
+    # assignments are indistinguishable from before this column existed.
+    grounding: Mapped[float | None] = mapped_column(Float, nullable=True)
     classification: Mapped[str | None] = mapped_column(String(64), nullable=True)
     leading_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     full_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -195,6 +214,10 @@ class EvalResult(Base):
     # Consent is captured per turn (the export unit) so it is immune to mid-session
     # toggles and resumed conversations. The export's consent filter reads this.
     consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Marks the consequential post-feed revision: the scored artifact of record
+    # for that session. The pre-revision score is retained as its own row, so
+    # the delta between seeing the feed and acting on it stays measurable.
+    is_graded_revision: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -281,6 +304,37 @@ class ClassroomChallenge(Base):
     mode: Mapped[str] = mapped_column(String(16), default="solo", nullable=False)  # solo | group
     team_min: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     team_max: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+
+    # ---- Collaborative-study configuration -------------------------------
+    # Every flag below defaults to today's behaviour, so an assignment that
+    # predates the study is unchanged and no section is silently enrolled.
+
+    # Which arm this section runs:
+    #   control_solo_feed     - the existing single-user chat + PEI feed
+    #   collab_coach_artifact - per-student private coaches + one shared artifact
+    study_arm: Mapped[str] = mapped_column(
+        String(32), default="control_solo_feed", nullable=False
+    )
+    # How prominent the coach is. An experimental condition, not a product
+    # choice — resolved once per session into a CoachPolicy (see main.py).
+    #   ambient    - reacts to artifact changes unprompted, visible in the shared space
+    #   on_request - responds only when addressed (today's behaviour)
+    #   isolated   - reachable, but its output never flows into the artifact
+    #                automatically; importing it takes an explicit, logged copy
+    coach_prominence: Mapped[str] = mapped_column(
+        String(16), default="on_request", nullable=False
+    )
+    # Post-feed revision rules for the control arm, e.g.
+    # {"require_revision_on_turn": 3, "graded": "revision"}. NULL = no revision
+    # step, which is how every existing assignment behaves.
+    revision_policy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Who reviews whose work (Phase 5): none | round_robin | random | instructor_assigned
+    verification_policy: Mapped[str] = mapped_column(
+        String(32), default="none", nullable=False
+    )
+    # Ground-truth material the evaluator scores against. NULL = today's
+    # behaviour: the rubric vector store only, and a null grounding score.
+    reference_corpus_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class InstructorTestEnrollment(Base):
@@ -383,9 +437,434 @@ class GroupChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class ContestedPair(Base):
+    """Two answers to the same subproblem that disagree: one from a teammate,
+    one from the student's own coach.
+
+    `subproblem_key` is the artifact section key. That is what made this phase
+    buildable — the build plan lists "how does the system know two contributions
+    address the same subproblem?" as a blocking open question, and choosing a
+    sectioned artifact answered it without inventing a second decomposition.
+
+    Option A is always the human contribution and option B always the coach
+    output. Fixing the order matters: if it varied, "adopted A" would mean
+    different things in different rows and the adoption rate would be
+    uninterpretable. Presentation order is a separate UI concern.
+    """
+
+    __tablename__ = "contested_pairs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    subproblem_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    # A: a teammate's artifact revision. B: a coach message.
+    option_a_revision_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("artifact_revisions.id"), nullable=True
+    )
+    option_a_text: Mapped[str] = mapped_column(Text, nullable=False)
+    option_b_message_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("messages.id"), nullable=True
+    )
+    option_b_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # instructor_scripted | auto_detected. Scripted is study v1: deterministic,
+    # reliably triggered, and comparable across teams, which matters more than
+    # realism for a first run.
+    origin: Mapped[str] = mapped_column(String(32), default="instructor_scripted", nullable=False)
+    # Which option the ground truth actually supports, when a reference corpus
+    # makes that knowable. NULL when unknown — adoption is then a preference,
+    # not an accuracy.
+    better_option: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    surfaced_to_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False, index=True
+    )
+    surfaced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ContestedResponse(Base):
+    """What the student did when the two answers disagreed.
+
+    `inspected_a` / `inspected_b` are DERIVED from the event log at submission
+    time, never asked of the student. A self-report measures willingness to
+    claim, and the case worth catching is the student who adopts an option
+    without opening either — an uninspected adoption."""
+
+    __tablename__ = "contested_responses"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    pair_id: Mapped[str] = mapped_column(
+        String, ForeignKey("contested_pairs.id"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    adopted: Mapped[str] = mapped_column(String(16), nullable=False)  # a | b | neither | merged
+    inspected_a: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    inspected_b: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    dwell_ms_a: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dwell_ms_b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rationale_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Consent snapshotted at write time, matching EvalResult and StudyEvent.
+    # A standing constraint of the study design: the export filters per row, so
+    # a row that never captured consent can only be exported by guessing, and a
+    # later toggle must not retroactively change what was exportable.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    responded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class VerificationAssignment(Base):
+    """One student's contribution routed to a teammate to check.
+
+    `target_section_key` is denormalised alongside the revision id because the
+    outcome is derived from read events, and a read names a section. Without it,
+    deciding whether the reviewer actually looked would need a join back through
+    the revision on every classification.
+    """
+
+    __tablename__ = "verification_assignments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    target_revision_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifact_revisions.id"), nullable=False, index=True
+    )
+    target_section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    reviewer_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    # none | round_robin | random | instructor_assigned — recorded per row so a
+    # mid-study policy change stays visible in the data rather than being
+    # inferred from a config table that has since moved on.
+    routing_policy: Mapped[str] = mapped_column(String(32), default="round_robin", nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    due_turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Stored status is only ever "pending" or "expired". Every other outcome is
+    # DERIVED from the response and the read log at classification time — a
+    # self-reported "completed" would record that a reviewer pressed a button,
+    # not that they read anything.
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+
+
+class VerificationResponse(Base):
+    """A reviewer's verdict. Note what is absent: no "did you read it?" field.
+
+    Whether the check actually happened is derived from read events, because a
+    self-report measures willingness to claim, not behaviour — and the whole
+    reason reads are first-class in the log is to make that distinction."""
+
+    __tablename__ = "verification_responses"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    assignment_id: Mapped[str] = mapped_column(
+        String, ForeignKey("verification_assignments.id"), nullable=False, index=True
+    )
+    reviewer_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)  # correct | incorrect | unsure
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    checked_against_corpus: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    evidence_refs: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Consent snapshotted at write time, matching EvalResult and StudyEvent.
+    # A standing constraint of the study design: the export filters per row, so
+    # a row that never captured consent can only be exported by guessing, and a
+    # later toggle must not retroactively change what was exportable.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ReferenceCorpus(Base):
+    """Ground-truth material an instructor attaches to one assignment, which the
+    evaluator scores student work against.
+
+    Scoped to a ClassroomChallenge rather than a Challenge: the same challenge
+    can carry different corpora in different sections, which is what makes a
+    corpus an experimental variable rather than a property of the task.
+
+    Retrofittable by design. `evaluate_conversation_v3` scores a stored
+    conversation history, so a corpus attached in week 6 can re-score every
+    archived transcript from week 1 — which is why this is Phase 2 and the event
+    log is Phase 1. A read that went unlogged is gone; a missing score is not.
+    """
+
+    __tablename__ = "reference_corpora"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    classroom_challenge_id: Mapped[str] = mapped_column(
+        String, ForeignKey("classroom_challenges.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # The OpenAI vector store backing this corpus. NULL until ingestion creates it.
+    openai_vector_store_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # building | ready | failed. The evaluator only uses a corpus that is ready,
+    # so a half-indexed corpus degrades to rubric-only scoring rather than
+    # silently grading against a partial set of documents.
+    status: Mapped[str] = mapped_column(String(16), default="building", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CorpusDocument(Base):
+    """One uploaded ground-truth file.
+
+    Bytes are stored inline, mirroring the Attachment table's decision: the
+    deploy target has an ephemeral filesystem, so anything not in the database
+    is gone on the next restart. Keeping the bytes also means a corpus can be
+    re-ingested into a fresh vector store without asking the instructor to
+    re-upload.
+    """
+
+    __tablename__ = "corpus_documents"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    corpus_id: Mapped[str] = mapped_column(
+        String, ForeignKey("reference_corpora.id"), nullable=False, index=True
+    )
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    openai_file_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # pending | ready | failed
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    uploaded_by_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StudyEvent(Base):
+    """The collaborative-study event log: one ordered, append-only record of every
+    action in a session — including *reads* of a teammate's work.
+
+    Why this table exists at all: `artifact_revision` and `messages` answer who
+    wrote what, but only this log answers who looked at whose work before writing,
+    which is the question the study is asking. A read that goes unrecorded cannot
+    be reconstructed from a database of final states, so this log is the one part
+    of the design that must be right the first time.
+
+    Three rules this schema enforces, and the reasons they are structural rather
+    than conventional (see docs/collab-study-build-plan.md, "The read requirement"):
+
+    - **Reads and writes share one sequence space.** `seq` is monotonic per
+      session and assigned server-side (see events.py::log_event), so whether a
+      student read a teammate's contribution *before* or *after* writing their own
+      is answerable. Reads in a side table with their own clock could not answer it.
+    - **No sampling.** `idempotency_key` is unique, so client delivery can be
+      at-least-once and dedupe on ingest. Under-recording is not a tunable.
+    - **client_ts is never trusted for ordering.** It is kept for latency analysis
+      only; `seq` and `server_ts` are authoritative.
+
+    A row is scoped to exactly one session: `group_session_id` for collaborative
+    work, `user_challenge_session_id` for the solo control arm.
+    """
+
+    __tablename__ = "study_events"
+    __table_args__ = (
+        # One seq per session scope. Two constraints rather than one because a row
+        # belongs to exactly one scope and the other column is NULL; both engines
+        # treat NULLs as distinct, so the unused constraint never collides.
+        UniqueConstraint("group_session_id", "seq", name="uq_study_event_group_seq"),
+        UniqueConstraint("user_challenge_session_id", "seq", name="uq_study_event_solo_seq"),
+        UniqueConstraint("idempotency_key", name="uq_study_event_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    # Session scope: exactly one of these is set (enforced in events.py::log_event).
+    group_session_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=True, index=True
+    )
+    user_challenge_session_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("user_challenge_sessions.id"), nullable=True, index=True
+    )
+    # Denormalised for analysis-time filtering without a four-table join.
+    classroom_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("classrooms.id"), nullable=True, index=True
+    )
+    challenge_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("challenges.id"), nullable=True, index=True
+    )
+
+    # Monotonic per session, assigned server-side as MAX(seq)+1 and guaranteed by
+    # the UNIQUE constraints above rather than by any in-process lock. The total
+    # order across reads and writes is the finding, not a convenience.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    actor_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True, index=True
+    )
+    # student | coach | system. A coach-mediated read is attributed to the student
+    # whose prompt it entered, with actor_kind="coach" — never merged into human opens.
+    actor_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The student's role-scoped label at the time of the event (Phase 1 roles).
+    # NULL until the role taxonomy lands.
+    role_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # coach | artifact | group_chat | feed | contested | verification
+    target: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Row this event points at (a Message.id, artifact_revision.id, ...). Untyped
+    # by design: targets live in different tables, so no FK.
+    ref_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Client-supplied, preserved across a buffered reconnect flush. For latency
+    # analysis only — never for ordering.
+    client_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    server_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Dedupe key for at-least-once client delivery. NULL for server-emitted events,
+    # which cannot be double-delivered.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Consent snapshotted per row, matching EvalResult.consent_research, so the
+    # export is immune to a later toggle.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Resolved experimental condition (arm, prominence, corpus id) written onto
+    # every row so an exported log is self-describing.
+    condition: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class Artifact(Base):
+    """The one shared document a team reads and writes. One per group session.
+
+    Content lives in ArtifactSection rows, not here: a section is the unit of
+    both write conflict and read granularity, and the study's central question
+    ("did this student read that teammate's contribution before writing their
+    own?") is only answerable if a read can name a part of the document rather
+    than the whole panel. Sections are instructor-definable per assignment; an
+    artifact with none defined gets a single implicit section (IMPLICIT_SECTION_KEY)
+    and behaves like a free-form document.
+    """
+
+    __tablename__ = "artifacts"
+    __table_args__ = (UniqueConstraint("group_session_id", name="uq_artifact_group_session"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True
+    )
+
+
+class ArtifactSection(Base):
+    """One writable region of the shared artifact, and the unit of optimistic
+    concurrency: a write carries the version it was based on, and is rejected
+    with the current version if a teammate got there first, so the client can
+    rebase rather than clobber."""
+
+    __tablename__ = "artifact_sections"
+    __table_args__ = (UniqueConstraint("artifact_id", "key", name="uq_artifact_section_key"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    artifact_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifacts.id"), nullable=False, index=True
+    )
+    # Stable identifier used by read events and (later) Phase 4 subproblem pairing.
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Bumped on every accepted write. Starts at 0 for an empty section.
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True
+    )
+
+
+class ArtifactRevision(Base):
+    """Append-only history of every accepted section write.
+
+    A research record, not an undo buffer, so revisions are never pruned and
+    never rewritten. `origin` distinguishes text the student typed from text
+    they copied out of their coach — the difference between a student's own work
+    and adopted AI output is a finding, not an implementation detail."""
+
+    __tablename__ = "artifact_revisions"
+    __table_args__ = (
+        UniqueConstraint("section_id", "version", name="uq_artifact_revision_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    artifact_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifacts.id"), nullable=False, index=True
+    )
+    section_id: Mapped[str] = mapped_column(
+        String, ForeignKey("artifact_sections.id"), nullable=False, index=True
+    )
+    # Denormalised so a revision stays readable if a section is ever renamed.
+    section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    # student_typed | coach_copied | verification_edit
+    origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    bytes_added: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    bytes_removed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Consent snapshotted at write time, matching EvalResult and StudyEvent.
+    # A standing constraint of the study design: the export filters per row, so
+    # a row that never captured consent can only be exported by guessing, and a
+    # later toggle must not retroactively change what was exportable.
+    consent_research: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# Columns added to already-existing tables, as (table, column, DDL type).
+# `create_all` creates missing TABLES but never missing COLUMNS, and Alembic does
+# not run against SQLite here — so without this, adding a column to an existing
+# model leaves every SQLite database (local dev, the test suite) with an ORM that
+# writes a column the file does not have. That fails at INSERT time, far from the
+# cause: the first symptom of adding Conversation.kind was an empty artifact panel.
+_SQLITE_ADDED_COLUMNS = [
+    ("conversations", "kind", "VARCHAR(16) NOT NULL DEFAULT 'solo'"),
+    ("classroom_challenges", "study_arm", "VARCHAR(32) NOT NULL DEFAULT 'control_solo_feed'"),
+    ("classroom_challenges", "coach_prominence", "VARCHAR(16) NOT NULL DEFAULT 'on_request'"),
+    ("classroom_challenges", "revision_policy", "JSON"),
+    ("classroom_challenges", "verification_policy", "VARCHAR(32) NOT NULL DEFAULT 'none'"),
+    ("eval_results", "is_graded_revision", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("eval_results", "grounding", "FLOAT"),
+    ("classroom_challenges", "reference_corpus_id", "VARCHAR"),
+    ("artifact_revisions", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("verification_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
+]
+
+
+async def _ensure_sqlite_columns(conn):
+    """Add any column in _SQLITE_ADDED_COLUMNS that the file is missing.
+
+    SQLite has no ADD COLUMN IF NOT EXISTS, so existence is checked with PRAGMA
+    first. Mirrors the Postgres ALTER block below; both paths exist because the
+    deploy is Postgres and everything else is SQLite."""
+    for table, column, ddl in _SQLITE_ADDED_COLUMNS:
+        try:
+            cols = {row[1] for row in (await conn.exec_driver_sql(f"PRAGMA table_info({table})")).fetchall()}
+            if not cols:
+                continue  # table does not exist yet; create_all will have made it
+            if column not in cols:
+                await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        except Exception as e:  # never block startup on a best-effort backfill
+            import logging
+            logging.getLogger("database").warning(
+                "could not add %s.%s on sqlite: %s", table, column, e
+            )
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    if _db_url.startswith("sqlite"):
+        async with engine.begin() as conn:
+            await _ensure_sqlite_columns(conn)
     # Postgres: ORM expects listed_in_directory; older DBs (pre-Alembic) need the column added.
     if "postgresql" in _db_url.lower():
         async with engine.begin() as conn:
@@ -419,6 +898,37 @@ async def init_db():
                     "consent_research BOOLEAN NOT NULL DEFAULT false"
                 )
             )
+            # Existing rows are all either solo or the legacy shared group chat;
+            # "solo" is the safe default and group_session_id still distinguishes them.
+            await conn.execute(
+                text(
+                    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS "
+                    "kind VARCHAR(16) NOT NULL DEFAULT 'solo'"
+                )
+            )
+            # Study configuration. Defaults reproduce today's behaviour exactly,
+            # so no existing section is enrolled into an arm by deploying this.
+            for _ddl in (
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "study_arm VARCHAR(32) NOT NULL DEFAULT 'control_solo_feed'",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "coach_prominence VARCHAR(16) NOT NULL DEFAULT 'on_request'",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS revision_policy JSONB",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "verification_policy VARCHAR(32) NOT NULL DEFAULT 'none'",
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
+                "is_graded_revision BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS grounding FLOAT",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "reference_corpus_id VARCHAR",
+                "ALTER TABLE artifact_revisions ADD COLUMN IF NOT EXISTS "
+                "consent_research BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE verification_responses ADD COLUMN IF NOT EXISTS "
+                "consent_research BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE contested_responses ADD COLUMN IF NOT EXISTS "
+                "consent_research BOOLEAN NOT NULL DEFAULT false",
+            ):
+                await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens
             # stay valid until they expire naturally, which is the safe default.
             await conn.execute(
