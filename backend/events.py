@@ -5,20 +5,25 @@ and above all a *read* of a teammate's work — goes through `log_event`. Nothin
 else writes `study_events`, because the ordering guarantee below only holds if
 `seq` has exactly one allocator.
 
-SINGLE-WORKER ONLY, same constraint as group_room.py. `seq` is allocated under an
-in-process lock, so two Uvicorn workers would allocate the same number. The unique
-constraint on (scope, seq) turns that into a retry rather than silent corruption,
-but the real fix for multi-worker is a DB sequence per session or Redis.
+MULTI-WORKER SAFE. `seq` is allocated as MAX(seq)+1 for the scope, and the
+database enforces it: UNIQUE(scope, seq) means a second allocator that picks the
+same number loses its INSERT and retries with a fresh one. There is deliberately
+no in-process lock — a lock only orders the writers inside one Uvicorn worker,
+so it is both insufficient (two workers still collide) and misleading (it reads
+as if the ordering were guaranteed in memory). The constraint is the guarantee.
+
+Deliberately NOT a Redis INCR either. Redis is a cache in this deployment, and a
+flush would replay sequence numbers into what is meant to be a permanent
+research log. The database is the system of record and has to be up regardless.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import AsyncSessionLocal, StudyEvent, User
 
@@ -30,35 +35,16 @@ log = logging.getLogger("study_events")
 ACTOR_KINDS = {"student", "coach", "system"}
 TARGETS = {"coach", "artifact", "group_chat", "feed", "contested", "verification"}
 
-# How many times to retry when a (scope, seq) collision means someone else took
-# our number. Only reachable under multiple workers or a lock bug.
-_MAX_SEQ_RETRIES = 5
-
-# One lock per session scope, so unrelated sessions never serialise against each
-# other. Created lazily; the dict itself is guarded because asyncio tasks can
-# interleave at any await.
-_seq_locks: dict[str, asyncio.Lock] = {}
-_locks_guard = asyncio.Lock()
-
-
-async def _lock_for(scope_key: str) -> asyncio.Lock:
-    async with _locks_guard:
-        lock = _seq_locks.get(scope_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _seq_locks[scope_key] = lock
-        return lock
-
-
-def forget_session(group_session_id: str | None = None, user_challenge_session_id: str | None = None) -> None:
-    """Drop a finished session's seq lock so the dict doesn't grow without bound.
-    Safe to call on a session that is still live: the next event just recreates
-    the lock, and `seq` continues from the database's MAX, not from memory."""
-    scope_key = _scope_key(group_session_id, user_challenge_session_id)
-    _seq_locks.pop(scope_key, None)
+# Retries when someone else took our number. Now that contention is resolved at
+# the database rather than serialised in memory, a busy session can lose several
+# races in a row: with W concurrent writers a given attempt is only guaranteed to
+# make progress for one of them, so the ceiling is generous.
+_MAX_SEQ_RETRIES = 8
 
 
 def _scope_key(group_session_id: str | None, user_challenge_session_id: str | None) -> str:
+    """Logging label only. Nothing keys state on this now that there is no lock
+    table to key — kept because a scope in an error line is worth having."""
     return f"g:{group_session_id}" if group_session_id else f"u:{user_challenge_session_id}"
 
 
@@ -106,69 +92,70 @@ async def log_event(
         return None
 
     scope_key = _scope_key(group_session_id, user_challenge_session_id)
-    lock = await _lock_for(scope_key)
 
     try:
-        async with lock:
-            for attempt in range(_MAX_SEQ_RETRIES):
-                async with AsyncSessionLocal() as db:
-                    # Dedupe before allocating a seq, so a retried client delivery
-                    # doesn't burn a sequence number and leave a hole.
-                    if idempotency_key:
-                        existing = await db.execute(
-                            select(StudyEvent.id).where(StudyEvent.idempotency_key == idempotency_key)
-                        )
-                        if existing.scalar_one_or_none() is not None:
-                            return None
-
-                    consent_now = consent_research
-                    if consent_now is None:
-                        consent_now = False
-                        if actor_user_id:
-                            actor = await db.get(User, actor_user_id)
-                            consent_now = bool(actor.consent_research) if actor else False
-
-                    scope_col = (
-                        StudyEvent.group_session_id if group_session_id
-                        else StudyEvent.user_challenge_session_id
+        for attempt in range(_MAX_SEQ_RETRIES):
+            async with AsyncSessionLocal() as db:
+                # Dedupe before allocating a seq, so a retried client delivery
+                # doesn't burn a sequence number and leave a hole.
+                if idempotency_key:
+                    existing = await db.execute(
+                        select(StudyEvent.id).where(StudyEvent.idempotency_key == idempotency_key)
                     )
-                    scope_val = group_session_id or user_challenge_session_id
-                    current_max = (
-                        await db.execute(
-                            select(func.max(StudyEvent.seq)).where(scope_col == scope_val)
-                        )
-                    ).scalar()
+                    if existing.scalar_one_or_none() is not None:
+                        return None
 
-                    event = StudyEvent(
-                        group_session_id=group_session_id,
-                        user_challenge_session_id=user_challenge_session_id,
-                        classroom_id=classroom_id,
-                        challenge_id=challenge_id,
-                        seq=(current_max or 0) + 1,
-                        actor_user_id=actor_user_id,
-                        actor_kind=actor_kind,
-                        role_label=role_label,
-                        target=target,
-                        action=action,
-                        ref_id=ref_id,
-                        payload=payload,
-                        client_ts=client_ts,
-                        server_ts=datetime.utcnow(),
-                        idempotency_key=idempotency_key,
-                        consent_research=consent_now,
-                        condition=condition,
+                consent_now = consent_research
+                if consent_now is None:
+                    consent_now = False
+                    if actor_user_id:
+                        actor = await db.get(User, actor_user_id)
+                        consent_now = bool(actor.consent_research) if actor else False
+
+                scope_col = (
+                    StudyEvent.group_session_id if group_session_id
+                    else StudyEvent.user_challenge_session_id
+                )
+                scope_val = group_session_id or user_challenge_session_id
+                current_max = (
+                    await db.execute(
+                        select(func.max(StudyEvent.seq)).where(scope_col == scope_val)
                     )
-                    db.add(event)
-                    try:
-                        await db.commit()
-                        return event.id
-                    except IntegrityError:
-                        await db.rollback()
-                        if attempt == _MAX_SEQ_RETRIES - 1:
-                            raise
-                        # Someone took our seq (or raced us to the idempotency
-                        # key). Re-read MAX and try again.
-                        continue
+                ).scalar()
+
+                event = StudyEvent(
+                    group_session_id=group_session_id,
+                    user_challenge_session_id=user_challenge_session_id,
+                    classroom_id=classroom_id,
+                    challenge_id=challenge_id,
+                    seq=(current_max or 0) + 1,
+                    actor_user_id=actor_user_id,
+                    actor_kind=actor_kind,
+                    role_label=role_label,
+                    target=target,
+                    action=action,
+                    ref_id=ref_id,
+                    payload=payload,
+                    client_ts=client_ts,
+                    server_ts=datetime.utcnow(),
+                    idempotency_key=idempotency_key,
+                    consent_research=consent_now,
+                    condition=condition,
+                )
+                db.add(event)
+                try:
+                    await db.commit()
+                    return event.id
+                except (IntegrityError, OperationalError) as e:
+                    await db.rollback()
+                    if attempt == _MAX_SEQ_RETRIES - 1:
+                        raise
+                    # Someone took our seq, or raced us to the idempotency key,
+                    # or (SQLite) held the write lock. The next pass
+                    # distinguishes them: a duplicate key is found and returns,
+                    # a seq clash simply gets a fresh number.
+                    log.debug("seq retry %d for %s.%s (%s)", attempt + 1, target, action, type(e).__name__)
+                    continue
     except Exception as e:
         log.error("study event NOT recorded (%s.%s, scope=%s): %s", target, action, scope_key, e)
         return None

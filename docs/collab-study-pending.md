@@ -225,30 +225,54 @@ corpora in use first, so there is ground truth to label against. Build behind a
 flag; scripted pairs stay the default for study v1 because they are
 deterministic and comparable across teams.
 
-### 12. Multi-worker support
+### 12. Multi-worker support — *built, unverified against a real Redis*
 
-`seq` in `backend/events.py` is allocated under an in-process `asyncio.Lock`,
-and `backend/group_room.py` holds live room state in process memory. **The
-deploy must stay on one Uvicorn worker.** Two workers would allocate the same
-sequence number; the unique `(scope, seq)` constraint turns that into a retry
-rather than corruption, but it is not a fix.
+**Done.** The in-process `asyncio.Lock` is gone from `backend/events.py`: `seq`
+is `MAX(seq)+1` guaranteed by `UNIQUE(scope, seq)`, retried up to 8 times, so
+two workers racing produce a gapless sequence rather than duplicates
+(`test_two_event_loops_still_produce_one_gapless_sequence` stages it with two
+threads and two event loops). The artifact write path is covered the same way:
+`UNIQUE(section_id, version)` turns a cross-worker version race into the
+ordinary conflict, returning the current text to rebase against, instead of
+silently dropping a revision.
 
-**Done looks like.** A Postgres sequence per session (or Redis) replacing the
-in-process lock, and Redis pub/sub replacing the in-memory broadcast. The
-existing test `test_seq_is_gapless_and_ordered_under_concurrency` is the bar to
-clear.
+`backend/group_room.py` now has two modes. With `REDIS_URL` unset it is the
+in-process room, correct on one worker, unchanged. With it set, presence
+(ZSET + HASH with a heartbeat), broadcast (pub/sub with origin suppression) and
+the per-student coach-turn lock (`SET NX PX` + compare-and-delete release) move
+to Redis, so any number of workers can serve one team. A configured but
+unreachable Redis refuses sessions with close code 4005 rather than degrading to
+per-worker rooms, which would look live while teammates were invisible to each
+other. Shared rate-limit counters moved to Redis on the same switch.
 
-### 13. Disconnect-buffer verification — *needs a human with two machines*
+**Still to do before running multiple workers.** Nothing has been exercised
+against a real Redis server: `backend/tests/test_group_room_redis.py` drives the
+fan-out through an injected fake shared by two instances (key naming, envelope
+shape, echo suppression, presence merging and eviction, lock semantics,
+heartbeat) and one case checks a real unreachable client fails loudly, but the
+wire behaviour of `redis.asyncio` is untested here. Bring up a Redis, set
+`REDIS_URL`, run with `--workers 2`, and put two teammates on one team.
 
-`frontend/src/pages/CoachWorkspace.jsx` buffers read events while the socket is
-down and flushes them on reconnect with their original `client_ts`, each
-carrying an idempotency key so an at-least-once flush counts once. The server
-side is tested (`test_duplicate_read_delivery_is_deduped_over_the_socket`), but
-**nobody has tested it against a real network drop.**
+### 13. Disconnect-buffer verification — *still needs a human and a real drop*
 
-**Done looks like.** Kill wifi mid-session, expand several artifact sections,
-reconnect. Every read should appear exactly once, each keeping the timestamp
-from when it happened rather than when it arrived.
+**Changed since this was written.** The buffer was memory-only and nothing
+acked, so delivery was at-most-once in practice: a send accepted by a socket
+that was OPEN but already dead was lost, and a page reload — what a student
+actually does when the app looks stuck — discarded everything held.
+
+Now `frontend/src/lib/readBuffer.js` writes every read to localStorage *before*
+sending and keeps it until the server names it back with `read_ack` (added to
+`/ws/coach`; sent for a handled read whether or not the row was new, so a
+replayed duplicate is acked rather than replayed forever). Buffers are scoped
+per student per session, and logout wipes them, so nothing one student left
+behind can be flushed under the next student's identity on a shared machine.
+13 tests in `frontend/tests/readBuffer.test.js` cover the loss paths, including
+the reload case; three in `test_coach_socket.py` cover the ack contract.
+
+**Still to do.** Kill wifi mid-session, expand several artifact sections,
+reload the page for good measure, reconnect. Every read should appear exactly
+once, each keeping the timestamp from when it happened rather than when it
+arrived. No amount of unit testing substitutes for one real drop.
 
 ---
 

@@ -760,6 +760,79 @@ def _default_sessions_data(total: int) -> list[dict]:
     return sessions
 
 
+class SectionBody(BaseModel):
+    """One fixed section of the shared artifact, as authored by an instructor.
+
+    `key` is the stable identifier the collaboration layer is keyed on: artifact
+    websocket payloads, `payload.section_key` on every `study_events` row, and
+    the per-section read/write attribution the study is built to answer.
+    Constrained here rather than trusted.
+    """
+
+    key: str = Field(..., min_length=1, max_length=64,
+                     pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    title: str = Field(..., min_length=1, max_length=200)
+    prompt: str = Field(default="", max_length=2000)
+
+
+def _normalize_sections(sections: list[SectionBody] | None) -> list[dict]:
+    """Validate and flatten authored sections.
+
+    artifacts.get_or_create() raises on duplicate keys, and _section_defs_for
+    would hand it whatever was stored, so a duplicate authored here would only
+    surface later as a broken session. Rejected at authoring time instead.
+    """
+    if not sections:
+        return []
+    if len(sections) > 12:
+        raise HTTPException(
+            status_code=400,
+            detail="A challenge may declare at most 12 artifact sections",
+        )
+    out: list[dict] = []
+    seen: set[str] = set()
+    for sec in sections:
+        key = sec.key.strip()
+        if key in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate section key {key!r}: keys must be unique "
+                       "within a challenge (every event is attributed by key)",
+            )
+        seen.add(key)
+        out.append({"key": key, "title": sec.title.strip(), "prompt": sec.prompt.strip()})
+    return out
+
+
+def _apply_sections(sessions_data: list[dict], sections: list[dict]) -> list[dict]:
+    """Write one section list into EVERY session of a challenge.
+
+    Stored per session because that is where main.py::_section_defs_for reads
+    them (`sessions_data[n]["artifact_sections"]`), but authored once for the
+    challenge: a section present in session 2 and absent in session 1 would
+    start empty with no signal that anything was lost. Every other session key
+    (title, goal, brief, seed_question, system_prompt_extra) is preserved.
+    """
+    out = []
+    for sd in sessions_data or []:
+        merged = dict(sd)
+        if sections:
+            merged["artifact_sections"] = [dict(s) for s in sections]
+        else:
+            merged.pop("artifact_sections", None)
+        out.append(merged)
+    return out
+
+
+def _sections_of(ch: Challenge) -> list[dict]:
+    """The authored sections for a challenge, read off its first session."""
+    for sd in ch.sessions_data or []:
+        raw = sd.get("artifact_sections")
+        if isinstance(raw, list):
+            return [s for s in raw if isinstance(s, dict)]
+    return []
+
+
 class CreateChallengeBody(BaseModel):
     classroom_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1, max_length=300)
@@ -777,6 +850,9 @@ class CreateChallengeBody(BaseModel):
     mode: str = Field(default="solo", pattern="^(solo|group)$")
     team_min: int = Field(default=2, ge=2, le=4)
     team_max: int = Field(default=4, ge=2, le=4)
+    # Fixed artifact sections, one per subproblem. Optional: a challenge with
+    # none gives the team a single free-form document.
+    sections: Optional[list[SectionBody]] = None
 
 
 class UpdateChallengeBody(BaseModel):
@@ -790,6 +866,9 @@ class UpdateChallengeBody(BaseModel):
     time_limit_minutes: Optional[int] = Field(None, ge=1, le=120)
     min_turns: Optional[int] = Field(None, ge=1, le=50)
     is_active: Optional[bool] = None
+    # Replace-all, like the timer fields: an explicit [] removes the sections
+    # and leaves a free-form artifact. Absent = leave whatever is there.
+    sections: Optional[list[SectionBody]] = None
 
 
 async def _student_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
@@ -1077,7 +1156,10 @@ async def create_challenge(
         )
     )
     next_sort = int(max_so if max_so is not None else -1) + 1
-    sessions_data = _default_sessions_data(body.total_sessions)
+    sessions_data = _apply_sections(
+        _default_sessions_data(body.total_sessions),
+        _normalize_sections(body.sections),
+    )
     ch = Challenge(
         title=body.title.strip(),
         description=body.description.strip(),
@@ -1152,6 +1234,14 @@ async def update_challenge(
         ch.min_turns = body.min_turns
     if body.is_active is not None:
         ch.is_active = body.is_active
+    # Replace-all when present. Sections already written into a live session's
+    # artifact are untouched: artifacts.get_or_create() reads the decomposition
+    # once, when the first teammate connects, so re-authoring changes the NEXT
+    # session rather than restructuring a document the team is working in.
+    if "sections" in body.model_fields_set:
+        ch.sessions_data = _apply_sections(
+            ch.sessions_data, _normalize_sections(body.sections)
+        )
     await db.commit()
     await db.refresh(ch)
     return {
@@ -1161,6 +1251,7 @@ async def update_challenge(
         "week": ch.week,
         "time_limit_minutes": ch.time_limit_minutes,
         "min_turns": ch.min_turns,
+        "sections": _sections_of(ch),
     }
 
 
@@ -1228,6 +1319,7 @@ async def get_challenge(
         "sessions": sessions_out,
         "group_mode": group_mode,
         "group": group,
+        "sections": _sections_of(ch),
     }
 
 

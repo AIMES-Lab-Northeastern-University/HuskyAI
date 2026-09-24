@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
 import CorpusManager from '../components/CorpusManager'
+import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 
 const STUDENTS = [
@@ -180,6 +181,11 @@ export default function Instructor() {
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
   const [creatingDraft, setCreatingDraft] = useState(false)
+  // Shared-artifact sections. One list per challenge, applied to every session
+  // by the API — see SectionsEditor and challenges.py::_apply_sections.
+  const [createSections, setCreateSections] = useState([])
+  const [editSections, setEditSections] = useState([])
+
   const [editingId, setEditingId] = useState(null)
   const [editTitle, setEditTitle] = useState('')
   const [editDesc, setEditDesc] = useState('')
@@ -464,6 +470,11 @@ export default function Instructor() {
       setActionMsg('Title and description are required')
       return
     }
+    const secProblem = sectionsProblem(editSections)
+    if (secProblem) {
+      setActionMsg(secProblem)
+      return
+    }
     setActionMsg('')
     try {
       const r = await fetch(`${API_URL}/challenges/${challengeId}`, {
@@ -474,6 +485,13 @@ export default function Instructor() {
           description,
           time_limit_minutes: editTimed ? editTimeLimit : null,
           min_turns: editTimed ? editMinTurns : null,
+          // Always sent, so clearing every section clears the decomposition.
+          // The API distinguishes an explicit [] from an absent field.
+          sections: editSections.map(s => ({
+            key: (s.key || '').trim(),
+            title: (s.title || '').trim(),
+            prompt: (s.prompt || '').trim(),
+          })),
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -548,6 +566,11 @@ export default function Instructor() {
       }
       weekNum = n
     }
+    const secProblem = sectionsProblem(createSections)
+    if (secProblem) {
+      setCreateMsg(secProblem)
+      return
+    }
     setCreateMsg('')
     if (publish) setCreating(true)
     else setCreatingDraft(true)
@@ -569,6 +592,11 @@ export default function Instructor() {
           mode: createGroup ? 'group' : 'solo',
           team_min: createTeamMin,
           team_max: createTeamMax,
+          sections: createSections.map(s => ({
+            key: (s.key || '').trim(),
+            title: (s.title || '').trim(),
+            prompt: (s.prompt || '').trim(),
+          })),
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -582,6 +610,7 @@ export default function Instructor() {
       setCreateTitle('')
       setCreateDesc('')
       setCreateWeek('')
+      setCreateSections([])
       await loadChallenges()
     } catch {
       setCreateMsg('Network error')
@@ -1500,6 +1529,10 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
+                                        <SectionsEditor
+                                          sections={editSections}
+                                          onChange={setEditSections}
+                                        />
                                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                                           <button
                                             type="button"
@@ -1552,6 +1585,9 @@ export default function Instructor() {
                                             setEditTimed(c.time_limit_minutes != null || c.min_turns != null)
                                             setEditTimeLimit(c.time_limit_minutes ?? 15)
                                             setEditMinTurns(c.min_turns ?? 5)
+                                            // Copied, not aliased: editing rows
+                                            // must not mutate the loaded list.
+                                            setEditSections((c.sections || []).map(s => ({ ...s })))
                                           }}
                                           style={btnSm}
                                         >
@@ -1745,6 +1781,11 @@ export default function Instructor() {
                             </span>
                           </div>
                         )}
+                        <SectionsEditor
+                          sections={createSections}
+                          onChange={setCreateSections}
+                          disabled={creating || creatingDraft}
+                        />
                         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                           <button
                             type="button"

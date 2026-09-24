@@ -183,6 +183,37 @@ def test_coach_reliance_weighs_copied_text_against_teammate_informed_text():
     assert m["coach_reliance"]["ratio"] == 0.5
 
 
+def test_a_coach_copied_write_with_nothing_yet_to_adopt_is_not_reliance():
+    """The mirror of test_a_write_with_nothing_yet_to_read_is_excluded_from_the
+    _denominator. Both terms of the ratio must come from the same population:
+    when the only coach-copied write landed before any teammate had written,
+    there was no teammate work available to adopt instead, so the session is
+    not evidence of choosing the coach over a teammate."""
+    m = compute_turn_taking([
+        write(1, A, "s1", 0, origin="coach_copied"),
+    ], [A, B])
+    assert m["coach_reliance"]["ratio"] is None
+    # Still described, just not divided: the write happened and is reported.
+    assert m["coach_reliance"]["coach_copied_writes"] == 1
+    assert m["coach_reliance"]["coach_copied_eligible_writes"] == 0
+
+
+def test_coach_reliance_counts_only_copies_made_over_available_teammate_work():
+    """A coach-copied write before eligibility and one after are different
+    findings; only the second is reliance."""
+    m = compute_turn_taking([
+        write(1, A, "s1", 0, origin="coach_copied"),   # nothing to adopt yet
+        write(2, B, "s2", 2),                          # now A has a teammate section
+        expand(3, A, "s2", 3),
+        write(4, A, "s3", 5),                          # teammate-informed, typed
+        write(5, A, "s4", 7, origin="coach_copied"),   # chose the coach instead
+    ], [A, B])
+    assert m["coach_reliance"]["coach_copied_writes"] == 2
+    assert m["coach_reliance"]["coach_copied_eligible_writes"] == 1
+    assert m["coach_reliance"]["teammate_informed_writes"] == 1
+    assert m["coach_reliance"]["ratio"] == 0.5
+
+
 def test_ratios_are_null_not_zero_when_nothing_happened():
     """"No eligible writes" and "nobody did it" are different findings."""
     m = compute_turn_taking([], [A, B])
@@ -258,3 +289,110 @@ def test_metrics_computed_from_a_real_logged_session(app_ready):
     # B expanded A's section before writing their own.
     assert m["read_before_write"]["ratio"] == 1.0
     assert m["read_before_write"]["eligible_writes"] == 1
+
+
+# ── The classroom-scoped team route ──────────────────────────────────────────
+# Same numbers, different door: /research/... is by session id and unscoped,
+# this one is scoped to a classroom the caller manages. The instructor UI reads
+# this one, because it also needs one entry per session and the member names.
+
+
+def test_the_team_route_returns_one_entry_per_session_to_its_instructor(app_ready):
+    from fastapi.testclient import TestClient
+
+    from database import (AsyncSessionLocal, Classroom, ClassroomChallenge,
+                          ClassroomMembership, GroupChallenge, User)
+    from tests.test_coach_socket import (_connect, _drain_until, _make_team, _token)
+
+    group_id, users = asyncio.run(_make_team(2, section_defs=[{"key": "s1"}, {"key": "s2"}]))
+
+    async def attach_to_a_section():
+        """Give the team a classroom with an instructor, and enrol a student."""
+        async with AsyncSessionLocal() as db:
+            inst = User(email=f"ti_{uuid.uuid4().hex[:8]}@e.com", name="Team Inst",
+                        password_hash="x")
+            db.add(inst)
+            await db.flush()
+            room = Classroom(name="TT Section", join_code=uuid.uuid4().hex[:8].upper(),
+                             instructor_user_id=inst.id)
+            db.add(room)
+            await db.flush()
+            team = await db.get(GroupChallenge, group_id)
+            team.classroom_id = room.id
+            db.add(ClassroomChallenge(classroom_id=room.id, challenge_id=team.challenge_id,
+                                      mode="group"))
+            db.add(ClassroomMembership(classroom_id=room.id, user_id=users[0], role="student"))
+            await db.commit()
+            return inst.id, room.id, team.challenge_id
+
+    inst_id, room_id, challenge_id = asyncio.run(attach_to_a_section())
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws_a:
+        _drain_until(ws_a, {"artifact"})
+        ws_a.send_text(json.dumps({"type": "artifact_write", "section_key": "s1",
+                                   "content": "A's work", "expected_version": 0}))
+        _drain_until(ws_a, {"artifact_write_ok"})
+    with _connect(client, group_id, users[1]) as ws_b:
+        _drain_until(ws_b, {"artifact"})
+        ws_b.send_text(json.dumps({"type": "artifact_expand", "section_key": "s1"}))
+        ws_b.send_text(json.dumps({"type": "artifact_write", "section_key": "s2",
+                                   "content": "B's work", "expected_version": 0}))
+        _drain_until(ws_b, {"artifact_write_ok"})
+
+    url = f"/classrooms/{room_id}/challenges/{challenge_id}/teams/{group_id}/turn-taking"
+
+    r = client.get(url, headers={"Authorization": f"Bearer {_token(inst_id)}"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["team_id"] == group_id
+    assert set(body["member_names"]) == set(users), "names for the legend, keyed by user id"
+    assert len(body["sessions"]) == 1, "one entry per session, never averaged together"
+
+    s = body["sessions"][0]
+    assert s["session_number"] == 1
+    assert s["metrics_version"] == METRICS_VERSION
+    assert s["totals"]["artifact_writes"] == 2
+    assert s["contribution_share"] == {users[0]: 0.5, users[1]: 0.5}
+    assert s["read_before_write"]["ratio"] == 1.0
+    # Nobody copied the coach and nobody was eligible-and-typed... B was: their
+    # write followed a read of A's section, so reliance has a denominator.
+    assert s["coach_reliance"]["coach_copied_eligible_writes"] == 0
+
+
+def test_a_student_cannot_read_the_team_route(app_ready):
+    """Contribution share must not be visible to the people being measured."""
+    from fastapi.testclient import TestClient
+
+    from database import (AsyncSessionLocal, Classroom, ClassroomChallenge,
+                          ClassroomMembership, GroupChallenge, User)
+    from tests.test_coach_socket import _make_team, _token
+
+    group_id, users = asyncio.run(_make_team(2))
+
+    async def attach():
+        async with AsyncSessionLocal() as db:
+            inst = User(email=f"ts_{uuid.uuid4().hex[:8]}@e.com", name="I", password_hash="x")
+            db.add(inst)
+            await db.flush()
+            room = Classroom(name="TT Section 2", join_code=uuid.uuid4().hex[:8].upper(),
+                             instructor_user_id=inst.id)
+            db.add(room)
+            await db.flush()
+            team = await db.get(GroupChallenge, group_id)
+            team.classroom_id = room.id
+            db.add(ClassroomChallenge(classroom_id=room.id, challenge_id=team.challenge_id,
+                                      mode="group"))
+            db.add(ClassroomMembership(classroom_id=room.id, user_id=users[0], role="student"))
+            await db.commit()
+            return room.id, team.challenge_id
+
+    room_id, challenge_id = asyncio.run(attach())
+    client = TestClient(app_ready)
+
+    r = client.get(
+        f"/classrooms/{room_id}/challenges/{challenge_id}/teams/{group_id}/turn-taking",
+        headers={"Authorization": f"Bearer {_token(users[0])}"},
+    )
+    assert r.status_code == 403

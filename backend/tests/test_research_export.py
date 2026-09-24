@@ -280,6 +280,13 @@ def test_metrics_are_computed_over_the_whole_session_not_the_filtered_subset(app
 
 
 def test_the_bundle_states_its_own_versions(app_ready, stub_model):
+    """The bundle must carry the versions actually in force, so an archived
+    export stays traceable to the definitions that produced it. Asserted against
+    the constants rather than literals: a definition change is supposed to move
+    these, and pinning the literal here only makes the bump look like a failure."""
+    from analysis.turn_taking import METRICS_VERSION
+    from main import STUDY_SCHEMA_VERSION
+
     gid, users, admin = asyncio.run(_team())
     client = TestClient(app_ready)
     _seed_activity(client, gid, users)
@@ -287,8 +294,10 @@ def test_the_bundle_states_its_own_versions(app_ready, stub_model):
 
     b = client.get(f"/research/sessions/{gs}/export",
                    headers={"Authorization": f"Bearer {_token(admin)}"}).json()
-    assert b["schema_version"] == "1.0.0"
-    assert b["metrics_version"] == "1.0.0"
+    assert b["schema_version"] == STUDY_SCHEMA_VERSION
+    assert b["metrics_version"] == METRICS_VERSION
+    # Both are set and look like versions, not empty strings passed through.
+    assert b["schema_version"] and b["metrics_version"]
 
 
 def test_jsonl_streams_one_tagged_object_per_line(app_ready, stub_model):

@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
 import { API_URL, authHeaders } from '../lib/api'
+import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -20,8 +21,6 @@ const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
  *     Rendering is not reading; counting it would manufacture reads for someone
  *     who never looked.
  */
-
-const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
 function initials(name = '') {
   return name.trim().split(/\s+/).slice(0, 2).map(w => w[0]?.toUpperCase() || '').join('') || '?'
@@ -49,16 +48,30 @@ function timeAgo(iso) {
 
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy }) {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(section.content || '')
   const [saving, setSaving] = useState(false)
+  // The version this draft was started from. It must NOT be read from
+  // section.version at save time: a teammate's save updates that live, so a
+  // stale draft would claim to be current and overwrite their work unchallenged.
+  const [baseVersion, setBaseVersion] = useState(section.version)
+  // The text we last sent, so a conflict can hand it back.
+  const sentDraft = useRef('')
 
   // Follow the server's copy while not actively editing, so a teammate's edit
   // lands live instead of being silently overwritten by a stale draft.
   useEffect(() => { if (!editing) setDraft(section.content || '') }, [section.content, section.version, editing])
-  useEffect(() => { if (conflict) setSaving(false) }, [conflict])
+  // Declared after the effect above so it runs second: on a conflict that effect
+  // has just replaced the draft with the teammate's text, and this restores ours.
+  useEffect(() => {
+    if (!conflict) return
+    setSaving(false)
+    setDraft(sentDraft.current)
+    setBaseVersion(conflict.version)
+    setEditing(true)
+  }, [conflict])
 
   const toggle = () => {
     const next = !open
@@ -69,14 +82,15 @@ function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, co
 
   const save = () => {
     setSaving(true)
-    onSave(section.key, draft, section.version)
+    sentDraft.current = draft
+    onSave(section.key, draft, baseVersion)
     setEditing(false)
   }
 
   const empty = !(section.content || '').trim()
 
   return (
-    <div className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden" style={{ borderWidth: '1.5px' }}>
+    <div className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden flex-shrink-0" style={{ borderWidth: '1.5px' }}>
       <button
         onClick={toggle}
         className="w-full px-4 py-3 flex items-center gap-3 hover:bg-[#F7F3EE] cursor-pointer text-left"
@@ -105,7 +119,10 @@ function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, co
             <div className="mt-3 p-3 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]" style={{ borderWidth: '1.5px' }}>
               <div className="text-[12px] font-bold text-[#C8102E] mb-1">A teammate saved first</div>
               <div className="text-[12px] text-[#4A4440] mb-2">
-                Their version (v{conflict.version}) is now shown below. Your draft was not lost — it is in the editor.
+                Their version (v{conflict.version}) is below. Your draft was not lost — it is in the editor; fold in their changes and save again.
+              </div>
+              <div className="mb-2 p-2 rounded-[8px] bg-white border border-[#F5C2CC] text-[12px] text-[#16120E] whitespace-pre-wrap">
+                {section.content}
               </div>
               <button onClick={() => onDismissConflict(section.key)}
                       className="text-[11px] font-bold text-[#C8102E] underline cursor-pointer">Got it</button>
@@ -138,7 +155,7 @@ function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, co
               {empty
                 ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
                 : <div className="prose-chat text-[13px] text-[#16120E]"><ReactMarkdown remarkPlugins={[remarkGfm]}>{section.content}</ReactMarkdown></div>}
-              <button onClick={() => setEditing(true)}
+              <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
                       className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
                       style={{ borderWidth: '1.5px' }}>
                 {empty ? 'Write this section' : 'Edit'}
@@ -199,28 +216,38 @@ export default function CoachWorkspace() {
   const streamBuf    = useRef('')
   const endRef       = useRef(null)
   const dwellRef     = useRef({})   // section_key -> started-at ms
-  const outbox       = useRef([])   // read events buffered while disconnected
   const recentTimers = useRef({})
   const teamEndRef   = useRef(null)
   const endedRef     = useRef(false)
 
-  /* Read events. Buffered across a dropped socket and flushed on reconnect with
-   * their ORIGINAL client_ts, because a flaky network must not silently eat
-   * reads. Each carries an idempotency key so an at-least-once flush counts once. */
+  /* Read events, durably.
+   *
+   * Every read is written to localStorage before it is sent and stays there
+   * until the server acks its event_id, then replayed on reconnect with its
+   * ORIGINAL client_ts. Two failures this covers that an in-memory queue does
+   * not: a send accepted by a socket that is OPEN but already dead (readyState
+   * lags a dropped connection by seconds), and the student reloading the page
+   * while it looks stuck — which is exactly when unsent reads are being held.
+   *
+   * Delivery is at-least-once and the server dedupes on the same id, so a
+   * replay costs a duplicate frame and never a duplicate row. A read that goes
+   * unrecorded cannot be reconstructed from anything else.
+   *
+   * Scoped per student per session: see readBuffer.bufferKey. */
+  const reader = useRef(null)
+  if (reader.current === null) {
+    reader.current = createReadSender({
+      scope: { userId: user?.id, groupSessionId: `${groupId}:${sessionNum}` },
+      socket: () => wsRef.current,
+    })
+  }
+
   const emit = useCallback((payload) => {
-    const msg = { ...payload, event_id: uid(), client_ts: new Date().toISOString() }
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg))
-    } else {
-      outbox.current.push(msg)
-    }
+    reader.current.emit(payload)
   }, [])
 
   const flushOutbox = useCallback(() => {
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return
-    const queued = outbox.current
-    outbox.current = []
-    for (const m of queued) wsRef.current.send(JSON.stringify(m))
+    reader.current.flush()
   }, [])
 
   const onExpand = useCallback((key) => {
@@ -237,17 +264,26 @@ export default function CoachWorkspace() {
     }
   }, [emit])
 
+  /**
+   * Emitting happens HERE, not inside the setArtOpen updater.
+   *
+   * React invokes a state updater twice under StrictMode (and may re-invoke it
+   * during a re-render), so an emit inside one fires twice with two different
+   * event_ids — which dedupe cannot collapse, because they are genuinely two
+   * different events as far as the server can tell. That silently doubled every
+   * artifact_open and artifact_close in dev, the build any pilot run is most
+   * likely to be served from. The updater is now pure and the event fires once,
+   * from the click.
+   */
   const togglePanel = useCallback(() => {
-    setArtOpen(prev => {
-      const next = !prev
-      emit({ type: next ? 'artifact_open' : 'artifact_close' })
-      if (!next) {
-        // Closing the panel ends any open dwells.
-        for (const key of Object.keys(dwellRef.current)) onCollapse(key)
-      }
-      return next
-    })
-  }, [emit, onCollapse])
+    const next = !artifactOpen
+    if (!next) {
+      // Closing the panel ends any open dwells.
+      for (const key of Object.keys(dwellRef.current)) onCollapse(key)
+    }
+    setArtOpen(next)
+    emit({ type: next ? 'artifact_open' : 'artifact_close' })
+  }, [artifactOpen, emit, onCollapse])
 
   const saveSection = useCallback((key, content, expectedVersion) => {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
@@ -295,6 +331,12 @@ export default function CoachWorkspace() {
         break
       }
       case 'artifact_write_ok':
+        // An unchanged save wrote nothing, so the section (including who last
+        // edited it) stays exactly as it was.
+        if (data.unchanged) {
+          setConflicts(prev => { const n = { ...prev }; delete n[data.section_key]; return n })
+          break
+        }
         // Apply our own saved text. The broadcast that carries content excludes
         // the sender, so without taking it from the ack the author's section
         // would keep rendering as empty.
@@ -355,6 +397,12 @@ export default function CoachWorkspace() {
         endedRef.current = true
         setEnded(true)
         break
+      case 'read_ack':
+        // The server has this read. Only now is it safe to stop holding it —
+        // see readBuffer: until the ack arrives we cannot tell a delivered read
+        // from one that went into a socket that was already dead.
+        reader.current.ack(data.event_id)
+        break
       case 'error':
         setIsStreaming(false); setIsTyping(false); setIsEval(false)
         console.error('Server error:', data.message)
@@ -378,6 +426,11 @@ export default function CoachWorkspace() {
       setConn('disconnected'); setIsStreaming(false); setIsTyping(false); setIsEval(false)
       if (e.code === 4001) {
         localStorage.removeItem('token'); localStorage.removeItem('user')
+        // Drop every buffered read on the way out. On a shared machine the next
+        // student's socket would otherwise flush what this one left behind, and
+        // the server attributes an event to whoever is authenticated — a
+        // fabricated read, on the wrong student, in a permanent log.
+        clearAllReadBuffers()
         navigate('/login', { replace: true }); return
       }
       if (e.code === 4003 || e.code === 4005) { setConn('error'); return }
@@ -653,7 +706,7 @@ export default function CoachWorkspace() {
                     The two options are deliberately unlabelled — saying which
                     came from the coach would measure trust in the label. */}
                 {pairs.map(p => (
-                  <div key={p.pair_id} className="border border-[#D8B4FE] rounded-[12px] bg-[#FAF5FF] p-4"
+                  <div key={p.pair_id} className="border border-[#D8B4FE] rounded-[12px] bg-[#FAF5FF] p-4 flex-shrink-0"
                        style={{ borderWidth: '1.5px' }}>
                     <div className="text-[11px] font-bold text-[#7C3AED] uppercase tracking-[0.7px] mb-1">
                       Two answers disagree
@@ -686,7 +739,7 @@ export default function CoachWorkspace() {
                     the work is measured from their section reads, not from a
                     checkbox here — so there deliberately isn't one. */}
                 {inbox.map(item => (
-                  <div key={item.assignment_id} className="border border-[#FDBA74] rounded-[12px] bg-[#FFF7ED] p-4"
+                  <div key={item.assignment_id} className="border border-[#FDBA74] rounded-[12px] bg-[#FFF7ED] p-4 flex-shrink-0"
                        style={{ borderWidth: '1.5px' }}>
                     <div className="text-[11px] font-bold text-[#D97706] uppercase tracking-[0.7px] mb-1">
                       Review a teammate's work

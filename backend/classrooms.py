@@ -17,6 +17,9 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import resolve_token_user_id, pwd_context
+# Authored-section reader, kept in challenges.py next to the validation that
+# writes them so the two cannot drift on which sessions_data key holds them.
+from challenges import _sections_of
 from database import (
     AsyncSessionLocal,
     Challenge,
@@ -439,6 +442,9 @@ async def list_classroom_linked_challenges(
             "mode": mode or "solo",
             "team_min": int(team_min) if team_min is not None else 2,
             "team_max": int(team_max) if team_max is not None else 4,
+            # Authored artifact sections, so the instructor's editor seeds itself
+            # from the list it already loads instead of a second fetch.
+            "sections": _sections_of(c),
             "classroom_challenge_id": cc_id,
             "study_arm": study_arm or "control_solo_feed",
             "coach_prominence": coach_prominence or "on_request",

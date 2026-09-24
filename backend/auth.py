@@ -237,7 +237,7 @@ async def forgot_password(
     existing address measurably slower to respond, which leaks the same thing the
     uniform message is there to hide.
     """
-    check_reset_rate_limit(request, req.email, scope="request")
+    await check_reset_rate_limit(request, req.email, scope="request")
     generic = SimpleMessage(
         message="If an account exists for that email, a reset link is on its way."
     )
@@ -270,7 +270,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
     On success every other outstanding token for that user is burned too, and
     `password_changed_at` is stamped so existing access tokens stop working.
     """
-    check_reset_rate_limit(request, None, scope="redeem")
+    await check_reset_rate_limit(request, None, scope="redeem")
     token_hash = _hash_reset_token(req.token)
     now = datetime.utcnow()
 

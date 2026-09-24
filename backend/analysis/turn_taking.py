@@ -25,7 +25,7 @@ from statistics import median
 
 # Bumped whenever any definition in this module changes. Echoed in the API
 # response and recorded alongside exported metrics.
-METRICS_VERSION = "1.0.0"
+METRICS_VERSION = "1.1.0"
 
 # Reads performed by a person. Deliberately excludes read_by_coach: whether a
 # coach-mediated read counts as the student having read their teammate's work is
@@ -157,6 +157,14 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
     # teammate's work, even when that student had read a teammate earlier in the
     # session. Otherwise one write lands on both sides of the same ratio.
     informed_typed = 0
+    # Coach-copied writes made when a teammate-authored section already existed.
+    # The ratio below uses this and NOT the count over all writes: `informed_typed`
+    # can only ever be drawn from eligible writes, so pairing it with a numerator
+    # drawn from every write compares two different populations. A session whose
+    # only coach-copied write landed before anyone else had written would report
+    # total coach reliance, when there was no teammate work available to adopt --
+    # the same artefact the read_before_write denominator exists to avoid.
+    coach_copied_eligible = 0
     section_author: dict[str, str] = {}
     for e in events:
         if e["target"] != "artifact":
@@ -168,6 +176,8 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
             }
             if teammate_sections:
                 eligible += 1
+                if (e.get("payload") or {}).get("origin") == "coach_copied":
+                    coach_copied_eligible += 1
                 read_a_teammate = any(
                     r["seq"] < e["seq"]
                     and r["actor_user_id"] == e["actor_user_id"]
@@ -185,10 +195,13 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
 
     # -- Coach reliance: text lifted from a coach vs text written after reading
     # a teammate. Both are "adoption"; the question is adoption of whose work. --
+    # Both terms are restricted to eligible writes, so the ratio answers "when a
+    # teammate's work was there to adopt, how often was the coach's taken
+    # instead?". The unrestricted count is still reported for description.
     coach_copied = sum(1 for w in writes if (w.get("payload") or {}).get("origin") == "coach_copied")
     coach_reliance_ratio = (
-        round(coach_copied / (coach_copied + informed_typed), 4)
-        if (coach_copied + informed_typed) > 0 else None
+        round(coach_copied_eligible / (coach_copied_eligible + informed_typed), 4)
+        if (coach_copied_eligible + informed_typed) > 0 else None
     )
 
     shares = [writes_by_user[u] for u in sorted(actors)]
@@ -220,7 +233,11 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
         },
         "coach_reliance": {
             "ratio": coach_reliance_ratio,
+            # Every coach-copied write in the session, eligible or not.
             "coach_copied_writes": coach_copied,
+            # The numerator of the ratio: coach-copied writes made when a
+            # teammate's section already existed to be adopted instead.
+            "coach_copied_eligible_writes": coach_copied_eligible,
             "teammate_informed_writes": informed_typed,
         },
     }

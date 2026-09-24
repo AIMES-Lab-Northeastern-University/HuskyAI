@@ -1,7 +1,11 @@
 # Turn-taking metrics codebook
 
-**Metrics version: 1.0.0** (`METRICS_VERSION` in `backend/analysis/turn_taking.py`,
+**Metrics version: 1.1.0** (`METRICS_VERSION` in `backend/analysis/turn_taking.py`,
 echoed as `metrics_version` in every response.)
+
+Changes since 1.0.0: `coach_reliance.ratio` now draws both of its terms from
+eligible writes only (see below). No other definition changed, so every other
+number is comparable across the two versions.
 
 Changing any definition here is a **version bump plus a codebook edit**, never a
 silent fix. A number in a paper must be traceable to the definition that
@@ -67,14 +71,25 @@ rather than counted as failures — a convenient denominator would make early
 turns look like students ignoring each other. `null` when nothing was eligible.
 
 ### `coach_reliance.ratio`
-`coach_copied_writes ÷ (coach_copied_writes + teammate_informed_writes)`.
+`coach_copied_eligible_writes ÷ (coach_copied_eligible_writes + teammate_informed_writes)`.
 
 Both terms are adoption; the question is adoption of *whose* work. `origin` on
 each write distinguishes text a student typed from text they copied out of their
 coach. `null` when neither occurred.
 
-`teammate_informed_writes` here counts only `student_typed` writes that were
-preceded by a teammate read — it is **not** the same number as
+**Both terms are restricted to eligible writes** — writes made when a
+teammate-authored section already existed — so the ratio answers "when a
+teammate's work was there to adopt, how often was the coach's taken instead?".
+`teammate_informed_writes` can only ever be drawn from eligible writes, so a
+numerator drawn from *every* write would compare two different populations: a
+session whose only coach-copied write landed before anyone else had written
+would report total coach reliance, when there was no teammate work available to
+adopt. That is the same artefact `eligible_writes` exists to avoid. In 1.0.0 the
+numerator was unrestricted; `coach_copied_writes` still reports that
+unrestricted count for description, but it is not what the ratio divides.
+
+`teammate_informed_writes` counts only `student_typed` writes that were preceded
+by a teammate read — it is **not** the same number as
 `read_before_write.informed_writes`, which is origin-agnostic. A student who has
 read a teammate and then pastes coach output has adopted the coach's work, not
 the teammate's; counting that write on both sides of the ratio would understate

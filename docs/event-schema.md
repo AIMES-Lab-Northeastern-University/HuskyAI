@@ -35,7 +35,7 @@ Three properties follow, and they are structural rather than conventional:
 | `group_session_id` | Set for collaborative sessions. Exactly one scope column is set. |
 | `user_challenge_session_id` | Set for the solo control arm. |
 | `classroom_id`, `challenge_id` | Denormalised for analysis-time filtering. |
-| `seq` | Monotonic per session, server-assigned under a per-session lock. **The ordering is the finding.** |
+| `seq` | Monotonic per session, server-assigned as `MAX(seq)+1` under `UNIQUE(scope, seq)`. **The ordering is the finding.** |
 | `actor_user_id` | Whose action. For `read_by_coach`, the student whose prompt the artifact entered. |
 | `actor_kind` | `student` \| `coach` \| `system` |
 | `role_label` | The actor's role-scoped label. Currently always NULL — the role taxonomy is an open question for the PI. |
@@ -55,7 +55,7 @@ Three properties follow, and they are structural rather than conventional:
 
 | Action | Emitted when | Payload | Retention |
 |---|---|---|---|
-| `write` | A section write is **accepted**. A rejected (conflicting) write emits nothing — it is not a contribution. | `section_key`, `version`, `origin`, `bytes_added`, `bytes_removed` | permanent |
+| `write` | A section write is **accepted** and changes the text. A rejected (conflicting) write or an unchanged save emits nothing — neither is a contribution. | `section_key`, `version`, `origin`, `bytes_added`, `bytes_removed` | permanent |
 | `open` | A person opens the artifact panel. Not on initial render. | — | permanent |
 | `close` | A person closes the panel. Bounds an `open`. | — | permanent |
 | `section_expand` | A person expands one section. **The finest-grained read, and the one that makes "did they look at Sam's step 2?" answerable.** | `section_key` | permanent |
@@ -125,6 +125,11 @@ that disconnects the instant it receives its score cannot cancel the record.
   read measure from the first session onwards.
 - **Rejected writes.** A conflict is not a write. Logging it would inflate
   contribution share for a student whose text never landed.
+- **Unchanged saves.** Saving text identical to the current version creates no
+  revision, no version bump and no `write` (nor a review assignment). It would
+  otherwise count a Save click that changed nothing as a contribution, raising
+  that student's share and alternation and asking a teammate to review text they
+  have already seen. The stale-version check still applies first.
 - **The team backchannel.** `group_chat` is in the `target` vocabulary but
   nothing emits it yet: whether human-to-human discussion enters the research
   record as content, as metadata only, or not at all is an open question for the
@@ -133,10 +138,13 @@ that disconnects the instant it receives its score cannot cancel the record.
 
 ## Known limits
 
-- **Single worker.** `seq` is allocated under an in-process lock
-  (`backend/events.py`). Two Uvicorn workers would allocate the same number; the
-  unique `(scope, seq)` constraint turns that into a retry rather than silent
-  corruption, but multi-worker needs a DB sequence or Redis first.
+- **`seq` allocation is multi-worker safe.** It is `MAX(seq)+1` for the scope,
+  with `UNIQUE(scope, seq)` as the guarantee: an allocator that loses the race
+  loses its INSERT and retries with a fresh number (`backend/events.py`, up to 8
+  attempts). There is deliberately no in-process lock — one orders writers
+  within a single Uvicorn worker only, which is both insufficient across workers
+  and misleading to read. Verified by
+  `test_two_event_loops_still_produce_one_gapless_sequence`.
 - **`role_label` is unpopulated** pending the role taxonomy decision.
 
 ## Export

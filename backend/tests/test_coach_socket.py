@@ -84,11 +84,16 @@ def _drain_until(ws, wanted, limit=25):
 def _fence(ws):
     """Wait until the server has processed everything sent so far.
 
-    Read events are fire-and-forget (the server sends no reply), so a test
-    cannot wait on them directly. The handler processes messages sequentially,
-    so sending something that *does* reply and waiting for that reply proves the
-    earlier sends already landed. A malformed artifact_write is the cheapest
-    such message: it answers with artifact_error and writes nothing."""
+    A read now answers with `read_ack` when it carries an event_id, but a test
+    that sends several reads still cannot tell which ack belongs to which
+    without matching ids, and reads sent without an id answer nothing at all.
+    The handler processes messages sequentially, so sending something that
+    always replies and waiting for that reply proves the earlier sends already
+    landed. A malformed artifact_write is the cheapest such message: it answers
+    with artifact_error and writes nothing.
+
+    (`_drain_until` skips frame types it was not asked for, so intervening acks
+    do not disturb it.)"""
     ws.send_text(json.dumps({"type": "artifact_write", "section_key": None}))
     return _drain_until(ws, {"artifact_error"})
 
@@ -248,7 +253,7 @@ def test_write_broadcasts_to_teammates_and_logs_once(app_ready):
         # After connecting: the GroupSession (and its room) is created by the
         # connect path, so it cannot be looked up before.
         gs = asyncio.run(_group_session_id(group_id))
-        rooms.peek(gs).add(spy, users[1], "Member1")
+        asyncio.run(rooms.peek(gs).add(spy, users[1], "Member1"))
         ws_a.send_text(json.dumps({
             "type": "artifact_write", "section_key": "body",
             "content": "Alice's contribution", "expected_version": 0,
@@ -279,7 +284,7 @@ def test_broadcast_of_an_edit_is_not_logged_as_a_teammate_read(app_ready):
         # After connecting: the GroupSession (and its room) is created by the
         # connect path, so it cannot be looked up before.
         gs = asyncio.run(_group_session_id(group_id))
-        rooms.peek(gs).add(spy, users[1], "Member1")
+        asyncio.run(rooms.peek(gs).add(spy, users[1], "Member1"))
         ws_a.send_text(json.dumps({
             "type": "artifact_write", "section_key": "body",
             "content": "text", "expected_version": 0,
@@ -422,8 +427,8 @@ def test_private_coach_output_never_reaches_a_teammate(app_ready):
             self.sink.append(json.loads(text))
 
     room = GroupRoom("gs-test")
-    room.add(FakeWS(sent_a), "user-a", "A")
-    room.add(FakeWS(sent_b), "user-b", "B")
+    asyncio.run(room.add(FakeWS(sent_a), "user-a", "A"))
+    asyncio.run(room.add(FakeWS(sent_b), "user-b", "B"))
 
     asyncio.run(room.send_to_user("user-a", {"type": "stream", "content": "private coaching"}))
 
@@ -585,6 +590,97 @@ def test_the_coach_reads_the_shared_artifact_and_that_read_is_logged(app_ready, 
 
     # And the ordering is legible: write, coach read, turn.
     assert [e.action for e in asyncio.run(_events(gs))] == ["write", "read_by_coach", "turn"]
+
+
+def test_an_unwritten_artifact_injects_nothing_and_logs_no_coach_read(app_ready, monkeypatch):
+    """A declared-but-empty artifact is not a teammate contribution.
+
+    Rendering empty sections as "(empty)" made the block non-empty, so the first
+    turn of every sectioned session logged a coach read of work nobody had
+    written yet — inflating coach_reads and answering open question 4 against a
+    log of reads of nothing."""
+    import main
+
+    captured = {}
+
+    async def capturing_stream(*_args, **kwargs):
+        captured["contents"] = kwargs.get("contents")
+
+        async def gen():
+            yield _FakeChunk("ok")
+
+        return gen()
+
+    monkeypatch.setattr(main.client.aio.models, "generate_content_stream", capturing_stream)
+
+    async def fake_eval(_history, corpus_vector_store_id=None):
+        return {"scores": {"PEI": 50.0}}
+
+    monkeypatch.setattr(main, "evaluate_conversation", fake_eval)
+
+    group_id, users = asyncio.run(_make_team(
+        1, section_defs=[{"key": "step-1", "title": "Step one"},
+                         {"key": "step-2", "title": "Step two"}]))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "message", "content": "where do I start?"}))
+        _drain_until(ws, {"done", "error"})
+        _drain_until(ws, {"eval", "eval_error"})
+
+    assert "SHARED TEAM ARTIFACT" not in str(captured.get("contents")), \
+        "an artifact with nothing written must not be injected"
+    gs = asyncio.run(_group_session_id(group_id))
+    assert asyncio.run(_events(gs, "read_by_coach")) == [], \
+        "no coach read may be logged for sections that were never written"
+
+
+def test_only_written_sections_reach_the_prompt_and_the_log(app_ready, monkeypatch):
+    """The logged read names exactly the sections that were injected, so a
+    coach-mediated read of one section is never recorded as a read of all."""
+    import main
+
+    captured = {}
+
+    async def capturing_stream(*_args, **kwargs):
+        captured["contents"] = kwargs.get("contents")
+
+        async def gen():
+            yield _FakeChunk("ok")
+
+        return gen()
+
+    monkeypatch.setattr(main.client.aio.models, "generate_content_stream", capturing_stream)
+
+    async def fake_eval(_history, corpus_vector_store_id=None):
+        return {"scores": {"PEI": 50.0}}
+
+    monkeypatch.setattr(main, "evaluate_conversation", fake_eval)
+
+    group_id, users = asyncio.run(_make_team(
+        1, section_defs=[{"key": "step-1", "title": "Step one"},
+                         {"key": "step-2", "title": "Step two"}]))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "artifact_write", "section_key": "step-1",
+                                 "content": "only this one is written",
+                                 "expected_version": 0}))
+        _drain_until(ws, {"artifact_write_ok"})
+        ws.send_text(json.dumps({"type": "message", "content": "what next?"}))
+        _drain_until(ws, {"done", "error"})
+        _drain_until(ws, {"eval", "eval_error"})
+
+    prompt = str(captured.get("contents"))
+    assert "only this one is written" in prompt
+    assert "Step two" not in prompt, "an empty section must not be rendered at all"
+
+    gs = asyncio.run(_group_session_id(group_id))
+    reads = asyncio.run(_events(gs, "read_by_coach"))
+    assert len(reads) == 1
+    assert reads[0].payload["section_keys"] == ["step-1"]
 
 
 def test_artifact_content_actually_reaches_the_prompt(app_ready, monkeypatch):
@@ -787,3 +883,83 @@ def test_the_resolved_condition_is_stamped_on_every_event(app_ready, stub_model)
     assert turns[0].condition == {
         "arm": "collab_coach_artifact", "prominence": "on_request", "corpus": None,
     }
+
+
+# ── Read acks: the client's permission to stop holding an event ──────────────
+
+
+def test_a_read_is_acked_by_its_event_id(app_ready):
+    """The client buffers every read until the server names it back. Without the
+    ack it cannot distinguish a delivered read from one that vanished into a
+    socket that was OPEN but already dead."""
+    group_id, users = asyncio.run(_make_team(1, section_defs=[{"key": "s1"}]))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "artifact_expand", "section_key": "s1",
+                                 "event_id": "evt-expand-1"}))
+        ack = _drain_until(ws, {"read_ack"})
+
+    assert ack is not None, "an expand carrying an event_id must be acked"
+    assert ack["event_id"] == "evt-expand-1", "the ack must name the id it confirms"
+
+
+def test_a_replayed_read_is_acked_again_but_logged_once(app_ready):
+    """At-least-once delivery: a flush after a reconnect re-sends events the
+    server may already hold. The duplicate must be recorded once and STILL be
+    acked, or the client replays it forever."""
+    group_id, users = asyncio.run(_make_team(1, section_defs=[{"key": "s1"}]))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        for _ in range(3):
+            ws.send_text(json.dumps({"type": "artifact_expand", "section_key": "s1",
+                                     "event_id": "evt-replayed"}))
+            ack = _drain_until(ws, {"read_ack"})
+            assert ack["event_id"] == "evt-replayed"
+
+    gs = asyncio.run(_group_session_id(group_id))
+    expands = asyncio.run(_events(gs, "section_expand"))
+    assert len(expands) == 1, "three deliveries of one read must leave one row"
+
+
+def test_a_read_without_an_event_id_is_still_logged(app_ready):
+    """Nothing is waiting for an ack, and the read must not be refused for it —
+    under-recording is not a tunable."""
+    group_id, users = asyncio.run(_make_team(1, section_defs=[{"key": "s1"}]))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "artifact_expand", "section_key": "s1"}))
+        _fence(ws)
+
+    gs = asyncio.run(_group_session_id(group_id))
+    assert len(asyncio.run(_events(gs, "section_expand"))) == 1
+
+
+def test_unchanged_save_acks_without_broadcasting_or_logging(app_ready):
+    from group_room import rooms
+
+    group_id, users = asyncio.run(_make_team(2))
+    client = TestClient(app_ready)
+    spy = _SpyWS()
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        gs = asyncio.run(_group_session_id(group_id))
+        asyncio.run(rooms.peek(gs).add(spy, users[1], "Member1"))
+        ws.send_text(json.dumps({"type": "artifact_write", "section_key": "body",
+                                 "content": "text", "expected_version": 0}))
+        _drain_until(ws, {"artifact_write_ok"})
+        ws.send_text(json.dumps({"type": "artifact_write", "section_key": "body",
+                                 "content": "text", "expected_version": 1}))
+        ack = _drain_until(ws, {"artifact_write_ok", "artifact_error", "artifact_conflict"})
+
+    assert ack["type"] == "artifact_write_ok"
+    assert ack.get("unchanged") is True and ack["version"] == 1
+    assert len(spy.of_type("artifact_updated")) == 1, "only the real edit reaches teammates"
+    assert spy.of_type("verification_assigned") == []
+    assert len(asyncio.run(_events(gs, "write"))) == 1

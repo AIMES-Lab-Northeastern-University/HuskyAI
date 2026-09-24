@@ -322,3 +322,63 @@ async def test_orm_columns_all_exist_in_the_database(db_ready):
         + ", ".join(missing)
         + " — add them to _SQLITE_ADDED_COLUMNS in database.py and to an Alembic migration"
     )
+
+
+@pytest.mark.asyncio
+async def test_no_in_process_lock_orders_the_sequence(db_ready):
+    """The allocator must not rely on in-process state.
+
+    A lock only orders writers inside one Uvicorn worker, so a lock-based
+    allocator reads as safe while still colliding across workers. The guarantee
+    has to come from UNIQUE(scope, seq); this asserts nobody quietly puts the
+    lock back."""
+    import events
+
+    assert not hasattr(events, "_seq_locks")
+    assert not hasattr(events, "_lock_for")
+
+
+def test_two_event_loops_still_produce_one_gapless_sequence(db_ready):
+    """The multi-worker case, as closely as one process can stage it.
+
+    Two threads, each with its own event loop and its own connections, writing
+    to one session concurrently — the shape two Uvicorn workers have. Under the
+    old in-process lock these two would not have serialised against each other
+    at all; the unique constraint is what makes the result 1..20 rather than a
+    pile of duplicates."""
+    import threading
+
+    from events import log_event
+
+    session_id = _solo_scope()
+    actor = asyncio.run(_make_user())
+
+    errors: list[BaseException] = []
+
+    def worker(offset: int):
+        async def run():
+            await asyncio.gather(*[
+                log_event(
+                    action="write", target="artifact",
+                    user_challenge_session_id=session_id,
+                    actor_user_id=actor, payload={"i": offset + i},
+                )
+                for i in range(10)
+            ])
+        try:
+            asyncio.run(run())
+        except BaseException as e:   # surfaced below rather than lost in a thread
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(o,)) for o in (0, 100)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"worker raised: {errors!r}"
+
+    rows = asyncio.run(_events_for(session_id))
+    seqs = [e.seq for e in rows]
+    assert seqs == list(range(1, 21)), f"expected a gapless 1..20, got {seqs}"
+    assert len(set(seqs)) == len(seqs), "a repeated seq makes read-before-write unanswerable"

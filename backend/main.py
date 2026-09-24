@@ -21,9 +21,10 @@ from session_analysis import analyze_session
 from sqlalchemy import select, update, func
 
 from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership
-from group_room import rooms
+from group_room import RedisUnavailable, rooms
 from events import log_event
 import artifacts
+from rate_limit import close_rate_limit_clients
 from study_policy import resolve_for_group_session
 
 # Version of the study event schema (docs/event-schema.md). Echoed in research
@@ -201,7 +202,26 @@ async def lifespan(app: FastAPI):
     await seed_demo_classroom()
     await seed_pilot_classroom()
     await _resweep_stuck_analyses()
+
+    # Group rooms: in-process (one Uvicorn worker) or Redis (any number).
+    # Checked here so a configured-but-unreachable Redis is a loud boot problem
+    # rather than a student discovering it when they join a team.
+    rooms.configure()
+    try:
+        await rooms.startup_check()
+        log.info(f"Group rooms: {rooms.backend_name} backend ready")
+    except Exception as e:
+        log.critical(
+            f"Group rooms: {rooms.backend_name} backend UNREACHABLE ({type(e).__name__}: {e}). "
+            "Group and coach sessions will refuse connections until this is fixed. "
+            "Solo chat is unaffected."
+        )
+
     yield
+    await rooms.close()
+    # Shared rate-limit counters hold a Redis connection pool when REDIS_URL is
+    # set; closing it on shutdown keeps a reload from leaking connections.
+    await close_rate_limit_clients()
 
 
 app = FastAPI(title="Husky AI API", lifespan=lifespan)
@@ -1683,14 +1703,21 @@ async def group_websocket_endpoint(
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
-    room = await rooms.get(group_session_id)
+    try:
+        room = await rooms.get(group_session_id)
 
-    # Hydrate shared history once per live room.
-    if not room.history_loaded:
-        room.history = await _load_group_history(conversation_id)
-        room.history_loaded = True
+        # Hydrate shared history once per live room.
+        if not room.history_loaded:
+            room.history = await _load_group_history(conversation_id)
+            room.history_loaded = True
 
-    room.add(websocket, user_id, my_name)
+        await room.add(websocket, user_id, my_name)
+    except RedisUnavailable as e:
+        # Refuse rather than degrade: see the /ws/coach path. A shared-coach
+        # room that cannot fan out would give each worker its own conversation.
+        log.critical(f"[WS-GROUP] collaboration backend unavailable: {e}")
+        await websocket.close(code=4005, reason="Collaboration backend unavailable")
+        return
     log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
 
     # --- Initial state to the connecting client only ---
@@ -1737,7 +1764,7 @@ async def group_websocket_endpoint(
 
     # Tell everyone (including this client) who is now present.
     await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
 
     try:
         while True:
@@ -1781,7 +1808,7 @@ async def group_websocket_endpoint(
             # Strict group-only: a coach turn needs at least team_min distinct
             # members connected live. A lone student cannot drive the AI — there is
             # no solo fallback. (Counts distinct users, so multiple tabs don't count.)
-            present = len(room.members_snapshot())
+            present = len(await room.members_snapshot())
             if present < team_min:
                 await websocket.send_text(json.dumps({
                     "type": "waiting", "needed": team_min, "present": present,
@@ -1884,9 +1911,9 @@ async def group_websocket_endpoint(
     except Exception as e:
         log.error(f"[WS-GROUP] unexpected error: {type(e).__name__}: {e}", exc_info=True)
     finally:
-        room.remove(websocket)
+        await room.remove(websocket)
         await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
-        await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
         await rooms.drop_if_empty(group_session_id)
         if rooms.peek(group_session_id) is None:
             # Last member gone: release this session's in-process locks (artifact
@@ -1966,21 +1993,34 @@ async def _load_private_history(conversation_id: str) -> list[dict]:
         return [{"role": m.role, "content": m.content} for m in msgs]
 
 
-def _artifact_prompt_block(snap: dict | None) -> str:
-    """Render the shared artifact for injection into a coach prompt."""
+def _artifact_prompt_block(snap: dict | None) -> tuple[str, list[str]]:
+    """Render the shared artifact for injection into a coach prompt.
+
+    Returns (block, section_keys), where section_keys names exactly the sections
+    that reached the block, so the caller logs the read it actually made.
+
+    Empty sections are omitted rather than rendered as "(empty)". Injecting them
+    made `read_by_coach` fire on the first turn of every session, before anyone
+    had written a word, recording that the coach read teammates' contributions
+    that did not exist. Whether a coach-mediated read counts as the student
+    having read their teammate's work is an open question for the PI, and it
+    stays answerable only if the log holds no reads of nothing.
+    """
     if not snap or not snap.get("sections"):
-        return ""
+        return "", []
+    written = [s for s in snap["sections"] if (s.get("content") or "").strip()]
+    if not written:
+        return "", []
     parts = ["--- SHARED TEAM ARTIFACT (your student's team is writing this together) ---"]
-    for s in snap["sections"]:
+    for s in written:
         label = s.get("title") or s["key"]
-        body = (s.get("content") or "").strip() or "(empty)"
-        parts.append(f"\n## {label}\n{body}")
+        parts.append(f"\n## {label}\n{(s.get('content') or '').strip()}")
     parts.append(
         "\n--- END ARTIFACT ---\n"
         "This is the team's shared work, which may include teammates' contributions. "
         "Refer to it when helpful, but coach THIS student on their own thinking."
     )
-    return "\n".join(parts)
+    return "\n".join(parts), [s["key"] for s in written]
 
 
 async def _mark_group_session_started(group_session_id: str) -> None:
@@ -2073,9 +2113,17 @@ async def coach_websocket_endpoint(
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
-    room = await rooms.get(group_session_id)
-    room.artifact_id = artifact_id
-    room.add(websocket, user_id, my_name)
+    try:
+        room = await rooms.get(group_session_id)
+        room.artifact_id = artifact_id
+        await room.add(websocket, user_id, my_name)
+    except RedisUnavailable as e:
+        # Refuse rather than degrade. Without the shared bus, teammates the load
+        # balancer put on other workers are invisible to each other and to the
+        # presence gate: the session would look live and silently not be one.
+        log.critical(f"[WS-COACH] collaboration backend unavailable: {e}")
+        await websocket.close(code=4005, reason="Collaboration backend unavailable")
+        return
 
     state = room.private_state(user_id, conversation_id)
     if not state["loaded"]:
@@ -2126,7 +2174,7 @@ async def coach_websocket_endpoint(
         await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
 
     await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
 
     def _client_ts(data: dict):
         """Client-supplied timestamp, preserved across a buffered reconnect
@@ -2138,6 +2186,30 @@ async def coach_websocket_endpoint(
             return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
         except Exception:
             return None
+
+    async def _ack_read(data: dict):
+        """Tell the client this read is safely recorded, so it can stop holding it.
+
+        Sent for a *handled* read whether or not the row was new: a duplicate
+        arriving from an at-least-once flush was already recorded once, which is
+        exactly what the client needs to hear. Without an ack the client can
+        only guess, and a send into a socket that is OPEN but already dead —
+        the normal shape of a dropped connection, since readyState lags reality
+        by seconds — looks identical to a delivered one. Then the buffer is the
+        only copy, and the one signal the study cannot reconstruct is gone.
+
+        A read with no event_id is a client that predates the buffer; nothing to
+        ack and nothing is waiting for one.
+        """
+        event_id = data.get("event_id")
+        if not event_id:
+            return
+        try:
+            await websocket.send_text(json.dumps({"type": "read_ack", "event_id": event_id}))
+        except Exception:
+            # Socket went away mid-ack. The client keeps the event buffered and
+            # replays it on reconnect, which is the behaviour we want anyway.
+            pass
 
     try:
         while True:
@@ -2151,6 +2223,7 @@ async def coach_websocket_endpoint(
                     group_session_id, user_id,
                     idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                 )
+                await _ack_read(data)
                 continue
 
             if mtype == "artifact_expand":
@@ -2160,6 +2233,7 @@ async def coach_websocket_endpoint(
                         group_session_id, user_id, key,
                         idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                     )
+                    await _ack_read(data)
                 continue
 
             if mtype == "artifact_dwell":
@@ -2170,6 +2244,7 @@ async def coach_websocket_endpoint(
                         group_session_id, user_id, key, ms,
                         idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                     )
+                    await _ack_read(data)
                 continue
 
             if mtype == "artifact_close":
@@ -2177,6 +2252,7 @@ async def coach_websocket_endpoint(
                     group_session_id, user_id,
                     idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                 )
+                await _ack_read(data)
                 continue
 
             # ---- Writes ----
@@ -2205,6 +2281,17 @@ async def coach_websocket_endpoint(
                         "type": "artifact_conflict" if result.get("conflict") else "artifact_error",
                         "section_key": key,
                         **{k: v for k, v in result.items() if k != "ok"},
+                    }))
+                    continue
+                if result.get("unchanged"):
+                    # Nothing was written (see write_section), so there is nothing
+                    # to route for review or show teammates. Still ack, so the
+                    # writer's editor closes as it would after any save.
+                    await websocket.send_text(json.dumps({
+                        "type": "artifact_write_ok",
+                        "section_key": key,
+                        "version": result["version"],
+                        "unchanged": True,
                     }))
                     continue
                 # Echo the saved content back, not just the version. The writer's
@@ -2286,8 +2373,10 @@ async def coach_websocket_endpoint(
             # ---- A private coach turn ----
             # No team_min gate and no shared turn lock: this student's coach is
             # theirs alone, and teammates' coaches run concurrently by design.
-            lock = room.user_lock(user_id)
-            if lock.locked():
+            # The claim covers every worker when a fan-out is configured, so a
+            # second tab served elsewhere cannot start a parallel turn on the
+            # same coach conversation.
+            if room.user_lock(user_id).locked():
                 await websocket.send_text(json.dumps({"type": "busy"}))
                 continue
 
@@ -2305,7 +2394,12 @@ async def coach_websocket_endpoint(
             if not user_content:
                 user_content = "Please take a look at the attached file(s)."
 
-            await lock.acquire()
+            turn_token = await room.acquire_user_turn(user_id)
+            if turn_token is None:
+                # Lost the race, or this student has a turn running on another
+                # worker. Same answer either way.
+                await websocket.send_text(json.dumps({"type": "busy"}))
+                continue
             try:
                 history = state["history"]
                 turn = len(history) // 2 + 1
@@ -2321,12 +2415,13 @@ async def coach_websocket_endpoint(
                 # read their teammates' work is an open research question.
                 if policy.injects_artifact:
                     snap = await artifacts.snapshot(group_session_id)
-                    block = _artifact_prompt_block(snap)
+                    block, read_keys = _artifact_prompt_block(snap)
                     if block:
                         turn_parts.append(types.Part(text=block))
+                        # Exactly the sections that reached the prompt, never the
+                        # whole section list — see _artifact_prompt_block.
                         await artifacts.log_read_by_coach(
-                            group_session_id, user_id,
-                            [s["key"] for s in snap["sections"]],
+                            group_session_id, user_id, read_keys,
                         )
 
                 turn_parts.append(types.Part(text=user_content))
@@ -2379,16 +2474,16 @@ async def coach_websocket_endpoint(
                         user_id, {"type": "eval_error", "message": "evaluation failed"}
                     )
             finally:
-                lock.release()
+                await room.release_user_turn(user_id, turn_token)
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
         log.error(f"[WS-COACH] unexpected error: {type(e).__name__}: {e}", exc_info=True)
     finally:
-        room.remove(websocket)
+        await room.remove(websocket)
         await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
-        await room.broadcast({"type": "presence", "members": room.members_snapshot()})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
         await rooms.drop_if_empty(group_session_id)
         if rooms.peek(group_session_id) is None:
             await artifacts.forget_session(group_session_id)

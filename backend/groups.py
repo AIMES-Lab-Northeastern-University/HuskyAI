@@ -383,6 +383,68 @@ async def team_analytics(
     return await _team_analytics(db, team)
 
 
+@team_router.get("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/turn-taking")
+async def team_turn_taking(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: turn-taking metrics for one team, one entry per session.
+
+    The same numbers as /research/sessions/{id}/turn-taking, reached through a
+    different door. The research route is unscoped (it can read any session in
+    the deployment, so it is admin-or-section-instructor by id); this one is
+    scoped to a classroom the caller manages, which is the boundary the team's
+    contribution analytics already sits behind. Deliberately a second endpoint
+    rather than a relaxed guard on the first.
+
+    NOT aggregated across sessions. Alternation and read-before-write are
+    defined per session, and averaging rates over sessions of different lengths
+    would let a two-turn session outweigh a twenty-turn one.
+
+    Instructor-only by design: showing contribution share to students during a
+    session turns the measurement into an incentive.
+    """
+    from analysis.turn_taking import compute_turn_taking, events_for_group_session
+
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+
+    members = [
+        row for (row,) in (
+            await db.execute(
+                select(GroupMember.user_id).where(GroupMember.group_id == team.id)
+            )
+        ).all()
+    ]
+    names: dict[str, str] = {}
+    if members:
+        rows = await db.execute(select(User.id, User.name).where(User.id.in_(members)))
+        names = {uid: nm for uid, nm in rows.all()}
+
+    sessions = (
+        await db.execute(
+            select(GroupSession)
+            .where(GroupSession.group_id == team.id)
+            .order_by(GroupSession.session_number)
+        )
+    ).scalars().all()
+
+    out = []
+    for s in sessions:
+        events = await events_for_group_session(db, s.id)
+        out.append({
+            "group_session_id": s.id,
+            "session_number": s.session_number,
+            "status": s.status,
+            **compute_turn_taking(events, members),
+        })
+
+    return {"team_id": team.id, "member_names": names, "sessions": out}
+
+
 @team_router.post("/{classroom_id}/challenges/{challenge_id}/teams", status_code=201)
 async def create_team(
     classroom_id: str,

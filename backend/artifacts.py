@@ -14,8 +14,11 @@ Two responsibilities, kept together because they must not drift apart:
    and "did this student read that teammate's work before writing their own?" is
    the question the study exists to answer.
 
-SINGLE-WORKER ONLY, same constraint as group_room.py and events.py: write
-serialisation uses an in-process lock per artifact.
+Write serialisation uses an in-process lock per artifact, which orders the
+writers inside one Uvicorn worker. Correctness does not rest on it: the section
+`version` check plus UNIQUE(section_id, version) means a writer racing in from
+another worker loses its INSERT and is told it conflicted, with the current text
+to rebase against. The lock is a fast path, not the guarantee.
 """
 
 from __future__ import annotations
@@ -37,7 +40,6 @@ from database import (
     GroupSession,
     User,
 )
-from events import forget_session as events_forget_session
 from events import log_event
 
 log = logging.getLogger("artifacts")
@@ -108,9 +110,13 @@ def forget_artifact(artifact_id: str) -> None:
 
 
 async def forget_session(group_session_id: str) -> None:
-    """Release the in-process state for a session that has gone quiet — both
-    this module's write lock and the event log's seq lock. Called when the last
-    member disconnects."""
+    """Release the in-process state for a session that has gone quiet — this
+    module's per-artifact write lock. Called when the last member disconnects.
+
+    The event log no longer has anything to forget: `seq` is allocated against
+    the UNIQUE(scope, seq) constraint rather than an in-process lock, so it
+    holds no per-session memory to release.
+    """
     async with AsyncSessionLocal() as db:
         artifact_id = (
             await db.execute(
@@ -119,7 +125,6 @@ async def forget_session(group_session_id: str) -> None:
         ).scalar_one_or_none()
     if artifact_id:
         forget_artifact(artifact_id)
-    events_forget_session(group_session_id=group_session_id)
 
 
 def _diff_bytes(old: str, new: str) -> tuple[int, int]:
@@ -258,6 +263,13 @@ async def write_section(
     or {"ok": False, "conflict": True, "version", "content"} when the writer was
     working from a stale version — the current text comes back so the client can
     rebase instead of losing the teammate's edit.
+
+    Saving text identical to the current version returns {"ok": True,
+    "unchanged": True} and records nothing: no revision, no version bump, no
+    `write` event. A write is a contribution, and every write feeds contribution
+    share, alternation and review routing, so a Save click that changed nothing
+    would otherwise count as work. The version check still runs first, so an
+    unchanged save from a stale draft is a conflict like any other.
     """
     if origin not in ORIGINS:
         return {"ok": False, "error": f"unknown origin {origin!r}"}
@@ -300,6 +312,11 @@ async def write_section(
                 }
 
             old = section.content or ""
+            if content == old:
+                return {
+                    "ok": True, "unchanged": True, "version": section.version,
+                    "bytes_added": 0, "bytes_removed": 0, "revision_id": None,
+                }
             added, removed = _diff_bytes(old, content)
             new_version = section.version + 1
             now = datetime.utcnow()
@@ -323,17 +340,44 @@ async def write_section(
                 consent_research=bool(author.consent_research) if author else False,
             )
             db.add(revision)
-            await db.flush()
-            revision_id = revision.id
-
-            artifact = await db.get(Artifact, artifact_id)
-            if artifact is not None:
-                artifact.updated_at = now
-                artifact.updated_by_user_id = author_user_id
-
-            scope = await _scope(db, group_session_id)
             section_id = section.id
-            await db.commit()
+            # UNIQUE(section_id, version) is checked at the flush, not the
+            # commit, because the revision id is read back below. Both are
+            # inside this guard: another worker may have committed this version
+            # between our check above and either statement. The in-process lock
+            # orders writers inside ONE Uvicorn worker and cannot see that one,
+            # so the constraint is what makes the case survivable — reported as
+            # the ordinary stale-write conflict, with the current text, so the
+            # client rebases instead of silently losing the teammate's edit.
+            try:
+                await db.flush()
+                revision_id = revision.id
+
+                artifact = await db.get(Artifact, artifact_id)
+                if artifact is not None:
+                    artifact.updated_at = now
+                    artifact.updated_by_user_id = author_user_id
+
+                scope = await _scope(db, group_session_id)
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+                log.warning(
+                    "artifact write lost the version race on %s/%s (wanted v%s)",
+                    group_session_id, section_key, new_version,
+                )
+                async with AsyncSessionLocal() as fresh:
+                    current = (
+                        await fresh.execute(
+                            select(ArtifactSection).where(ArtifactSection.id == section_id)
+                        )
+                    ).scalar_one_or_none()
+                    return {
+                        "ok": False,
+                        "conflict": True,
+                        "version": current.version if current else expected_version,
+                        "content": (current.content or "") if current else "",
+                    }
 
     await log_event(
         action="write",

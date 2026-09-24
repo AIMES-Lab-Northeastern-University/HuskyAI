@@ -38,7 +38,7 @@ def asgi_app():
 @pytest.mark.asyncio
 async def test_register_returns_429_after_rate_limit(asgi_app, monkeypatch):
     monkeypatch.setenv("AUTH_RATE_TEST_MAX", "2")
-    clear_auth_rate_buckets()
+    await clear_auth_rate_buckets()
     try:
         async with AsyncClient(transport=ASGITransport(app=asgi_app), base_url="http://test") as client:
             r1 = await client.post(
@@ -71,4 +71,4 @@ async def test_register_returns_429_after_rate_limit(asgi_app, monkeypatch):
         assert r3.json().get("detail")
     finally:
         monkeypatch.delenv("AUTH_RATE_TEST_MAX", raising=False)
-        clear_auth_rate_buckets()
+        await clear_auth_rate_buckets()

@@ -689,8 +689,9 @@ class StudyEvent(Base):
         String, ForeignKey("challenges.id"), nullable=True, index=True
     )
 
-    # Monotonic per session, assigned server-side under a per-session lock. The
-    # total order across reads and writes is the finding, not a convenience.
+    # Monotonic per session, assigned server-side as MAX(seq)+1 and guaranteed by
+    # the UNIQUE constraints above rather than by any in-process lock. The total
+    # order across reads and writes is the finding, not a convenience.
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
 
     actor_user_id: Mapped[str | None] = mapped_column(

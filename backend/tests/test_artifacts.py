@@ -402,10 +402,18 @@ async def test_write_never_creates_a_wrongly_shaped_artifact(db_ready):
 
 @pytest.mark.asyncio
 async def test_session_teardown_releases_in_process_locks(db_ready):
-    """Was: the write-lock and seq-lock dicts grew for the lifetime of the
-    worker. Correctness never depended on them, so releasing is safe."""
+    """Was: the write-lock dict grew for the lifetime of the worker.
+    Correctness never depended on it, so releasing is safe.
+
+    The event log has no per-session memory to release any more — `seq` is
+    allocated against UNIQUE(scope, seq) rather than an in-process lock — so
+    there is no seq-lock dict to assert on. The sequence surviving teardown is
+    asserted below, which is the property that actually mattered."""
     import artifacts
     import events
+
+    assert not hasattr(events, "_seq_locks"), \
+        "a reintroduced in-process seq lock would order writers in one worker only"
 
     gs = await _make_group_session()
     await artifacts.get_or_create(gs)
@@ -416,12 +424,10 @@ async def test_session_teardown_releases_in_process_locks(db_ready):
     )
     artifact_id = (await artifacts.snapshot(gs))["artifact_id"]
     assert artifact_id in artifacts._write_locks
-    assert f"g:{gs}" in events._seq_locks
 
     await artifacts.forget_session(gs)
 
     assert artifact_id not in artifacts._write_locks
-    assert f"g:{gs}" not in events._seq_locks
 
     # Releasing the locks must not lose the sequence: seq resumes from the DB.
     await artifacts.write_section(
@@ -453,3 +459,107 @@ async def test_revision_order_is_deterministic(db_ready):
     ]
     assert runs[0] == runs[1] == runs[2]
     assert len(runs[0]) == 6
+
+
+@pytest.mark.asyncio
+async def test_a_cross_worker_version_race_conflicts_instead_of_losing_an_edit(db_ready):
+    """The in-process write lock cannot see another Uvicorn worker.
+
+    Staged by writing directly through a second connection between the version
+    check and the commit — which is exactly what a second worker does. The
+    constraint must turn it into the ordinary conflict (current text returned to
+    rebase against), never a silently dropped revision."""
+    import artifacts
+    from database import ArtifactRevision, ArtifactSection, AsyncSessionLocal
+    from sqlalchemy import select
+
+    gs = await _make_group_session()
+    await artifacts.get_or_create(gs)
+    a, b = await _make_user(), await _make_user()
+    key = artifacts.IMPLICIT_SECTION_KEY
+
+    first = await artifacts.write_section(
+        group_session_id=gs, section_key=key, content="A's text",
+        author_user_id=a, expected_version=0,
+    )
+    assert first["ok"] and first["version"] == 1
+
+    # Stage the interleaving: another worker has already committed revision 2
+    # for this section, but this worker's snapshot of the section row still says
+    # version 1, so its version check passes and it proceeds to write 2. That is
+    # the state the in-process lock cannot detect, and the only thing standing
+    # in the way is UNIQUE(section_id, version).
+    async with AsyncSessionLocal() as db:
+        section = (await db.execute(
+            select(ArtifactSection).where(ArtifactSection.key == key)
+            .order_by(ArtifactSection.updated_at.desc())
+        )).scalars().first()
+        db.add(ArtifactRevision(
+            artifact_id=section.artifact_id, section_id=section.id, section_key=key,
+            version=2, content="the other worker's text", author_user_id=b,
+            origin="student_typed", bytes_added=1, bytes_removed=0,
+            consent_research=True,
+        ))
+        await db.commit()
+
+    raced = await artifacts.write_section(
+        group_session_id=gs, section_key=key, content="this worker's text",
+        author_user_id=b, expected_version=1,
+    )
+    assert raced["ok"] is False, "a lost version race must not report success"
+    assert raced["conflict"] is True, "it must look like the ordinary conflict the client already handles"
+    assert "content" in raced, "the client needs current text to rebase against"
+
+    # One row per version: the revision the other worker committed, and no
+    # duplicate or silently dropped second revision 2.
+    revs = await artifacts.revisions(gs, key)
+    assert [r["version"] for r in revs] == [1, 2]
+    assert revs[1]["content"] == "the other worker's text"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_save_is_not_a_write(db_ready):
+    """Saving the current text back is a Save click, not a contribution. Found in
+    a browser test: an identical save became a new version and a `write`, raising
+    that student's share and alternation and routing a review of unchanged text."""
+    import artifacts
+
+    gs = await _make_group_session()
+    await artifacts.get_or_create(gs)
+    a, b = await _make_user(), await _make_user()
+    k = artifacts.IMPLICIT_SECTION_KEY
+
+    await artifacts.write_section(group_session_id=gs, section_key=k, content="same",
+                                  author_user_id=a, expected_version=0)
+    res = await artifacts.write_section(group_session_id=gs, section_key=k, content="same",
+                                        author_user_id=b, expected_version=1)
+
+    assert res["ok"] and res.get("unchanged") and res["version"] == 1
+    assert res["revision_id"] is None, "nothing to route for review"
+    assert len(await _events(gs, "write")) == 1
+    assert [r["version"] for r in await artifacts.revisions(gs, k)] == [1]
+    snap = await artifacts.snapshot(gs)
+    sec = next(s for s in snap["sections"] if s["key"] == k)
+    assert sec["version"] == 1
+    assert sec["updated_by_user_id"] == a, "an unchanged save must not claim authorship"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_save_from_a_stale_draft_still_conflicts(db_ready):
+    """The version check comes first: text that matches an OLD version is a stale
+    draft, and the writer must be shown what changed rather than told it saved."""
+    import artifacts
+
+    gs = await _make_group_session()
+    await artifacts.get_or_create(gs)
+    a, b = await _make_user(), await _make_user()
+    k = artifacts.IMPLICIT_SECTION_KEY
+
+    await artifacts.write_section(group_session_id=gs, section_key=k, content="v1",
+                                  author_user_id=a, expected_version=0)
+    await artifacts.write_section(group_session_id=gs, section_key=k, content="v2",
+                                  author_user_id=a, expected_version=1)
+    res = await artifacts.write_section(group_session_id=gs, section_key=k, content="v2",
+                                        author_user_id=b, expected_version=1)
+
+    assert not res["ok"] and res["conflict"] and res["version"] == 2

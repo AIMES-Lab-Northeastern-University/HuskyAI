@@ -269,3 +269,106 @@ async def test_only_a_section_instructor_can_change_study_settings():
                           json={"study_arm": "collab_coach_artifact"},
                           headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 403
+
+
+# ── Artifact section authoring ───────────────────────────────────────────────
+# The decomposition read by main.py::_section_defs_for. Before this existed,
+# `artifact_sections` was readable but unwritable, so every team got a single
+# free-form document no matter what the assignment was meant to decompose into.
+
+
+async def _instructor_with_room(client):
+    """Register an instructor and give them a section. Returns (headers, room_id)."""
+    email = f"sec_{uuid.uuid4().hex[:10]}@example.com"
+    reg = await client.post("/auth/register",
+                            json={"email": email, "name": "Sec Inst", "password": "testpassword123"})
+    assert reg.status_code == 200, reg.text
+    h = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    cr = await client.post("/classrooms", json={"name": "Sections Section"}, headers=h)
+    assert cr.status_code == 200, cr.text
+    return h, cr.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_authored_sections_land_in_every_session(asgi_app):
+    """Authored once, written into all sessions: a section that appeared only in
+    session 2 would start empty with nothing to say why."""
+    from database import AsyncSessionLocal, Challenge
+
+    async with AsyncClient(transport=ASGITransport(app=asgi_app), base_url="http://test") as client:
+        h, room = await _instructor_with_room(client)
+        r = await client.post("/challenges", json={
+            "classroom_id": room, "title": "Sectioned", "description": "d",
+            "total_sessions": 3, "mode": "group",
+            "sections": [{"key": "root-causes", "title": "Root causes", "prompt": "which failures?"},
+                         {"key": "fix-plan", "title": "Fix plan"}],
+        }, headers=h)
+        assert r.status_code == 201, r.text
+        ch_id = r.json()["id"]
+
+    async with AsyncSessionLocal() as db:
+        ch = await db.get(Challenge, ch_id)
+        assert len(ch.sessions_data) == 3
+        for sd in ch.sessions_data:
+            assert [s["key"] for s in sd["artifact_sections"]] == ["root-causes", "fix-plan"]
+            assert sd["title"], "authoring sections must not wipe the session's own fields"
+        # The key main.py actually reads.
+        assert ch.sessions_data[0]["artifact_sections"][0]["prompt"] == "which failures?"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_section_keys_are_rejected_at_authoring_time(asgi_app):
+    """artifacts.get_or_create() raises on duplicates, which would surface as a
+    broken session long after the mistake. Rejected here instead."""
+    async with AsyncClient(transport=ASGITransport(app=asgi_app), base_url="http://test") as client:
+        h, room = await _instructor_with_room(client)
+        r = await client.post("/challenges", json={
+            "classroom_id": room, "title": "Dupes", "description": "d", "total_sessions": 1,
+            "sections": [{"key": "same", "title": "One"}, {"key": "same", "title": "Two"}],
+        }, headers=h)
+    assert r.status_code == 400
+    assert "same" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_bad_section_key_is_rejected(asgi_app):
+    """Keys travel into every event payload as the unit of attribution."""
+    async with AsyncClient(transport=ASGITransport(app=asgi_app), base_url="http://test") as client:
+        h, room = await _instructor_with_room(client)
+        r = await client.post("/challenges", json={
+            "classroom_id": room, "title": "Bad key", "description": "d", "total_sessions": 1,
+            "sections": [{"key": "not a key!", "title": "One"}],
+        }, headers=h)
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sections_round_trip_and_an_explicit_empty_list_clears_them(asgi_app):
+    """Replace-all, like the timer fields: [] means free-form, absent means
+    leave alone."""
+    async with AsyncClient(transport=ASGITransport(app=asgi_app), base_url="http://test") as client:
+        h, room = await _instructor_with_room(client)
+        r = await client.post("/challenges", json={
+            "classroom_id": room, "title": "Round trip", "description": "d",
+            "total_sessions": 2, "sections": [{"key": "s1", "title": "S1"}],
+        }, headers=h)
+        ch_id = r.json()["id"]
+
+        listing = await client.get(f"/classrooms/{room}/challenges", headers=h)
+        assert listing.status_code == 200, listing.text
+        mine = [c for c in listing.json() if c["id"] == ch_id][0]
+        assert [s["key"] for s in mine["sections"]] == ["s1"], \
+            "the instructor editor seeds itself from this list"
+
+        # Absent → untouched.
+        p = await client.patch(f"/challenges/{ch_id}", json={"title": "Renamed"}, headers=h)
+        assert p.status_code == 200, p.text
+        assert [s["key"] for s in p.json()["sections"]] == ["s1"]
+
+        # Explicit [] → cleared.
+        p = await client.patch(f"/challenges/{ch_id}", json={"sections": []}, headers=h)
+        assert p.status_code == 200, p.text
+        assert p.json()["sections"] == []
+
+        detail = await client.get(f"/challenges/{ch_id}", headers=h)
+        assert detail.json()["sections"] == []
