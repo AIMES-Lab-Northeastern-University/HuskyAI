@@ -2,19 +2,27 @@ import { useCallback, useEffect, useState } from 'react'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 import ContributionAnalytics from './ContributionAnalytics'
 import TurnTakingPanel from './TurnTakingPanel'
+import { PeerReviewsPanel, ReviewPairingsEditor } from './PeerReviewAdmin'
+import ContestedPairsAdmin from './ContestedPairsAdmin'
+import ResearchExportPanel from './ResearchExportPanel'
 
 /**
  * Instructor team builder for a group-mode challenge. Lists teams + members,
  * lets the instructor create teams and assign/remove the section's students.
  * Teams are drawn from the classroom roster — there is no student self-join.
+ *
+ * `verificationPolicy`, when the parent knows it, overrides the value loaded
+ * with the teams, so switching to "I pick each student's reviewer" in Study
+ * settings shows the reviewer pickers without a reload.
  */
-export default function GroupTeamManager({ classroomId, challengeId }) {
+export default function GroupTeamManager({ classroomId, challengeId, verificationPolicy }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
   const [analyticsFor, setAnalyticsFor] = useState(null)
+  const [contestedFor, setContestedFor] = useState(null)
 
   const base = `${API_URL}/classrooms/${classroomId}/challenges/${challengeId}/teams`
 
@@ -100,6 +108,7 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
   if (!data) return null
 
   const { teams = [], unassigned_students = [], team_min, team_max } = data
+  const policy = verificationPolicy ?? data.verification_policy ?? 'none'
 
   return (
     <div style={{ marginTop: '10px', padding: '12px', background: '#FBF9F6', borderRadius: '9px', border: '1px solid #F0EBE4' }}>
@@ -134,6 +143,10 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
                     <button type="button" onClick={() => setAnalyticsFor(analyticsFor === t.id ? null : t.id)} disabled={busy}
                       style={{ ...btn, ...(analyticsFor === t.id ? { background: '#16120E', color: '#fff', borderColor: '#16120E' } : {}) }}>
                       {analyticsFor === t.id ? 'Hide analytics' : 'Analytics'}
+                    </button>
+                    <button type="button" onClick={() => setContestedFor(contestedFor === t.id ? null : t.id)} disabled={busy}
+                      style={{ ...btn, ...(contestedFor === t.id ? { background: '#16120E', color: '#fff', borderColor: '#16120E' } : {}) }}>
+                      {contestedFor === t.id ? 'Hide contested answers' : 'Contested answers'}
                     </button>
                     <button type="button" onClick={() => deleteTeam(t.id)} disabled={busy} style={{ ...btn, borderColor: '#F9BFCA', color: '#C8102E' }}>
                       Delete team
@@ -171,10 +184,21 @@ export default function GroupTeamManager({ classroomId, challengeId }) {
                   </select>
                 </div>
 
+                {policy === 'instructor_assigned' && (
+                  <ReviewPairingsEditor baseUrl={base} team={t} onSaved={load} />
+                )}
+
+                {contestedFor === t.id && (
+                  <ContestedPairsAdmin baseUrl={base} team={t}
+                    totalSessions={data.total_sessions || 1} sections={data.sections || []} />
+                )}
+
                 {analyticsFor === t.id && (
                   <>
                     <ContributionAnalytics classroomId={classroomId} challengeId={challengeId} teamId={t.id} />
                     <TurnTakingPanel classroomId={classroomId} challengeId={challengeId} teamId={t.id} />
+                    {policy !== 'none' && <PeerReviewsPanel baseUrl={base} team={t} />}
+                    <ResearchExportPanel baseUrl={base} team={t} teamLabel={t.name || `Team ${idx + 1}`} />
                   </>
                 )}
               </div>

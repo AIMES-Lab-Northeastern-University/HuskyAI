@@ -27,7 +27,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,8 +46,54 @@ router = APIRouter(prefix="/research", tags=["research"])
 SCHEMA_VERSION = "1.0.0"
 
 
+def export_filename(bundle: dict, fmt: str) -> str:
+    """Download name for a bundle. Derived from the bundle's own
+    `consent_filtered`, not from the request, so the name cannot disagree with
+    the contents: a file that includes unconsented students says so in its name,
+    and an archived copy can never pass for a consented one."""
+    mode = "consented" if bundle.get("consent_filtered") else "INCLUDES-UNCONSENTED"
+    session = bundle.get("session") or {}
+    return (f"huskyai-{session.get('id', 'session')}-session{session.get('session_number', '')}"
+            f"-{mode}.{fmt}")
+
+
 def _anon(user_id: str | None) -> str | None:
     return pseudonymize(user_id, "anon") if user_id else None
+
+
+def _asg(assignment_id: str | None) -> str | None:
+    return pseudonymize(assignment_id, "asg") if assignment_id else None
+
+
+# Event payload keys that hold a user id or an assignment id. Payloads are
+# written by server code across several modules, so each id-bearing key is
+# listed here explicitly and mapped to the same pseudonym the rest of the bundle
+# uses — `author: anon-7f3a91` in a payload is the student whose events carry
+# `actor: anon-7f3a91`, so joins survive de-identification.
+_PAYLOAD_USER_KEYS = frozenset({"author", "reviewer", "from_reviewer", "to_reviewer"})
+_PAYLOAD_ASSIGNMENT_KEYS = frozenset({"replaces"})
+
+
+def _anon_payload(payload: dict | None, known_ids: set[str]) -> dict | None:
+    """Pseudonymise the ids inside an event payload.
+
+    The named keys are the contract. `known_ids` is the backstop: any other
+    string value that is exactly a member's user id is pseudonymised too, so a
+    key added to some payload later without updating this module cannot put a
+    raw id into a de-identified file."""
+    if not payload:
+        return payload
+    out = {}
+    for k, v in payload.items():
+        if k in _PAYLOAD_USER_KEYS and isinstance(v, str):
+            out[k] = _anon(v)
+        elif k in _PAYLOAD_ASSIGNMENT_KEYS and isinstance(v, str):
+            out[k] = _asg(v)
+        elif isinstance(v, str) and v in known_ids:
+            out[k] = _anon(v)
+        else:
+            out[k] = v
+    return out
 
 
 async def build_session_bundle(db: AsyncSession, group_session_id: str,
@@ -75,6 +121,14 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
         return (u.name if u else None, u.email if u else None)
 
     # ── Events ──────────────────────────────────────────────────────────────
+    # Everyone who could appear in a payload: current members plus anyone who
+    # authored or reviewed work here (a student removed from the team since).
+    known_ids = set(members)
+    for a, r in (await db.execute(
+        select(VerificationAssignment.author_user_id, VerificationAssignment.reviewer_user_id)
+        .where(VerificationAssignment.group_session_id == group_session_id)
+    )).all():
+        known_ids.update((a, r))
     raw_events = (await db.execute(
         select(StudyEvent).where(StudyEvent.group_session_id == group_session_id)
         .order_by(StudyEvent.seq)
@@ -87,7 +141,7 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
             "role_label": e.role_label,
             "target": e.target,
             "action": e.action,
-            "payload": e.payload,
+            "payload": _anon_payload(e.payload, known_ids),
             "client_ts": e.client_ts.isoformat() if e.client_ts else None,
             "server_ts": e.server_ts.isoformat() if e.server_ts else None,
             "condition": e.condition,
@@ -168,7 +222,12 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
                 and not responded_consent[row["assignment_id"]]:
             continue
         verification_rows.append({
-            **{k: v for k, v in row.items() if k != "assignment_id"},
+            **{k: v for k, v in row.items()
+               if k not in ("assignment_id", "replaces_assignment_id")},
+            # Pseudonymised the same way as the `replaces` key in reassignment
+            # events, so a reassigned review can be linked to its replacement.
+            "assignment": _asg(row["assignment_id"]),
+            "replaces": _asg(row.get("replaces_assignment_id")),
             "author": _anon(row["author_user_id"]),
             "reviewer": _anon(row["reviewer_user_id"]),
             "author_user_id": None, "reviewer_user_id": None,
@@ -264,8 +323,9 @@ async def export_session(
 
     bundle = await build_session_bundle(db, group_session_id,
                                         consent_only=not include_unconsented)
+    disposition = {"Content-Disposition": f'attachment; filename="{export_filename(bundle, fmt)}"'}
     if fmt == "json":
-        return bundle
+        return JSONResponse(bundle, headers=disposition)
 
     # JSONL: one object per line, each tagged with its kind, for streaming into
     # analysis tools without loading the whole bundle.
@@ -274,4 +334,5 @@ async def export_session(
     for kind in ("events", "artifact_revisions", "evaluations", "verification", "contested"):
         for row in bundle[kind]:
             lines.append(json.dumps({"kind": kind, **row}))
-    return PlainTextResponse("\n".join(lines), media_type="application/x-ndjson")
+    return PlainTextResponse("\n".join(lines), media_type="application/x-ndjson",
+                             headers=disposition)

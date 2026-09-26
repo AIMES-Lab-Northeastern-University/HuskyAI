@@ -440,7 +440,11 @@ export default function Workspace() {
   const [feedSuppressed, setFeedSuppressed] = useState(false)
   const [revisionRequired, setRevisionRequired] = useState(null)
   const [revisionDone, setRevisionDone]   = useState(false)
+  // Turn whose feedback still needs a graded revision (server-decided, sent in
+  // session_init). While set, End Session is disabled rather than left to fail.
+  const [revisionOwedTurn, setRevisionOwedTurn] = useState(null)
   const [endingSession, setEndingSession] = useState(false)
+  const [endError, setEndError]           = useState('')
   const [sessionScore, setSessionScore]   = useState(null)
   const [endReason, setEndReason]         = useState(null) // "manual" | "timer_expired" | null
   // Post-session analysis (generated in the background on the server; polled after /end).
@@ -552,6 +556,15 @@ export default function Workspace() {
         setConversationId(data.conversation_id)
         setMinTurns(typeof data.min_turns === 'number' ? data.min_turns : null)
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
+        {
+          const owed = typeof data.revision_owed_after_turn === 'number' ? data.revision_owed_after_turn : null
+          setRevisionOwedTurn(owed)
+          // A reloaded tab past the feedback turn restores the prompt it lost.
+          if (owed != null && (data.turn_count ?? 0) >= owed) {
+            setRevisionRequired(owed)
+            setRevisionDone(false)
+          }
+        }
         if (typeof data.remaining_seconds === 'number') {
           // Anchor the countdown to the client clock at connect; the server still
           // enforces the real cutoff, so small skew is harmless.
@@ -757,6 +770,7 @@ export default function Workspace() {
     if (isDemo || !conversationId) return
     if (!auto && (sessionEnded || endingSession)) return
     setEndingSession(true)
+    setEndError('')
     let ok = false
     try {
       const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -772,6 +786,11 @@ export default function Workspace() {
         // Surface the analysis panel and start polling for the background result.
         setShowAnalysis(true)
         pollAnalysis(conversationId)
+      } else if (!auto) {
+        // Normally unreachable: the button is disabled while a gate applies.
+        // Shown inline for a stale tab, instead of failing silently.
+        const data = await resp.json().catch(() => ({}))
+        setEndError(typeof data.detail === 'string' ? data.detail : 'Could not end the session')
       }
     } catch (e) {
       console.error('Failed to end session', e)
@@ -877,7 +896,7 @@ export default function Workspace() {
       type: 'message', content, attachments: outFiles,
       ...(isRevision ? { is_revision: true } : {}),
     }))
-    if (isRevision) { setRevisionDone(true); setRevisionRequired(null) }
+    if (isRevision) { setRevisionDone(true); setRevisionRequired(null); setRevisionOwedTurn(null) }
     // Track this chat's running file usage so the next pick can be capped client-side.
     if (attachments.length) {
       setChatFiles(c => c + attachments.length)
@@ -980,14 +999,22 @@ export default function Workspace() {
             {conversationId && !isDemo && (() => {
               const minTurnsMet = minTurns == null || turnCount >= minTurns
               const turnsLeft = minTurns != null ? Math.max(0, minTurns - turnCount) : 0
-              const disabled = sessionEnded || endingSession || !minTurnsMet
+              const revisionPending = revisionOwedTurn != null && !revisionDone
+              const disabled = sessionEnded || endingSession || !minTurnsMet || revisionPending
+              const title = sessionEnded ? undefined
+                : !minTurnsMet ? `Send ${turnsLeft} more turn${turnsLeft !== 1 ? 's' : ''} to end`
+                : revisionPending
+                  ? (turnCount < revisionOwedTurn
+                    ? `After the feedback on turn ${revisionOwedTurn} you'll send one revised attempt; you can end the session after that`
+                    : 'Send your revised attempt first')
+                  : undefined
               return (
+                <>
+                {endError && <span role="alert" style={{ fontSize: '12px', color: '#C8102E' }}>{endError}</span>}
                 <button
                   onClick={() => handleEndSession()}
                   disabled={disabled}
-                  title={!minTurnsMet && !sessionEnded
-                    ? `Send ${turnsLeft} more turn${turnsLeft !== 1 ? 's' : ''} to end`
-                    : undefined}
+                  title={title}
                   style={{
                     padding: '5px 14px',
                     background: disabled ? '#F7F3EE' : '#FDE8EC',
@@ -1007,8 +1034,11 @@ export default function Workspace() {
                       ? 'Ending…'
                       : !minTurnsMet
                         ? `End Session (${turnCount}/${minTurns})`
-                        : 'End Session'}
+                        : revisionPending
+                          ? 'End Session (revision needed)'
+                          : 'End Session'}
                 </button>
+                </>
               )
             })()}
             <div className="flex items-center gap-1.5 text-[12px] text-[#9A948E]">

@@ -820,6 +820,12 @@ async def _finalize_session(conversation_id: str) -> float | None:
                 )
             )).scalar_one_or_none()
             schedule_analysis = False
+            missed_revision_turn = None
+            if ucs and ucs.status != "completed" and ucs.challenge_id:
+                # Checked only on the call that actually completes the session,
+                # so the timer and a racing /end cannot both record the miss.
+                from challenges import revision_owed
+                missed_revision_turn = await revision_owed(db, ucs.user_id, ucs.challenge_id, ucs)
             if ucs:
                 if avg_pei is not None:
                     ucs.session_avg_pei = round(float(avg_pei), 2)
@@ -833,6 +839,10 @@ async def _finalize_session(conversation_id: str) -> float | None:
                     ucs.session_analysis = _pending_blob()
                     schedule_analysis = True
             await db.commit()
+            if missed_revision_turn is not None:
+                await _log_feed_event(conversation_id, "revision.missed",
+                                      {"after_turn": missed_revision_turn,
+                                       "end_reason": "timer_expired"})
             if schedule_analysis:
                 _spawn_analysis(conversation_id, conv.user_id)
             return round(float(avg_pei), 1) if avg_pei is not None else None
@@ -973,7 +983,7 @@ async def _log_feed_event(conversation_id: str, action: str, payload: dict,
     await log_event(
         action=action,
         target="feed",
-        actor_kind="system" if action == "feed.suppressed" else "student",
+        actor_kind="system" if action in ("feed.suppressed", "revision.missed") else "student",
         user_challenge_session_id=ucs_id,
         actor_user_id=actor,
         classroom_id=classroom_id,
@@ -1015,6 +1025,10 @@ async def websocket_endpoint(
     conversation_history: list[dict] = []
     resumed = False
     session_is_completed = False
+    # Turn whose feedback still needs a graded revision (None = nothing owed),
+    # sent in session_init so a reloaded tab restores the prompt and the
+    # disabled End Session button instead of forgetting them.
+    revision_owed_turn = None
     # Timed-session snapshot (from the UserChallengeSession). None = untimed.
     session_time_limit = None
     session_min_turns = None
@@ -1043,6 +1057,9 @@ async def websocket_endpoint(
                         conversation_id = existing.id
                         resumed = True
                         session_is_completed = ucs.status == "completed"
+                        if not session_is_completed:
+                            from challenges import revision_owed
+                            revision_owed_turn = await revision_owed(db, user_id, challenge_id, ucs)
                         # Only reopen the conversation if it was not explicitly ended
                         if existing.ended_at is not None and not session_is_completed:
                             existing.ended_at = None
@@ -1110,6 +1127,9 @@ async def websocket_endpoint(
                     if ucs and not ucs.conversation_id:
                         ucs.conversation_id = conversation_id
                         await db.commit()
+                    if ucs and ucs.status != "completed":
+                        from challenges import revision_owed
+                        revision_owed_turn = await revision_owed(db, user_id, challenge_id, ucs)
     except Exception as e:
         log.error(f"Failed to create conversation record: {e}")
 
@@ -1140,6 +1160,7 @@ async def websocket_endpoint(
             "min_turns": session_min_turns,
             "remaining_seconds": remaining_seconds,
             "turn_count": len(conversation_history) // 2,
+            "revision_owed_after_turn": None if session_is_completed else revision_owed_turn,
         }))
 
     # Send session context to client immediately if challenge mode
@@ -1362,7 +1383,13 @@ async def websocket_endpoint(
                 log.debug(f"[TURN {turn}] Suggestions: {eval_result.get('suggestions', [])}")
                 log.debug(f"[TURN {turn}] Red flags:   {eval_result.get('red_flags', [])}")
                 # Persist before notifying the client so a fast disconnect cannot cancel the save.
-                is_revision = bool(data.get("is_revision")) and revision_turn is not None
+                # A graded revision is defined as the submission AFTER the feed
+                # was shown for the designated turn. So it counts only in a
+                # session that shows the feed, and only once that turn has
+                # passed — an early or feed-less "revision" is not a response
+                # to feedback, and a client cannot make it one by setting a flag.
+                is_revision = (bool(data.get("is_revision")) and revision_turn is not None
+                               and feed_enabled and turn > revision_turn)
                 if conversation_id:
                     await _save_turn(
                         conversation_id, user_content, full_response, eval_result, turn,
@@ -2609,6 +2636,18 @@ async def end_conversation(
                 detail=f"Send at least {ucs.min_turns} turns before ending (you have {turns_done}).",
             )
 
+    # Consequential revision: the same gate the challenge page's complete button
+    # hits, so ending from inside the chat is not a way round it. The timer is a
+    # hard cap and wins, as it does for min turns — but a session that ran out
+    # with the revision still owed is recorded as such, not silently completed.
+    missed_revision_turn = None
+    if ucs and ucs.status != "completed" and ucs.challenge_id:
+        from challenges import REVISION_OWED_DETAIL, revision_owed
+        owed = await revision_owed(db, user_id, ucs.challenge_id, ucs)
+        if owed is not None and not past_deadline:
+            raise HTTPException(status_code=409, detail=REVISION_OWED_DETAIL)
+        missed_revision_turn = owed
+
     result = await db.execute(
         select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
             EvalResult.conversation_id == conversation_id,
@@ -2639,6 +2678,10 @@ async def end_conversation(
             schedule_analysis = True
 
     await db.commit()
+
+    if missed_revision_turn is not None:
+        await _log_feed_event(conversation_id, "revision.missed",
+                              {"after_turn": missed_revision_turn, "end_reason": "timer_expired"})
 
     if schedule_analysis:
         _spawn_analysis(conversation_id, user_id)

@@ -19,15 +19,19 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from challenges import get_current_user, get_db, _assert_user_manages_classroom
+from challenges import get_current_user, get_db, _assert_user_manages_classroom, _sections_of
 from database import (
+    Challenge,
     ClassroomChallenge,
+    ContestedPair,
+    ContestedResponse,
     ClassroomMembership,
     EvalResult,
     GroupChallenge,
     GroupMember,
     GroupSession,
     Message,
+    ReviewPairing,
     User,
 )
 
@@ -69,6 +73,14 @@ async def _assert_member(db: AsyncSession, group_id: str, user_id: str) -> None:
     )
     if not r.scalar_one_or_none():
         raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+
+async def _pairings_payload(db: AsyncSession, group_id: str) -> list[dict]:
+    rows = await db.execute(
+        select(ReviewPairing.author_user_id, ReviewPairing.reviewer_user_id)
+        .where(ReviewPairing.group_id == group_id)
+    )
+    return [{"author_user_id": a, "reviewer_user_id": r} for a, r in rows.all()]
 
 
 @router.get("/{group_id}")
@@ -341,6 +353,7 @@ async def list_teams(
                 "status": t.status,
                 "max_members": t.max_members,
                 "members": members,
+                "review_pairings": await _pairings_payload(db, t.id),
             }
         )
 
@@ -358,10 +371,17 @@ async def list_teams(
         for uid, name, email in roster.all()
         if uid not in assigned
     ]
+    ch = await db.get(Challenge, challenge_id)
     return {
         "mode": cc.mode,
         "team_min": cc.team_min,
         "team_max": cc.team_max,
+        # So the team builder knows whether to show the reviewer pairings.
+        "verification_policy": cc.verification_policy or "none",
+        # For the contested-pair form: which session, which section.
+        "total_sessions": ch.total_sessions if ch else 1,
+        "sections": [{"key": s.get("key"), "title": s.get("title") or s.get("key")}
+                     for s in (_sections_of(ch) if ch else []) if s.get("key")],
         "teams": out_teams,
         "unassigned_students": unassigned,
     }
@@ -443,6 +463,254 @@ async def team_turn_taking(
         })
 
     return {"team_id": team.id, "member_names": names, "sessions": out}
+
+
+class PairingItem(BaseModel):
+    author_user_id: str
+    reviewer_user_id: str
+
+
+class ReviewPairingsBody(BaseModel):
+    pairings: list[PairingItem]
+
+
+@team_router.put("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/review-pairings")
+async def set_review_pairings(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    body: ReviewPairingsBody,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: replace who-reviews-whom for one team (instructor_assigned).
+
+    Replaces the whole map rather than patching one pair, so the saved state is
+    always exactly what the instructor saw. Editable at any time: every review
+    row records the reviewer it was actually routed to, so a change made
+    mid-session is visible in the data without a separate lock or log."""
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    await _team_or_404(db, team_id, classroom_id, challenge_id)
+
+    members = {
+        uid for (uid,) in (await db.execute(
+            select(GroupMember.user_id).where(GroupMember.group_id == team_id)
+        )).all()
+    }
+    seen: set[str] = set()
+    for p in body.pairings:
+        if p.author_user_id not in members or p.reviewer_user_id not in members:
+            raise HTTPException(status_code=400, detail="Pairings can only name students on this team")
+        if p.author_user_id == p.reviewer_user_id:
+            raise HTTPException(status_code=400, detail="A student cannot review their own work")
+        if p.author_user_id in seen:
+            raise HTTPException(status_code=400, detail="Each student can have only one reviewer")
+        seen.add(p.author_user_id)
+
+    await db.execute(delete(ReviewPairing).where(ReviewPairing.group_id == team_id))
+    for p in body.pairings:
+        db.add(ReviewPairing(group_id=team_id, author_user_id=p.author_user_id,
+                             reviewer_user_id=p.reviewer_user_id))
+    await db.commit()
+    return {"team_id": team_id, "review_pairings": await _pairings_payload(db, team_id)}
+
+
+@team_router.get("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/sessions")
+async def team_sessions(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: this team's sessions that have started, for the research
+    data download. A session written ahead of time (e.g. a contested pair) but
+    never joined has no data to export, so it is left out."""
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+    sessions = (
+        await db.execute(
+            select(GroupSession)
+            .where(GroupSession.group_id == team.id, GroupSession.conversation_id.is_not(None))
+            .order_by(GroupSession.session_number)
+        )
+    ).scalars().all()
+    return {"team_id": team.id, "sessions": [
+        {"group_session_id": s.id, "session_number": s.session_number, "status": s.status}
+        for s in sessions
+    ]}
+
+
+@team_router.get("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/reviews")
+async def team_reviews(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: every peer review in this team's sessions with its derived
+    outcome, one entry per session, so pending ones can be reassigned. Same
+    classification as /verification/outcomes, scoped to a classroom the caller
+    manages."""
+    from verification import outcomes_for_session
+
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+    sessions = (
+        await db.execute(
+            select(GroupSession)
+            .where(GroupSession.group_id == team.id)
+            .order_by(GroupSession.session_number)
+        )
+    ).scalars().all()
+    out = []
+    for s in sessions:
+        rows = await outcomes_for_session(db, s.id)
+        if rows:
+            out.append({"group_session_id": s.id, "session_number": s.session_number,
+                        "status": s.status, "assignments": rows})
+    return {"team_id": team.id, "sessions": out}
+
+
+class TeamPairBody(BaseModel):
+    session_number: int = Field(..., ge=1, le=6)
+    subproblem_key: str = Field(..., min_length=1, max_length=64)
+    # A is always the teammate's answer and B always the coach's. Named that
+    # way here so the form cannot put them the wrong way round.
+    teammate_answer: str = Field(..., min_length=1, max_length=8000)
+    coach_answer: str = Field(..., min_length=1, max_length=8000)
+    surfaced_to_user_id: str
+    better_option: str | None = Field(None, pattern="^(a|b)$")
+
+
+async def _get_or_create_group_session(db: AsyncSession, team: GroupChallenge,
+                                       session_number: int) -> GroupSession:
+    """The session row a pair attaches to, created ahead of time if the team has
+    not started that session yet, so pairs can be written before class.
+
+    Only the bare row — no conversation, no team status change. The coach socket
+    runs main._ensure_group_session on connect, which finds this row and fills
+    in the rest exactly as it would have."""
+    gs = (await db.execute(
+        select(GroupSession).where(GroupSession.group_id == team.id,
+                                   GroupSession.session_number == session_number)
+    )).scalar_one_or_none()
+    if gs is None:
+        gs = GroupSession(group_id=team.id, challenge_id=team.challenge_id,
+                          session_number=session_number, status="not_started")
+        db.add(gs)
+        await db.commit()
+    return gs
+
+
+@team_router.get("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/contested-pairs")
+async def list_team_pairs(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: the scripted pairs for this team, with whether each has been
+    shown and what the student chose. Instructor-facing, so A/B are labelled as
+    teammate/coach here; the student API never labels them."""
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+    rows = (await db.execute(
+        select(ContestedPair, GroupSession.session_number)
+        .join(GroupSession, GroupSession.id == ContestedPair.group_session_id)
+        .where(GroupSession.group_id == team.id)
+        .order_by(GroupSession.session_number, ContestedPair.created_at)
+    )).all()
+    responses = {
+        r.pair_id: r for r in (await db.execute(
+            select(ContestedResponse).where(
+                ContestedResponse.pair_id.in_([p.id for p, _ in rows] or [""]))
+        )).scalars().all()
+    }
+    out = []
+    for p, session_number in rows:
+        r = responses.get(p.id)
+        out.append({
+            "pair_id": p.id,
+            "session_number": session_number,
+            "subproblem_key": p.subproblem_key,
+            "surfaced_to_user_id": p.surfaced_to_user_id,
+            "teammate_answer": p.option_a_text,
+            "coach_answer": p.option_b_text,
+            "better_option": p.better_option,
+            "surfaced": p.surfaced_at is not None,
+            "adopted": r.adopted if r else None,
+            "uninspected_adoption": bool(r) and not (r.inspected_a or r.inspected_b),
+        })
+    return {"team_id": team.id, "pairs": out}
+
+
+@team_router.post("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/contested-pairs",
+                  status_code=201)
+async def create_team_pair(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    body: TeamPairBody,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: script a contested pair for one student in one session.
+
+    The student sees it when they are next in that session: at connect if the
+    session has not started, or within moments if it is live."""
+    from contested import ScriptPairBody, create_scripted_pair, notify_new_pair
+
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+    ch = await db.get(Challenge, challenge_id)
+    if ch is None or body.session_number > (ch.total_sessions or 1):
+        raise HTTPException(status_code=400, detail="That session does not exist in this challenge")
+    keys = {s.get("key") for s in _sections_of(ch)}
+    # With authored sections, the pair must name one: inspection is derived
+    # from reads of that section key, so a key no section has could never be
+    # inspected and every adoption would read as uninspected.
+    if keys and body.subproblem_key not in keys:
+        raise HTTPException(status_code=400, detail="Pick one of this challenge's sections")
+
+    gs = await _get_or_create_group_session(db, team, body.session_number)
+    if gs.status == "completed":
+        raise HTTPException(status_code=409, detail="That session is already finished for this team")
+    pair = await create_scripted_pair(db, gs.id, team.id, ScriptPairBody(
+        subproblem_key=body.subproblem_key,
+        option_a_text=body.teammate_answer,
+        option_b_text=body.coach_answer,
+        surfaced_to_user_id=body.surfaced_to_user_id,
+        better_option=body.better_option,
+    ))
+    await notify_new_pair(gs.id)
+    return {"pair_id": pair.id, "session_number": body.session_number}
+
+
+@team_router.delete("/{classroom_id}/challenges/{challenge_id}/teams/{team_id}/contested-pairs/{pair_id}")
+async def delete_team_pair(
+    classroom_id: str,
+    challenge_id: str,
+    team_id: str,
+    pair_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: remove a pair that has not been shown yet. Once a student has
+    seen it, it is part of the record and stays."""
+    await _assert_user_manages_classroom(db, user_id, classroom_id)
+    team = await _team_or_404(db, team_id, classroom_id, challenge_id)
+    pair = await db.get(ContestedPair, pair_id)
+    gs = await db.get(GroupSession, pair.group_session_id) if pair else None
+    if pair is None or gs is None or gs.group_id != team.id:
+        raise HTTPException(status_code=404, detail="Pair not found")
+    if pair.surfaced_at is not None:
+        raise HTTPException(status_code=409, detail="This pair has already been shown to the student")
+    await db.delete(pair)
+    await db.commit()
+    return {"status": "deleted", "pair_id": pair_id}
 
 
 @team_router.post("/{classroom_id}/challenges/{challenge_id}/teams", status_code=201)
@@ -546,6 +814,16 @@ async def remove_team_member(
             GroupMember.user_id == member_user_id,
         )
     )
+    # Pairings naming someone who left can never be followed. Clearing them
+    # makes the gap visible in the team builder now, instead of surfacing only
+    # as unrouted reviews mid-session.
+    await db.execute(
+        delete(ReviewPairing).where(
+            ReviewPairing.group_id == team_id,
+            (ReviewPairing.author_user_id == member_user_id)
+            | (ReviewPairing.reviewer_user_id == member_user_id),
+        )
+    )
     await db.commit()
     return {"status": "removed", "team_id": team_id, "members": await _members_payload(db, team_id)}
 
@@ -561,6 +839,7 @@ async def delete_team(
     """Instructor: delete a team and its memberships."""
     await _assert_user_manages_classroom(db, user_id, classroom_id)
     await _team_or_404(db, team_id, classroom_id, challenge_id)
+    await db.execute(delete(ReviewPairing).where(ReviewPairing.group_id == team_id))
     await db.execute(delete(GroupMember).where(GroupMember.group_id == team_id))
     await db.execute(delete(GroupChallenge).where(GroupChallenge.id == team_id))
     await db.commit()

@@ -9,7 +9,8 @@ interesting one. It is detectable only because Phase 1 logs reads as
 first-class events with a shared sequence.
 
 So `VerificationResponse` has no "did you read it?" field, and `status` on the
-assignment is only ever `pending` or `expired`. Everything else is computed.
+assignment is only ever `pending`, `expired` or `reassigned` (the last is an
+instructor action, not reviewer behaviour). Everything else is computed.
 """
 
 from __future__ import annotations
@@ -23,8 +24,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from challenges import get_current_user, get_db
-from database import (ArtifactRevision, AsyncSessionLocal, GroupMember, GroupSession,
-                      StudyEvent, User, VerificationAssignment, VerificationResponse)
+from database import (ArtifactRevision, AsyncSessionLocal, GroupChallenge, GroupMember,
+                      GroupSession, ReviewPairing, StudyEvent, User,
+                      VerificationAssignment, VerificationResponse)
 from events import log_event
 
 log = logging.getLogger("verification")
@@ -33,6 +35,9 @@ router = APIRouter(prefix="/verification", tags=["verification"])
 
 VERDICTS = ("correct", "incorrect", "unsure")
 POLICIES = ("none", "round_robin", "random", "instructor_assigned")
+# routing_policy on a row an instructor created by moving a pending review. Not
+# a selectable policy: it can happen under any of the ones above.
+REASSIGN_POLICY = "instructor_reassign"
 
 # Reads that count as having looked at the target. `open` is excluded: opening
 # the panel is not reading a particular teammate's section, and counting it
@@ -46,16 +51,25 @@ READ_ACTIONS = {"section_expand", "dwell"}
 
 
 def choose_reviewer(members: list[str], author_user_id: str,
-                    prior_counts: dict[str, int], policy: str) -> str | None:
+                    prior_counts: dict[str, int], policy: str,
+                    pairings: dict[str, str] | None = None) -> str | None:
     """Pick a reviewer, excluding the author.
 
     Round-robin is the default and is implemented as "fewest reviews so far,
     ties broken by stable ordering" rather than by rotating an index. An index
     rotates out of step the moment someone leaves the session or a write is
-    rejected, and the resulting imbalance is invisible."""
+    rejected, and the resulting imbalance is invisible.
+
+    instructor_assigned follows `pairings` (author -> reviewer) and nothing
+    else: no pairing, or a paired reviewer who is no longer on the team, returns
+    None. It must never fall through to round-robin — a setting that claims one
+    routing and performs another corrupts the arm without any visible sign."""
     candidates = sorted(u for u in members if u != author_user_id)
     if not candidates:
         return None
+    if policy == "instructor_assigned":
+        reviewer = (pairings or {}).get(author_user_id)
+        return reviewer if reviewer in candidates else None
     if policy == "random":
         import random
         return random.choice(candidates)
@@ -87,8 +101,32 @@ async def assign_review(group_session_id: str, revision_id: str, section_key: st
         )).all():
             prior[reviewer] = prior.get(reviewer, 0) + 1
 
-        reviewer = choose_reviewer(members, author_user_id, prior, policy)
+        pairings = None
+        if policy == "instructor_assigned":
+            pairings = {
+                a: r for a, r in (await db.execute(
+                    select(ReviewPairing.author_user_id, ReviewPairing.reviewer_user_id)
+                    .where(ReviewPairing.group_id == gs.group_id)
+                )).all()
+            }
+
+        reviewer = choose_reviewer(members, author_user_id, prior, policy, pairings)
+        challenge_id = gs.challenge_id
         if reviewer is None:
+            # A solo team has nobody to route to under any policy, which is not
+            # news. A team member with no usable pairing is: the instructor
+            # meant this work to be checked and it will not be, so say so in
+            # the log rather than leave a silent gap.
+            if policy == "instructor_assigned" and len(members) > 1:
+                reason = ("no_pairing" if author_user_id not in pairings
+                          else "reviewer_not_on_team")
+                await log_event(
+                    action="unrouted", target="verification", actor_kind="system",
+                    group_session_id=group_session_id, actor_user_id=author_user_id,
+                    challenge_id=challenge_id, ref_id=revision_id,
+                    payload={"section_key": section_key, "author": author_user_id,
+                             "policy": policy, "reason": reason},
+                )
             return None
 
         assignment = VerificationAssignment(
@@ -102,7 +140,7 @@ async def assign_review(group_session_id: str, revision_id: str, section_key: st
         )
         db.add(assignment)
         await db.commit()
-        assignment_id, challenge_id = assignment.id, gs.challenge_id
+        assignment_id = assignment.id
 
     await log_event(
         action="assigned", target="verification", actor_kind="system",
@@ -120,7 +158,8 @@ async def assign_review(group_session_id: str, revision_id: str, section_key: st
 
 def classify(assignment: dict, response: dict | None, reads: list[dict],
              responses_to_same_target: int = 1) -> str:
-    """One of: happened | skipped_unread | skipped_no_response | expired | duplicated.
+    """One of: happened | skipped_unread | skipped_no_response | expired |
+    duplicated | reassigned.
 
     `reads` are this reviewer's section reads of the target section. A read only
     counts if it happened AFTER the work was assigned and BEFORE the verdict was
@@ -132,6 +171,10 @@ def classify(assignment: dict, response: dict | None, reads: list[dict],
         # notice, and a different failure from nobody checking.
         return "duplicated"
     if response is None:
+        if assignment.get("status") == "reassigned":
+            # Taken away by the instructor before it was answered. Not the
+            # reviewer's behaviour, so it must not read as a skipped check.
+            return "reassigned"
         return "expired" if assignment.get("status") == "expired" else "skipped_no_response"
 
     submitted = response.get("submitted_at")
@@ -198,6 +241,9 @@ async def outcomes_for_session(db: AsyncSession, group_session_id: str) -> list[
             "author_user_id": a.author_user_id,
             "reviewer_user_id": a.reviewer_user_id,
             "routing_policy": a.routing_policy,
+            "status": a.status,
+            "replaces_assignment_id": a.replaces_assignment_id,
+            "assigned_at": a.assigned_at.isoformat() if a.assigned_at else None,
             "outcome": outcome,
             "verdict": resp.verdict if resp else None,
             "checked_against_corpus": bool(resp.checked_against_corpus) if resp else False,
@@ -231,6 +277,8 @@ async def my_inbox(
         .where(
             VerificationAssignment.group_session_id == group_session_id,
             VerificationAssignment.reviewer_user_id == user_id,
+            # Work the instructor moved to someone else is no longer theirs.
+            VerificationAssignment.status != "reassigned",
         )
         .order_by(VerificationAssignment.assigned_at)
     )).all()
@@ -272,6 +320,8 @@ async def respond(
         raise HTTPException(status_code=404, detail="Assignment not found")
     if a.reviewer_user_id != user_id:
         raise HTTPException(status_code=403, detail="This review is not assigned to you")
+    if a.status == "reassigned":
+        raise HTTPException(status_code=409, detail="This review was reassigned to a teammate")
 
     existing = (await db.execute(
         select(VerificationResponse).where(
@@ -327,3 +377,90 @@ async def session_outcomes(
     for r in rows:
         counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
     return {"group_session_id": group_session_id, "counts": counts, "assignments": rows}
+
+
+class ReassignBody(BaseModel):
+    reviewer_user_id: str
+
+
+@router.post("/{assignment_id}/reassign")
+async def reassign(
+    assignment_id: str,
+    body: ReassignBody,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Instructor: move a pending, unanswered review to another teammate.
+
+    Works under every routing policy — a reviewer can go quiet whoever chose
+    them. The original row is kept and marked "reassigned" rather than edited,
+    so its outcome reads as the instructor's action, not as the reviewer
+    skipping the check. The new row is routing_policy "instructor_reassign" and
+    its read window starts now: reads before the handover do not count as this
+    reviewer checking the work."""
+    from challenges import _assert_user_manages_classroom
+
+    a = await db.get(VerificationAssignment, assignment_id)
+    if a is None:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    gs = await db.get(GroupSession, a.group_session_id)
+    team = await db.get(GroupChallenge, gs.group_id) if gs else None
+    if team is None or not team.classroom_id:
+        raise HTTPException(status_code=404, detail="Team not found")
+    await _assert_user_manages_classroom(db, user_id, team.classroom_id)
+
+    if a.status != "pending":
+        raise HTTPException(status_code=409, detail=f"This review is {a.status}, not pending")
+    answered = (await db.execute(
+        select(VerificationResponse.id).where(VerificationResponse.assignment_id == assignment_id)
+    )).first()
+    if answered is not None:
+        raise HTTPException(status_code=409, detail="This review has already been answered")
+
+    new_reviewer = body.reviewer_user_id
+    if new_reviewer == a.author_user_id:
+        raise HTTPException(status_code=400, detail="A student cannot review their own work")
+    if new_reviewer == a.reviewer_user_id:
+        raise HTTPException(status_code=400, detail="That student already holds this review")
+    on_team = (await db.execute(
+        select(GroupMember.id).where(GroupMember.group_id == team.id,
+                                     GroupMember.user_id == new_reviewer)
+    )).first()
+    if on_team is None:
+        raise HTTPException(status_code=400, detail="That student is not on this team")
+
+    replacement = VerificationAssignment(
+        group_session_id=a.group_session_id,
+        target_revision_id=a.target_revision_id,
+        target_section_key=a.target_section_key,
+        author_user_id=a.author_user_id,
+        reviewer_user_id=new_reviewer,
+        routing_policy=REASSIGN_POLICY,
+        due_turn=a.due_turn,
+        replaces_assignment_id=a.id,
+    )
+    previous_reviewer = a.reviewer_user_id
+    a.status = "reassigned"
+    db.add(replacement)
+    await db.commit()
+
+    await log_event(
+        action="reassigned", target="verification", actor_kind="system",
+        group_session_id=a.group_session_id, actor_user_id=new_reviewer,
+        challenge_id=gs.challenge_id, ref_id=replacement.id,
+        payload={"section_key": a.target_section_key, "author": a.author_user_id,
+                 "from_reviewer": previous_reviewer, "to_reviewer": new_reviewer,
+                 "replaces": a.id},
+    )
+    try:
+        from group_room import rooms
+        # Both the new reviewer's inbox and the old one's change; the client
+        # refetches its own inbox on this, so one message covers both.
+        await rooms.notify(a.group_session_id, {"type": "verification_assigned",
+                                                "assignment_id": replacement.id,
+                                                "section_key": a.target_section_key})
+    except Exception as e:
+        log.error(f"could not notify session of reassignment: {e}")
+
+    return {"assignment_id": replacement.id, "replaces_assignment_id": a.id,
+            "reviewer_user_id": new_reviewer}

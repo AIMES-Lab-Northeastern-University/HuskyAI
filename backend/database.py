@@ -533,17 +533,52 @@ class VerificationAssignment(Base):
     target_section_key: Mapped[str] = mapped_column(String(64), nullable=False)
     author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     reviewer_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
-    # none | round_robin | random | instructor_assigned — recorded per row so a
+    # round_robin | random | instructor_assigned — recorded per row so a
     # mid-study policy change stays visible in the data rather than being
-    # inferred from a config table that has since moved on.
+    # inferred from a config table that has since moved on. A row created by an
+    # instructor moving a pending review to someone else is instructor_reassign,
+    # whatever the assignment's policy, so analysis can include or exclude them.
     routing_policy: Mapped[str] = mapped_column(String(32), default="round_robin", nullable=False)
     assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     due_turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Stored status is only ever "pending" or "expired". Every other outcome is
-    # DERIVED from the response and the read log at classification time — a
-    # self-reported "completed" would record that a reviewer pressed a button,
-    # not that they read anything.
+    # Stored status is only ever "pending", "expired" or "reassigned". Every
+    # other outcome is DERIVED from the response and the read log at
+    # classification time — a self-reported "completed" would record that a
+    # reviewer pressed a button, not that they read anything. "reassigned" is
+    # stored because it is an instructor action, not reviewer behaviour: without
+    # it the original reviewer would read as skipped_no_response for work that
+    # was taken away from them.
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    # Set on the row an instructor reassignment creates, pointing at the row it
+    # replaced. The old row is kept, marked "reassigned", rather than edited in
+    # place, so who held the review and for how long stays in the data.
+    replaces_assignment_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("verification_assignments.id"), nullable=True
+    )
+
+
+class ReviewPairing(Base):
+    """Who reviews whose work, set by the instructor ahead of time, for the
+    instructor_assigned verification policy.
+
+    One row per author per team: each author has at most one reviewer. Routing
+    reads this at the moment a section is saved, so reviews go out instantly
+    instead of waiting on the instructor. An author with no pairing is left
+    unrouted (and logged as such) — it never falls back to round-robin, because
+    a policy that quietly does something else is the bug this table fixes.
+
+    Scoped to the team, which is already scoped to one (classroom, challenge),
+    so the same students can be paired differently on another assignment.
+    """
+
+    __tablename__ = "review_pairings"
+    __table_args__ = (UniqueConstraint("group_id", "author_user_id", name="uq_review_pairing_author"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    reviewer_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class VerificationResponse(Base):
@@ -836,6 +871,7 @@ _SQLITE_ADDED_COLUMNS = [
     ("artifact_revisions", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("verification_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
 ]
 
 
@@ -927,6 +963,8 @@ async def init_db():
                 "consent_research BOOLEAN NOT NULL DEFAULT false",
                 "ALTER TABLE contested_responses ADD COLUMN IF NOT EXISTS "
                 "consent_research BOOLEAN NOT NULL DEFAULT false",
+                "ALTER TABLE verification_assignments ADD COLUMN IF NOT EXISTS "
+                "replaces_assignment_id VARCHAR",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens
