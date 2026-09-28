@@ -1,13 +1,20 @@
 import { useEffect, useState } from 'react'
 import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
 
-// One-time, blocking research-use notice. Shown to any authenticated user who
-// has not yet acknowledged it (server field research_acknowledged === false).
-// There is no decline: the user must accept to continue. Accepting stamps
-// research_ack_at and turns research consent on (they can still opt out later
-// in Settings). We cache the acknowledgement so the gate doesn't re-fetch on
-// every navigation.
+// Blocking research-use notice. Shown to any authenticated user who has not
+// acknowledged the notice currently in force (server field
+// research_acknowledged === false — the server compares against
+// RESEARCH_NOTICE_VERSION, so shipping new wording re-shows this to everyone).
+// Accepting turns research consent on (they can still opt out later in
+// Settings). Declining is offered only when the server enables it
+// (research_notice_allow_decline); it acknowledges the notice with consent off.
+//
+// A cached acknowledgement renders the app immediately, but is re-checked once
+// per load: the cache cannot know that the notice version moved since.
 const ACK_KEY = 'research_ack'
+// RequireAuth mounts a fresh gate per route, so "once per load" has to live
+// outside the component or every navigation would re-fetch.
+let verifiedThisLoad = false
 
 export default function ConsentGate({ children }) {
   // 'loading' | 'gate' | 'ok'
@@ -17,19 +24,23 @@ export default function ConsentGate({ children }) {
   const [checked, setChecked] = useState(false)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
+  const [allowDecline, setAllowDecline] = useState(false)
 
   useEffect(() => {
-    if (state === 'ok') return
+    if (state === 'ok' && verifiedThisLoad) return
     let cancelled = false
     ;(async () => {
       try {
         const r = await fetch(`${API_URL}/auth/me`, { headers: { ...authHeaders() } })
         const d = await r.json().catch(() => ({}))
         if (cancelled) return
+        if (r.ok) verifiedThisLoad = true
         if (r.ok && d.research_acknowledged) {
           localStorage.setItem(ACK_KEY, 'true')
           setState('ok')
         } else if (r.ok) {
+          localStorage.removeItem(ACK_KEY)
+          setAllowDecline(!!d.research_notice_allow_decline)
           setState('gate')
         } else {
           // If we can't confirm, don't hard-block the app on a transient error.
@@ -40,17 +51,18 @@ export default function ConsentGate({ children }) {
       }
     })()
     return () => { cancelled = true }
-  }, [state])
+  }, [])
 
-  const accept = async () => {
-    if (!checked || saving) return
+  const respond = async (accept) => {
+    if ((accept && !checked) || saving) return
     setSaving(true)
     setErr('')
     try {
       const r = await fetch(`${API_URL}/auth/me`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ accept_research_notice: true }),
+        body: JSON.stringify(accept ? { accept_research_notice: true }
+                                    : { decline_research_notice: true }),
       })
       const d = await r.json().catch(() => ({}))
       if (r.ok) {
@@ -112,7 +124,7 @@ export default function ConsentGate({ children }) {
 
           <button
             type="button"
-            onClick={accept}
+            onClick={() => respond(true)}
             disabled={!checked || saving}
             style={{
               marginTop: '22px', width: '100%', padding: '11px 0', borderRadius: '10px', border: 'none',
@@ -124,6 +136,20 @@ export default function ConsentGate({ children }) {
           >
             {saving ? 'Saving…' : 'Continue'}
           </button>
+          {allowDecline && (
+            <button
+              type="button"
+              onClick={() => respond(false)}
+              disabled={saving}
+              style={{
+                marginTop: '10px', width: '100%', padding: '10px 0', borderRadius: '10px',
+                border: '1.5px solid #E7E0D8', background: 'transparent', color: '#4A4440',
+                fontSize: '13px', fontWeight: 600, cursor: saving ? 'default' : 'pointer',
+              }}
+            >
+              Use HuskyAI without taking part
+            </button>
+          )}
         </div>
       </div>
     )

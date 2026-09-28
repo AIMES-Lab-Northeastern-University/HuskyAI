@@ -30,14 +30,16 @@ The collaborative study now records the following. None of it is described:
 ## 2. Questions for the PI and IRB beyond the new data types
 
 These came up while reading the code. Each one is a statement the notice makes,
-or a behaviour it doesn't mention, that the IRB may want addressed.
+or a behaviour it doesn't mention, that the IRB may want addressed. Items 1 and
+5 are already built behind settings that change nothing until turned on.
 
 1. **There is no way to decline.** The gate has only "Continue", and the
-   platform can't be used without clicking it (see the comment at the top of
-   `ConsentGate.jsx`). A student can turn research use off afterwards in
-   Settings. Most protocols require that research participation be voluntary
-   and separate from using a course tool. Decide whether the gate needs a
-   "Use HuskyAI without research" option. That is a small code change.
+   platform can't be used without clicking it. A student can turn research use
+   off afterwards in Settings. Most protocols require that research
+   participation be voluntary and separate from using a course tool. Decide
+   whether the gate needs a "Use HuskyAI without taking part" option.
+   **Built, off:** setting `RESEARCH_NOTICE_ALLOW_DECLINE=1` shows that button.
+   Clicking it counts as seeing the notice and leaves research consent off.
 2. **"Anonymized" overstates what happens.** Ids are *pseudonymised* with a
    keyed hash that stays stable across exports, so one student's rows can be
    linked over time. Free text is scrubbed by pattern (emails, phone numbers,
@@ -55,11 +57,23 @@ or a behaviour it doesn't mention, that the IRB may want addressed.
    models on student data, not only research analysis. If it doesn't, remove the
    phrase from both the gate and Settings.
 5. **Re-consent.** Decide whether students who already accepted must accept
-   the new wording. Today one acknowledgement is stored per account
-   (`research_ack_at`), so re-consent needs a notice version so that everyone
-   who accepted the old one sees the gate again. That's a small change, but it
-   must go live **before** the first study session.
-6. **Consent is captured per row, at the time of the action.** Turning research
+   the new wording. **Built, inactive:** each account now records which notice
+   version it accepted. Raising `RESEARCH_NOTICE_VERSION` from 1 to 2 when the
+   new wording ships shows the gate again to everyone who accepted version 1.
+   Their first acceptance time is kept for audit. Limit to know: until a student
+   accepts the new notice, their existing consent setting stays as it is. The
+   gate blocks the app, so they can't generate new data until they respond,
+   *except* that the gate lets students through if it can't reach the server
+   (so a network blip doesn't lock anyone out). If the IRB needs consent to be
+   off until re-accepted, that's a further small change.
+6. **Everyone was once opted in automatically.** When the consent notice was
+   first introduced, a one-time step marked **every existing student and every
+   past score as research-consented**, whether or not the student had seen a
+   notice (`backend/database.py`, "One-time backfill: make ALL pre-existing
+   data research-usable"). Confirm that the protocol covers data collected
+   before the notice existed. If it doesn't, those rows need excluding from
+   research exports.
+7. **Consent is captured per row, at the time of the action.** Turning research
    use off in Settings applies from that moment on and doesn't delete earlier
    rows. "To remove data already collected, contact your instructor" is the
    only removal path. Confirm that this matches the protocol's withdrawal
@@ -139,7 +153,11 @@ the same list of what is recorded, and "de-identified" in place of "anonymized".
 - [ ] IRB amendment filed with the table from section 1 and the approved wording.
 - [ ] IRB approval received.
 - [ ] Engineering: put the approved wording into `ConsentGate.jsx` and
-      `Settings.jsx`; add the decline option and the notice version if chosen.
+      `Settings.jsx`.
+- [ ] Engineering: in the same deploy, set `RESEARCH_NOTICE_VERSION=2` so
+      everyone sees the new wording, and `RESEARCH_NOTICE_ALLOW_DECLINE=1` if
+      a decline option was approved (edit the button label if the approved
+      wording differs).
 - [ ] Engineering: set "Team chat in research" on each study assignment to the
       chosen option.
 - [ ] All of the above live **before** the first real study session.

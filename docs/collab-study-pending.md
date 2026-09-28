@@ -44,10 +44,16 @@ start it first, in parallel with everything else.
 
 **Prepared.** `docs/consent-draft-for-pi.md` has a table of everything now
 recorded for the IRB amendment, proposed wording (with a variant for each
-team-chat option), and six questions found in the code: there is no decline
+team-chat option), and seven questions found in the code: there is no decline
 option, "anonymized" overstates what the scrubbing does, team metrics include
-students who declined, the "train models" claim, how re-consent would work, and
-how withdrawal works.
+students who declined, the "train models" claim, how re-consent would work,
+the one-time step that opted in all existing data, and how withdrawal works.
+
+**Built, inactive until the wording is approved.** `RESEARCH_NOTICE_VERSION`
+(default 1): raise it in the same deploy as the new wording, and everyone who
+accepted an older notice sees the gate again. `RESEARCH_NOTICE_ALLOW_DECLINE`
+(default off): adds a "Use HuskyAI without taking part" button that counts as
+seeing the notice, with consent off. See `backend/tests/test_research_notice.py`.
 
 ---
 

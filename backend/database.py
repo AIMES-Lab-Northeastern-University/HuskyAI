@@ -75,6 +75,10 @@ class User(Base):
     # When the user accepted the research-use notice. NULL = not yet acknowledged,
     # which is what triggers the blocking acceptance gate on login.
     research_ack_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Which version of the notice they acknowledged. NULL with research_ack_at
+    # set means version 1: every acknowledgement before versioning was of the
+    # original notice. Compared against RESEARCH_NOTICE_VERSION (auth.py).
+    research_ack_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Audit only: when the password last changed. Not used for enforcement.
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -880,6 +884,7 @@ _SQLITE_ADDED_COLUMNS = [
     ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
     ("classroom_challenges", "team_chat_logging", "VARCHAR(16) NOT NULL DEFAULT 'off'"),
+    ("users", "research_ack_version", "INTEGER"),
 ]
 
 
@@ -975,6 +980,7 @@ async def init_db():
                 "replaces_assignment_id VARCHAR",
                 "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
                 "team_chat_logging VARCHAR(16) NOT NULL DEFAULT 'off'",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS research_ack_version INTEGER",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens
