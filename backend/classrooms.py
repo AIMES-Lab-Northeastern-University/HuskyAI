@@ -423,7 +423,8 @@ async def list_classroom_linked_challenges(
                ClassroomChallenge.coach_prominence,
                ClassroomChallenge.verification_policy,
                ClassroomChallenge.reference_corpus_id,
-               ClassroomChallenge.revision_policy)
+               ClassroomChallenge.revision_policy,
+               ClassroomChallenge.team_chat_logging)
         .join(ClassroomChallenge, ClassroomChallenge.challenge_id == Challenge.id)
         .where(ClassroomChallenge.classroom_id == classroom_id)
         .order_by(ClassroomChallenge.sort_order, Challenge.title)
@@ -454,10 +455,11 @@ async def list_classroom_linked_challenges(
             "verification_policy": verification_policy or "none",
             "reference_corpus_id": reference_corpus_id,
             "require_revision_on_turn": _revision_turn(revision_policy),
+            "team_chat_logging": team_chat_logging or "off",
         }
         for (c, sort_order, mode, team_min, team_max, cc_id, study_arm,
              coach_prominence, verification_policy, reference_corpus_id,
-             revision_policy) in result.all()
+             revision_policy, team_chat_logging) in result.all()
     ]
 
 
@@ -476,6 +478,9 @@ class StudySettingsBody(BaseModel):
     # for no revision step. Checked via model_fields_set, so an explicit null
     # turns it off while an absent field leaves it alone.
     require_revision_on_turn: int | None = Field(None, ge=1, le=50)
+    # Whether the team backchannel enters the research record. A PI decision
+    # (collab-study-pending #3); "off" until it is made.
+    team_chat_logging: str | None = Field(None, pattern="^(off|metadata|content)$")
 
 
 @router.patch("/assignments/{classroom_challenge_id}/study")
@@ -509,6 +514,8 @@ async def update_study_settings(
         cc.coach_prominence = body.coach_prominence
     if body.verification_policy is not None:
         cc.verification_policy = body.verification_policy
+    if body.team_chat_logging is not None:
+        cc.team_chat_logging = body.team_chat_logging
     if "require_revision_on_turn" in body.model_fields_set:
         # Rebuilt rather than mutated in place: SQLAlchemy does not see in-place
         # edits to a JSON column. Other keys in the policy are kept.
@@ -525,6 +532,7 @@ async def update_study_settings(
         "coach_prominence": cc.coach_prominence,
         "verification_policy": cc.verification_policy,
         "require_revision_on_turn": _revision_turn(cc.revision_policy),
+        "team_chat_logging": cc.team_chat_logging,
     }
 
 

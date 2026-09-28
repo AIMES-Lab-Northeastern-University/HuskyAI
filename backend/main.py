@@ -29,7 +29,7 @@ from study_policy import resolve_for_group_session
 
 # Version of the study event schema (docs/event-schema.md). Echoed in research
 # responses so an exported dataset is interpretable against a fixed spec.
-STUDY_SCHEMA_VERSION = "1.0.0"
+STUDY_SCHEMA_VERSION = "1.1.0"
 from auth import router as auth_router, resolve_token_user_id, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
@@ -1569,15 +1569,48 @@ async def _load_group_history(conversation_id: str) -> list[dict]:
     return history
 
 
-async def _save_team_chat(group_id: str, user_id: str, content: str) -> str | None:
+async def _save_team_chat(group_id: str, user_id: str, content: str) -> tuple[str, str | None]:
     """Persist one team-backchannel message. This stream is human-only — it is
-    never sent to Gemini, scored, or exported. Returns the created_at ISO string."""
+    never sent to Gemini or scored, and it enters the research record only under
+    the assignment's team_chat_logging setting (see _log_team_chat). Returns
+    (message id, created_at ISO string)."""
     async with AsyncSessionLocal() as db:
         msg = GroupChatMessage(group_id=group_id, sender_user_id=user_id, content=content)
         db.add(msg)
         await db.commit()
         await db.refresh(msg)
-        return msg.created_at.isoformat() if msg.created_at else None
+        return msg.id, (msg.created_at.isoformat() if msg.created_at else None)
+
+
+async def _log_team_chat(policy, group_session_id: str, user_id: str, message_id: str,
+                         content: str, classroom_id: str | None, challenge_id: str | None,
+                         condition: dict) -> None:
+    """One study event per team-chat message, when the assignment logs team chat.
+
+    The payload is metadata only — length, never text — in both modes. Under
+    "content" the event is marked so the export joins the stored message and
+    scrubs it; the text itself never enters study_events, whose payloads the
+    export pseudonymises but does not scrub. Marking the event, rather than
+    reading the assignment's current setting at export time, means a later
+    switch to "content" cannot sweep in messages sent under "metadata"."""
+    if not policy.logs_team_chat:
+        return
+    await log_event(
+        action="message",
+        target="group_chat",
+        actor_kind="student",
+        group_session_id=group_session_id,
+        actor_user_id=user_id,
+        classroom_id=classroom_id,
+        challenge_id=challenge_id,
+        ref_id=message_id,
+        payload={
+            "chars": len(content),
+            "words": len(content.split()),
+            "content_logged": policy.logs_team_chat_content,
+        },
+        condition=condition,
+    )
 
 
 async def _load_team_chat(group_id: str) -> list[dict]:
@@ -1816,7 +1849,7 @@ async def group_websocket_endpoint(
                 chat_content = (data.get("content") or "").strip()
                 if not chat_content:
                     continue
-                created_at = await _save_team_chat(group_id, user_id, chat_content)
+                _, created_at = await _save_team_chat(group_id, user_id, chat_content)
                 await room.broadcast(
                     {
                         "type": "team_chat",
@@ -2381,7 +2414,9 @@ async def coach_websocket_endpoint(
                 chat_content = (data.get("content") or "").strip()
                 if not chat_content:
                     continue
-                created_at = await _save_team_chat(group_id, user_id, chat_content)
+                chat_id, created_at = await _save_team_chat(group_id, user_id, chat_content)
+                await _log_team_chat(policy, group_session_id, user_id, chat_id, chat_content,
+                                     _classroom_id, challenge_id, condition)
                 await room.broadcast(
                     {
                         "type": "team_chat",

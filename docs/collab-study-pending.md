@@ -42,6 +42,13 @@ filed and approved, and a decision on whether existing consents need re-taking.
 **Owner.** PI plus whoever handles IRB. Longest lead time of anything here —
 start it first, in parallel with everything else.
 
+**Prepared.** `docs/consent-draft-for-pi.md` has a table of everything now
+recorded for the IRB amendment, proposed wording (with a variant for each
+team-chat option), and six questions found in the code: there is no decline
+option, "anonymized" overstates what the scrubbing does, team metrics include
+students who declined, the "train models" claim, how re-consent would work, and
+how withdrawal works.
+
 ---
 
 ### 2. Role taxonomy for role-scoped coaches
@@ -73,18 +80,20 @@ generates. Default taxonomy configurable per assignment.
 **What.** Students can talk to each other in a pane that is deliberately
 firewalled from every coach prompt and from the evaluator.
 
-**Current state.** Messages are stored in `group_chat_messages`. **No study event
-is emitted**, so team discussion is invisible in the log and in the export.
+**Current state — built, waiting on the decision.** Now a per-assignment setting,
+`ClassroomChallenge.team_chat_logging`, set under "Team chat in research" in the
+instructor's Study settings panel: `off` (the default, and the previous
+behaviour), `metadata` (a `group_chat.message` event per message: who, when,
+length, no text), or `content` (as metadata, plus the scrubbed text in the
+export's `team_chat` section). Each event records the mode its message was sent
+under, so a later switch never adds text for earlier messages. See
+`docs/event-schema.md` (`target = group_chat`) and
+`backend/tests/test_team_chat_logging.py`.
 
-**Decision needed.** Three options, and they are materially different: content
-enters the research record; metadata only (who spoke, when, how long — no text);
-or it stays excluded entirely.
-
-**Done looks like.** Whichever is chosen, implemented behind the existing
-`target = "group_chat"` value already in the event vocabulary. Because the
-messages are already stored, choosing "content" later loses nothing — but
-choosing "metadata only" later cannot recover timing that was never logged, so
-this is worth deciding early.
+**Decision needed.** Which of the three options to use. Draft consent wording for
+each is in `docs/consent-draft-for-pi.md`. Decide before the first real session:
+if the choice is `metadata`, the timing of messages sent while the setting is
+still `off` can't be recovered.
 
 ---
 

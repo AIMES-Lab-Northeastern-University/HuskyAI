@@ -882,6 +882,7 @@ def test_the_resolved_condition_is_stamped_on_every_event(app_ready, stub_model)
     turns = asyncio.run(_events(gs, "turn"))
     assert turns[0].condition == {
         "arm": "collab_coach_artifact", "prominence": "on_request", "corpus": None,
+        "team_chat_logging": "off",
     }
 
 

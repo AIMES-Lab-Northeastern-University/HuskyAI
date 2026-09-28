@@ -335,6 +335,13 @@ class ClassroomChallenge(Base):
     # Ground-truth material the evaluator scores against. NULL = today's
     # behaviour: the rubric vector store only, and a null grounding score.
     reference_corpus_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Whether the team backchannel enters the research record (pending the PI):
+    #   off      - not logged (today's behaviour); messages are still stored for replay
+    #   metadata - one study event per message: who, when, length. No text.
+    #   content  - as metadata, and the export carries the scrubbed message text
+    team_chat_logging: Mapped[str] = mapped_column(
+        String(16), default="off", nullable=False
+    )
 
 
 class InstructorTestEnrollment(Base):
@@ -872,6 +879,7 @@ _SQLITE_ADDED_COLUMNS = [
     ("verification_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
+    ("classroom_challenges", "team_chat_logging", "VARCHAR(16) NOT NULL DEFAULT 'off'"),
 ]
 
 
@@ -965,6 +973,8 @@ async def init_db():
                 "consent_research BOOLEAN NOT NULL DEFAULT false",
                 "ALTER TABLE verification_assignments ADD COLUMN IF NOT EXISTS "
                 "replaces_assignment_id VARCHAR",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "team_chat_logging VARCHAR(16) NOT NULL DEFAULT 'off'",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens

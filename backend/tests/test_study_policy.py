@@ -56,7 +56,8 @@ def test_the_policy_is_immutable():
 
 def test_condition_stamp_is_self_describing():
     c = CoachPolicy(arm="collab_coach_artifact", prominence="isolated").as_condition()
-    assert c == {"arm": "collab_coach_artifact", "prominence": "isolated", "corpus": None}
+    assert c == {"arm": "collab_coach_artifact", "prominence": "isolated", "corpus": None,
+                 "team_chat_logging": "off"}
 
 
 # ── Resolution ───────────────────────────────────────────────────────────────

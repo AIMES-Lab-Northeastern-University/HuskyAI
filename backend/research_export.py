@@ -35,7 +35,8 @@ from analysis.turn_taking import METRICS_VERSION, compute_turn_taking, events_fo
 from anonymize import pseudonymize, scrub
 from challenges import get_current_user, get_db
 from database import (Artifact, ArtifactRevision, ContestedPair, ContestedResponse,
-                      Conversation, EvalResult, GroupChallenge, GroupMember,
+                      Conversation, EvalResult, GroupChallenge, GroupChatMessage,
+                      GroupMember,
                       GroupSession, StudyEvent, User, VerificationAssignment,
                       VerificationResponse)
 
@@ -43,7 +44,7 @@ log = logging.getLogger("research_export")
 
 router = APIRouter(prefix="/research", tags=["research"])
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 
 def export_filename(bundle: dict, fmt: str) -> str:
@@ -262,6 +263,40 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
             "rationale": scrub(r.rationale_text, name, email) if r else None,
         })
 
+    # ── Team chat ───────────────────────────────────────────────────────────
+    # Text only for messages whose event was logged under "content" — the event
+    # records the mode it was sent under, so switching an assignment to
+    # "content" later cannot sweep in messages sent under "metadata" or "off".
+    # Consent follows the event's snapshot. Scrubbed against every member, not
+    # just the sender: a backchannel is where students address each other by name.
+    chat_events = [
+        e for e in raw_events
+        if e.target == "group_chat" and e.action == "message" and e.ref_id
+        and (e.payload or {}).get("content_logged")
+        and (not consent_only or e.consent_research)
+    ]
+    chat_msgs = {
+        m.id: m for m in (await db.execute(
+            select(GroupChatMessage).where(
+                GroupChatMessage.id.in_([e.ref_id for e in chat_events] or [""])
+            )
+        )).scalars().all()
+    }
+    team_chat_rows = []
+    for e in chat_events:
+        m = chat_msgs.get(e.ref_id)
+        if m is None:
+            continue
+        text = m.content
+        for uid in [m.sender_user_id, *members]:
+            text = scrub(text, *ident(uid))
+        team_chat_rows.append({
+            "seq": e.seq,
+            "sender": _anon(m.sender_user_id),
+            "content": text,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        })
+
     # ── Metrics, computed from the FULL log ─────────────────────────────────
     # Deliberately not from the consent-filtered subset: a contribution share
     # computed over a subset of a team is not that team's contribution share,
@@ -294,6 +329,7 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
         "evaluations": evaluations,
         "verification": verification_rows,
         "contested": contested_rows,
+        "team_chat": team_chat_rows,
         "turn_taking": metrics,
     }
 
@@ -331,7 +367,8 @@ async def export_session(
     # analysis tools without loading the whole bundle.
     lines = [json.dumps({"kind": "meta", **{k: v for k, v in bundle.items()
                                             if not isinstance(v, list)}})]
-    for kind in ("events", "artifact_revisions", "evaluations", "verification", "contested"):
+    for kind in ("events", "artifact_revisions", "evaluations", "verification", "contested",
+                 "team_chat"):
         for row in bundle[kind]:
             lines.append(json.dumps({"kind": kind, **row}))
     return PlainTextResponse("\n".join(lines), media_type="application/x-ndjson",
