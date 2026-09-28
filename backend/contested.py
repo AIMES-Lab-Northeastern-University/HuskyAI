@@ -111,11 +111,54 @@ async def surface_pair(pair_id: str) -> None:
 
 
 class ScriptPairBody(BaseModel):
-    subproblem_key: str
-    option_a_text: str
-    option_b_text: str
+    subproblem_key: str = Field(..., min_length=1, max_length=64)
+    option_a_text: str = Field(..., min_length=1, max_length=8000)
+    option_b_text: str = Field(..., min_length=1, max_length=8000)
     surfaced_to_user_id: str
     better_option: str | None = Field(None, pattern="^(a|b)$")
+
+
+async def create_scripted_pair(db: AsyncSession, group_session_id: str, group_id: str,
+                               body: ScriptPairBody) -> ContestedPair:
+    """Validate and store one instructor-scripted pair. Shared by the research
+    route and the instructor's team form, so both enforce the same rules.
+
+    Option A is always the teammate's answer and B always the coach's; the
+    field names carry that, and nothing downstream may swap them."""
+    is_member = (await db.execute(
+        select(GroupMember.id).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == body.surfaced_to_user_id,
+        )
+    )).scalar_one_or_none()
+    if is_member is None:
+        raise HTTPException(status_code=400, detail="That user is not on this team")
+    if not body.option_a_text.strip() or not body.option_b_text.strip():
+        raise HTTPException(status_code=400, detail="Both answers need text")
+
+    pair = ContestedPair(
+        group_session_id=group_session_id,
+        subproblem_key=body.subproblem_key.strip()[:64],
+        option_a_text=body.option_a_text.strip(),
+        option_b_text=body.option_b_text.strip(),
+        origin="instructor_scripted",
+        better_option=body.better_option,
+        surfaced_to_user_id=body.surfaced_to_user_id,
+    )
+    db.add(pair)
+    await db.commit()
+    return pair
+
+
+async def notify_new_pair(group_session_id: str) -> None:
+    """Nudge a live session so the student's client refetches its review and
+    contested work (it does so on verification_assigned), making a pair written
+    mid-session appear without a reload. Harmless when nobody is connected."""
+    try:
+        from group_room import rooms
+        await rooms.notify(group_session_id, {"type": "verification_assigned"})
+    except Exception as e:
+        log.error(f"could not notify session of a new contested pair: {e}")
 
 
 @router.post("/sessions/{group_session_id}/pairs")
@@ -139,26 +182,8 @@ async def script_pair(
     team = await db.get(GroupChallenge, gs.group_id)
     await _assert_can_read_research(db, user_id, team.classroom_id if team else None)
 
-    is_member = (await db.execute(
-        select(GroupMember.id).where(
-            GroupMember.group_id == gs.group_id,
-            GroupMember.user_id == body.surfaced_to_user_id,
-        )
-    )).scalar_one_or_none()
-    if is_member is None:
-        raise HTTPException(status_code=400, detail="That user is not on this team")
-
-    pair = ContestedPair(
-        group_session_id=group_session_id,
-        subproblem_key=body.subproblem_key[:64],
-        option_a_text=body.option_a_text,
-        option_b_text=body.option_b_text,
-        origin="instructor_scripted",
-        better_option=body.better_option,
-        surfaced_to_user_id=body.surfaced_to_user_id,
-    )
-    db.add(pair)
-    await db.commit()
+    pair = await create_scripted_pair(db, group_session_id, gs.group_id, body)
+    await notify_new_pair(group_session_id)
     return {"pair_id": pair.id, "subproblem_key": pair.subproblem_key}
 
 

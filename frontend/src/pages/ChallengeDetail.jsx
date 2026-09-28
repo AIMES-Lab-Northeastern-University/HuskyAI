@@ -46,6 +46,9 @@ export default function ChallengeDetail() {
   const [error, setError] = useState('')
   const [starting, setStarting] = useState(null)   // session number being started
   const [completing, setCompleting] = useState(null) // session number being marked complete
+  // Inline refusal from the server, keyed by session number. Normally empty:
+  // the button is disabled while a revision is owed.
+  const [completeError, setCompleteError] = useState({})
   // Post-session analysis modal (revisit a completed session's analysis).
   const [analysisOpen, setAnalysisOpen] = useState(false)
   const [analysisData, setAnalysisData] = useState(null)
@@ -163,6 +166,7 @@ export default function ChallengeDetail() {
   const handleCompleteSession = async (sessionNumber) => {
     if (isDemo) return
     setCompleting(sessionNumber)
+    setCompleteError(prev => ({ ...prev, [sessionNumber]: '' }))
     try {
       const token = localStorage.getItem('token')
       const res = await fetch(`${API_URL}/challenges/${id}/sessions/${sessionNumber}/complete`, {
@@ -171,7 +175,8 @@ export default function ChallengeDetail() {
       })
       if (!res.ok) {
         const d = await res.json().catch(() => ({}))
-        alert(d.detail || 'Could not mark session as complete')
+        setCompleteError(prev => ({ ...prev,
+          [sessionNumber]: typeof d.detail === 'string' ? d.detail : 'Could not mark session as complete' }))
         return
       }
       // Reload so progress ring, status badges, and unlock state all update
@@ -504,20 +509,31 @@ export default function ChallengeDetail() {
 
                           <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto', flexWrap: 'wrap' }}>
                             {/* in_progress: Continue + Mark as complete */}
-                            {session.status === 'in_progress' && (
+                            {session.status === 'in_progress' && (() => {
+                              const owed = session.revision_owed_after_turn
+                              const blocked = completing === session.session_number || owed != null
+                              const err = completeError[session.session_number]
+                              return (
                               <>
+                                {(owed != null || err) && (
+                                  <span role={err ? 'alert' : undefined}
+                                    style={{ fontSize: '12px', color: err ? '#C8102E' : '#6B6560', alignSelf: 'center' }}>
+                                    {err || 'Send your revised attempt in the chat first.'}
+                                  </span>
+                                )}
                                 <button
-                                  disabled={completing === session.session_number}
+                                  disabled={blocked}
                                   onClick={() => handleCompleteSession(session.session_number)}
+                                  title={owed != null ? `A revision is required after the feedback on turn ${owed}` : undefined}
                                   style={{
                                     padding: '8px 16px',
                                     background: 'transparent',
-                                    color: completing === session.session_number ? '#9A948E' : '#16A34A',
-                                    border: `1.5px solid ${completing === session.session_number ? '#E7E0D8' : '#16A34A'}`,
+                                    color: blocked ? '#9A948E' : '#16A34A',
+                                    border: `1.5px solid ${blocked ? '#E7E0D8' : '#16A34A'}`,
                                     borderRadius: '8px',
                                     fontSize: '13px',
                                     fontWeight: 600,
-                                    cursor: completing === session.session_number ? 'not-allowed' : 'pointer',
+                                    cursor: blocked ? 'not-allowed' : 'pointer',
                                   }}
                                 >
                                   {completing === session.session_number ? 'Saving…' : 'Mark as complete'}
@@ -540,7 +556,8 @@ export default function ChallengeDetail() {
                                   {isActive ? 'Starting...' : 'Continue session'}
                                 </button>
                               </>
-                            )}
+                              )
+                            })()}
 
                             {/* not_started (and not locked): Start session */}
                             {session.status === 'not_started' && !isLocked && (

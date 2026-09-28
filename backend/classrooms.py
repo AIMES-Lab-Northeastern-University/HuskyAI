@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth import resolve_token_user_id, pwd_context
 # Authored-section reader, kept in challenges.py next to the validation that
 # writes them so the two cannot drift on which sessions_data key holds them.
-from challenges import _sections_of
+from challenges import _feed_flags_of, _sections_of
 from database import (
     AsyncSessionLocal,
     Challenge,
@@ -422,7 +422,8 @@ async def list_classroom_linked_challenges(
                ClassroomChallenge.id, ClassroomChallenge.study_arm,
                ClassroomChallenge.coach_prominence,
                ClassroomChallenge.verification_policy,
-               ClassroomChallenge.reference_corpus_id)
+               ClassroomChallenge.reference_corpus_id,
+               ClassroomChallenge.revision_policy)
         .join(ClassroomChallenge, ClassroomChallenge.challenge_id == Challenge.id)
         .where(ClassroomChallenge.classroom_id == classroom_id)
         .order_by(ClassroomChallenge.sort_order, Challenge.title)
@@ -445,15 +446,24 @@ async def list_classroom_linked_challenges(
             # Authored artifact sections, so the instructor's editor seeds itself
             # from the list it already loads instead of a second fetch.
             "sections": _sections_of(c),
+            # Per-session PEI feed on/off, so the editor can show the toggles.
+            "feed_enabled_by_session": _feed_flags_of(c),
             "classroom_challenge_id": cc_id,
             "study_arm": study_arm or "control_solo_feed",
             "coach_prominence": coach_prominence or "on_request",
             "verification_policy": verification_policy or "none",
             "reference_corpus_id": reference_corpus_id,
+            "require_revision_on_turn": _revision_turn(revision_policy),
         }
         for (c, sort_order, mode, team_min, team_max, cc_id, study_arm,
-             coach_prominence, verification_policy, reference_corpus_id) in result.all()
+             coach_prominence, verification_policy, reference_corpus_id,
+             revision_policy) in result.all()
     ]
+
+
+def _revision_turn(revision_policy: dict | None) -> int | None:
+    turn = (revision_policy or {}).get("require_revision_on_turn")
+    return turn if isinstance(turn, int) and turn >= 1 else None
 
 
 class StudySettingsBody(BaseModel):
@@ -462,6 +472,10 @@ class StudySettingsBody(BaseModel):
     verification_policy: str | None = Field(
         None, pattern="^(none|round_robin|random|instructor_assigned)$"
     )
+    # The turn after whose feedback one graded revision is required, or null
+    # for no revision step. Checked via model_fields_set, so an explicit null
+    # turns it off while an absent field leaves it alone.
+    require_revision_on_turn: int | None = Field(None, ge=1, le=50)
 
 
 @router.patch("/assignments/{classroom_challenge_id}/study")
@@ -495,12 +509,22 @@ async def update_study_settings(
         cc.coach_prominence = body.coach_prominence
     if body.verification_policy is not None:
         cc.verification_policy = body.verification_policy
+    if "require_revision_on_turn" in body.model_fields_set:
+        # Rebuilt rather than mutated in place: SQLAlchemy does not see in-place
+        # edits to a JSON column. Other keys in the policy are kept.
+        rest = {k: v for k, v in (cc.revision_policy or {}).items()
+                if k != "require_revision_on_turn"}
+        if body.require_revision_on_turn is None:
+            cc.revision_policy = rest or None
+        else:
+            cc.revision_policy = {**rest, "require_revision_on_turn": body.require_revision_on_turn}
     await db.commit()
     return {
         "classroom_challenge_id": cc.id,
         "study_arm": cc.study_arm,
         "coach_prominence": cc.coach_prominence,
         "verification_policy": cc.verification_policy,
+        "require_revision_on_turn": _revision_turn(cc.revision_policy),
     }
 
 

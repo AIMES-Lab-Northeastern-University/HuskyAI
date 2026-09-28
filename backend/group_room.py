@@ -554,6 +554,17 @@ class RoomManager:
         """Return the live room if one exists, without creating it."""
         return self._rooms.get(group_session_id)
 
+    async def notify(self, group_session_id: str, payload: dict) -> None:
+        """Push a payload to a session's sockets from outside a socket handler
+        (an HTTP endpoint), without creating a room nobody is in. Under Redis
+        the sockets may be on another worker, so publish even when this worker
+        holds no room."""
+        room = self._rooms.get(group_session_id)
+        if room is not None:
+            await room.broadcast(payload)
+        elif self._fanout is not None:
+            await self._fanout.publish(group_session_id, payload)
+
     async def drop_if_empty(self, group_session_id: str) -> None:
         async with self._guard:
             room = self._rooms.get(group_session_id)

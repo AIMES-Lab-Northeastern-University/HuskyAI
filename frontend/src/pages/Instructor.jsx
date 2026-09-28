@@ -77,6 +77,8 @@ function StudySettings({ cc, onSaved }) {
   const [arm, setArm] = useState(cc.study_arm || 'control_solo_feed')
   const [prominence, setProminence] = useState(cc.coach_prominence || 'on_request')
   const [verification, setVerification] = useState(cc.verification_policy || 'none')
+  // Turn after which one graded revision is required; '' = no revision step.
+  const [revisionTurn, setRevisionTurn] = useState(cc.require_revision_on_turn ?? '')
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState(null)
 
@@ -87,7 +89,8 @@ function StudySettings({ cc, onSaved }) {
         method: 'PATCH',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ study_arm: arm, coach_prominence: prominence,
-                               verification_policy: verification }),
+                               verification_policy: verification,
+                               require_revision_on_turn: revisionTurn === '' ? null : Number(revisionTurn) }),
       })
       if (r.ok) { setMsg('Saved.'); onSaved?.(await r.json()) }
       else setMsg((await r.json()).detail || 'Could not save')
@@ -129,9 +132,39 @@ function StudySettings({ cc, onSaved }) {
           <option value="none">Off</option>
           <option value="round_robin">Round robin</option>
           <option value="random">Random teammate</option>
-          <option value="instructor_assigned">I assign manually</option>
+          <option value="instructor_assigned">I pick each student's reviewer</option>
         </select>
       </div>
+      {verification === 'instructor_assigned' && (
+        <div style={{ fontSize: '11px', color: '#9A948E', lineHeight: 1.6, margin: '-2px 0 8px 160px' }}>
+          Pick reviewers per team under Manage teams. A student with no reviewer
+          picked gets no review — it never falls back to round robin.
+        </div>
+      )}
+
+      {arm === 'control_solo_feed' && (
+        <>
+          <div style={row}>
+            <span style={lbl}>Required revision</span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#4A4440' }}>
+              <input type="checkbox" checked={revisionTurn !== ''}
+                     onChange={e => setRevisionTurn(e.target.checked ? 1 : '')} />
+              After the feedback on turn
+            </label>
+            <input type="number" min={1} max={50} aria-label="Revision turn"
+                   value={revisionTurn} disabled={revisionTurn === ''}
+                   onChange={e => setRevisionTurn(e.target.value === '' ? 1 : Math.max(1, Math.min(50, Number(e.target.value))))}
+                   style={{ ...sel, width: '60px' }} />
+          </div>
+          {revisionTurn !== '' && (
+            <div style={{ fontSize: '11px', color: '#9A948E', lineHeight: 1.6, margin: '-2px 0 8px 160px' }}>
+              Students must submit one revision after seeing the score for turn {revisionTurn},
+              and cannot finish the session until they do. Not required in sessions where the
+              score feed is hidden.
+            </div>
+          )}
+        </>
+      )}
 
       <div style={{ fontSize: '11px', color: '#9A948E', lineHeight: 1.6, marginTop: '4px' }}>
         Changing these affects new sessions. Sessions already in progress keep the
@@ -192,6 +225,8 @@ export default function Instructor() {
   const [editTimed, setEditTimed] = useState(false)
   const [editTimeLimit, setEditTimeLimit] = useState(15)
   const [editMinTurns, setEditMinTurns] = useState(5)
+  // Per-session PEI feed on/off (control arm), one boolean per session.
+  const [editFeed, setEditFeed] = useState([])
   const [actionMsg, setActionMsg] = useState('')
   const [testToggleSaving, setTestToggleSaving] = useState(false)
   const [renamingSection, setRenamingSection] = useState(false)
@@ -492,6 +527,7 @@ export default function Instructor() {
             title: (s.title || '').trim(),
             prompt: (s.prompt || '').trim(),
           })),
+          ...(editFeed.length ? { feed_enabled_by_session: editFeed } : {}),
         }),
       })
       const d = await r.json().catch(() => ({}))
@@ -1529,6 +1565,23 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
+                                        {editFeed.length > 0 && (
+                                          <div style={{ display: 'grid', gap: '4px' }}>
+                                            <div style={{ fontSize: '12px', color: '#4A4440' }}>Show score feed to students in</div>
+                                            <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
+                                              {editFeed.map((on, idx) => (
+                                                <label key={idx} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#4A4440', cursor: 'pointer' }}>
+                                                  <input type="checkbox" checked={on}
+                                                    onChange={e => setEditFeed(prev => prev.map((v, j) => (j === idx ? e.target.checked : v)))} />
+                                                  Session {idx + 1}
+                                                </label>
+                                              ))}
+                                            </div>
+                                            <span style={{ fontSize: '11px', color: '#9A948E' }}>
+                                              Solo chat with score feed only. Turns are still scored when the feed is hidden; students just don't see it. Applies to sessions started after you save.
+                                            </span>
+                                          </div>
+                                        )}
                                         <SectionsEditor
                                           sections={editSections}
                                           onChange={setEditSections}
@@ -1585,6 +1638,9 @@ export default function Instructor() {
                                             setEditTimed(c.time_limit_minutes != null || c.min_turns != null)
                                             setEditTimeLimit(c.time_limit_minutes ?? 15)
                                             setEditMinTurns(c.min_turns ?? 5)
+                                            setEditFeed(Array.isArray(c.feed_enabled_by_session)
+                                              ? [...c.feed_enabled_by_session]
+                                              : Array(c.total_sessions || 0).fill(true))
                                             // Copied, not aliased: editing rows
                                             // must not mutate the loaded list.
                                             setEditSections((c.sections || []).map(s => ({ ...s })))
@@ -1654,7 +1710,8 @@ export default function Instructor() {
                                   </div>
                                 </div>
                                 {c.mode === 'group' && !isDemo && manageTeamsId === c.id && (
-                                  <GroupTeamManager classroomId={selectedId} challengeId={c.id} />
+                                  <GroupTeamManager classroomId={selectedId} challengeId={c.id}
+                                                    verificationPolicy={c.verification_policy} />
                                 )}
                                 {!isDemo && studySettingsId === c.id && c.classroom_challenge_id && (
                                   <div style={{ marginTop: '10px', display: 'grid', gap: '10px' }}>

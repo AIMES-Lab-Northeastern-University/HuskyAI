@@ -824,6 +824,30 @@ def _apply_sections(sessions_data: list[dict], sections: list[dict]) -> list[dic
     return out
 
 
+def _apply_feed_flags(sessions_data: list[dict], flags: list[bool]) -> list[dict]:
+    """Set whether each session shows the PEI feed (control arm).
+
+    Per session, not per assignment: the design shows the feed in early
+    sessions and withholds it in a later one to see what carries over. Stored as
+    `sessions_data[n]["feed_enabled"]`, which main.py::_resolve_solo_study_config
+    reads when a session connects. "On" is written as an absent key — the
+    documented default — so an untouched challenge and one toggled off and back
+    on look the same. Every other session key is preserved."""
+    out = []
+    for sd, on in zip(sessions_data or [], flags):
+        merged = dict(sd)
+        if on:
+            merged.pop("feed_enabled", None)
+        else:
+            merged["feed_enabled"] = False
+        out.append(merged)
+    return out
+
+
+def _feed_flags_of(ch: Challenge) -> list[bool]:
+    return [bool(sd.get("feed_enabled", True)) for sd in (ch.sessions_data or [])]
+
+
 def _sections_of(ch: Challenge) -> list[dict]:
     """The authored sections for a challenge, read off its first session."""
     for sd in ch.sessions_data or []:
@@ -869,6 +893,10 @@ class UpdateChallengeBody(BaseModel):
     # Replace-all, like the timer fields: an explicit [] removes the sections
     # and leaves a free-form artifact. Absent = leave whatever is there.
     sections: Optional[list[SectionBody]] = None
+    # One entry per session, in order: is the PEI feed shown to the student in
+    # that session? Must cover every session, so a short list cannot silently
+    # leave the rest at whatever they were.
+    feed_enabled_by_session: Optional[list[bool]] = None
 
 
 async def _student_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
@@ -1242,6 +1270,16 @@ async def update_challenge(
         ch.sessions_data = _apply_sections(
             ch.sessions_data, _normalize_sections(body.sections)
         )
+    if body.feed_enabled_by_session is not None:
+        if len(body.feed_enabled_by_session) != len(ch.sessions_data or []):
+            raise HTTPException(
+                status_code=400,
+                detail=f"feed_enabled_by_session needs one entry per session "
+                       f"({len(ch.sessions_data or [])})",
+            )
+        # Takes effect for sessions that connect after the save; a session
+        # already open keeps the feed setting it resolved at connect.
+        ch.sessions_data = _apply_feed_flags(ch.sessions_data, body.feed_enabled_by_session)
     await db.commit()
     await db.refresh(ch)
     return {
@@ -1252,6 +1290,7 @@ async def update_challenge(
         "time_limit_minutes": ch.time_limit_minutes,
         "min_turns": ch.min_turns,
         "sections": _sections_of(ch),
+        "feed_enabled_by_session": _feed_flags_of(ch),
     }
 
 
@@ -1302,6 +1341,12 @@ async def get_challenge(
             "started_at": us.started_at.isoformat() if us and us.started_at else None,
             "completed_at": us.completed_at.isoformat() if us and us.completed_at else None,
             "end_reason": us.end_reason if us else None,
+            # The turn whose feedback still needs a revision, so the page can
+            # disable "Mark as complete" instead of letting the server refuse.
+            "revision_owed_after_turn": (
+                await revision_owed(db, user_id, challenge_id, us)
+                if us and us.status == "in_progress" else None
+            ),
         })
 
     group_mode, group = await _student_group_info(db, user_id, challenge_id)
@@ -1407,14 +1452,21 @@ async def start_session(
     }
 
 
-async def _assert_revision_submitted(
-    db: AsyncSession, user_id: str, challenge_id: str, session_record
-) -> None:
-    """Raise 409 if this assignment requires a graded revision and none exists.
+REVISION_OWED_DETAIL = ("This session needs one revision: send your revised attempt "
+                        "before finishing.")
 
-    No-op unless a ClassroomChallenge in one of the user's sections sets
-    revision_policy.require_revision_on_turn, so every existing assignment
-    completes exactly as before."""
+
+async def revision_owed(
+    db: AsyncSession, user_id: str, challenge_id: str, session_record
+) -> int | None:
+    """The turn whose feedback the student still owes a graded revision for, or
+    None when nothing is owed.
+
+    The single definition every gate and every UI hint uses: the challenge
+    page's complete button, the workspace's End Session button, and the two
+    server paths that finish a session. None unless a ClassroomChallenge in one
+    of the user's sections sets revision_policy.require_revision_on_turn, so
+    every existing assignment behaves exactly as before."""
     cc = (await db.execute(
         select(ClassroomChallenge)
         .join(ClassroomMembership,
@@ -1427,23 +1479,35 @@ async def _assert_revision_submitted(
     )).scalar_one_or_none()
     required = (cc.revision_policy or {}).get("require_revision_on_turn") if cc else None
     if not isinstance(required, int) or required < 1:
-        return
+        return None
+    # The revision responds to feedback, so a session with the feed hidden
+    # (sessions_data[n]["feed_enabled"] false) never opens one. Requiring it
+    # there would leave the student unable to complete a session in which they
+    # were never asked to revise.
+    ch = await db.get(Challenge, challenge_id)
+    idx = (session_record.session_number or 1) - 1
+    if ch and ch.sessions_data and 0 <= idx < len(ch.sessions_data) \
+            and not ch.sessions_data[idx].get("feed_enabled", True):
+        return None
     if not session_record.conversation_id:
-        raise HTTPException(
-            status_code=409,
-            detail="This session requires a revision after the feedback before it can be completed.",
-        )
+        return required
     has_revision = (await db.execute(
         select(EvalResult.id).where(
             EvalResult.conversation_id == session_record.conversation_id,
             EvalResult.is_graded_revision.is_(True),
         ).limit(1)
     )).scalar_one_or_none()
-    if has_revision is None:
-        raise HTTPException(
-            status_code=409,
-            detail="This session requires a revision after the feedback before it can be completed.",
-        )
+    return required if has_revision is None else None
+
+
+async def _assert_revision_submitted(
+    db: AsyncSession, user_id: str, challenge_id: str, session_record
+) -> None:
+    """Raise 409 if a graded revision is still owed. The server-side backstop:
+    the UI disables the finish buttons first, so a student normally never
+    reaches this; a stale tab or a direct request does."""
+    if await revision_owed(db, user_id, challenge_id, session_record) is not None:
+        raise HTTPException(status_code=409, detail=REVISION_OWED_DETAIL)
 
 
 @router.post("/{challenge_id}/sessions/{session_number}/complete")
