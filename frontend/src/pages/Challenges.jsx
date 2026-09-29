@@ -6,6 +6,7 @@ import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
 import InfoIcon from '../components/InfoIcon'
 import { PEI_INFO } from '../lib/metricInfo'
 import { DEMO_CHALLENGE_LIST } from '../demo/demoData'
+import { clearSession } from '../lib/api'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -180,8 +181,7 @@ export default function Challenges() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 

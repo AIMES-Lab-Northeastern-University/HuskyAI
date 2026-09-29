@@ -178,6 +178,10 @@ def _build_run_record(
     golden_scores: dict,
 ) -> dict:
     """Translate a raw evaluator result into the report's per-run shape."""
+    if error is None and isinstance(raw, dict) and raw.get("eval_failed"):
+        # The evaluator gave up (it now returns no scores rather than zeros),
+        # so this run is a failure, not a prediction of 0 on every dimension.
+        error = "evaluator failed after retries"
     if error is not None or raw is None:
         return {
             "run_index": run_index,

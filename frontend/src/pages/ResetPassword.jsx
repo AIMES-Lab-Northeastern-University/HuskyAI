@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { API_URL, formatApiErrorDetail } from '../lib/api'
+import { API_URL, formatApiErrorDetail, clearSession } from '../lib/api'
 
 export default function ResetPassword() {
   const [params] = useSearchParams()
@@ -31,8 +31,7 @@ export default function ResetPassword() {
       if (!res.ok) throw new Error(formatApiErrorDetail(data.detail))
       // The reset invalidated every existing session for this account, including
       // any stale token in this browser. Clear it so the app cannot act on it.
-      localStorage.removeItem('token')
-      localStorage.removeItem('user')
+      clearSession()
       setDone(true)
       window.setTimeout(() => navigate('/login'), 2200)
     } catch (err) {

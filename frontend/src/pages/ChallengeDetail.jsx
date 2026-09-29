@@ -5,6 +5,7 @@ import SessionAnalysisCard from '../components/SessionAnalysisCard'
 import InfoIcon from '../components/InfoIcon'
 import { PEI_INFO } from '../lib/metricInfo'
 import { getDemoChallengeDetail, demoSlugForChallengeId } from '../demo/demoData'
+import { readApiError, clearSession } from '../lib/api'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -109,8 +110,7 @@ export default function ChallengeDetail() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 
@@ -151,8 +151,7 @@ export default function ChallengeDetail() {
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!res.ok) {
-        const d = await res.json()
-        alert(d.detail || 'Could not start session')
+        alert(await readApiError(res, 'Could not start session'))
         return
       }
       navigate(`/workspace?challenge=${id}&session=${sessionNumber}`)
@@ -174,9 +173,8 @@ export default function ChallengeDetail() {
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!res.ok) {
-        const d = await res.json().catch(() => ({}))
-        setCompleteError(prev => ({ ...prev,
-          [sessionNumber]: typeof d.detail === 'string' ? d.detail : 'Could not mark session as complete' }))
+        const msg = await readApiError(res, 'Could not mark session as complete')
+        setCompleteError(prev => ({ ...prev, [sessionNumber]: msg }))
         return
       }
       // Reload so progress ring, status badges, and unlock state all update
@@ -511,20 +509,28 @@ export default function ChallengeDetail() {
                             {/* in_progress: Continue + Mark as complete */}
                             {session.status === 'in_progress' && (() => {
                               const owed = session.revision_owed_after_turn
-                              const blocked = completing === session.session_number || owed != null
+                              // Same rule the server enforces (challenges.finish_check).
+                              const turnsLeft = session.turns_left || 0
+                              const blocked = completing === session.session_number || owed != null || turnsLeft > 0
                               const err = completeError[session.session_number]
+                              const note = err
+                                || (turnsLeft > 0
+                                  ? `Send ${turnsLeft} more scored turn${turnsLeft === 1 ? '' : 's'} in the chat first.`
+                                  : owed != null ? 'Send your revised attempt in the chat first.' : null)
                               return (
                               <>
-                                {(owed != null || err) && (
+                                {note && (
                                   <span role={err ? 'alert' : undefined}
                                     style={{ fontSize: '12px', color: err ? '#C8102E' : '#6B6560', alignSelf: 'center' }}>
-                                    {err || 'Send your revised attempt in the chat first.'}
+                                    {note}
                                   </span>
                                 )}
                                 <button
                                   disabled={blocked}
                                   onClick={() => handleCompleteSession(session.session_number)}
-                                  title={owed != null ? `A revision is required after the feedback on turn ${owed}` : undefined}
+                                  title={turnsLeft > 0
+                                    ? `This session needs ${session.min_turns} scored turns (you have ${session.scored_turns ?? 0})`
+                                    : owed != null ? `A revision is required after the feedback on turn ${owed}` : undefined}
                                   style={{
                                     padding: '8px 16px',
                                     background: 'transparent',

@@ -264,7 +264,7 @@ async def user_activity(
     eval_count = await db.scalar(
         select(func.count()).select_from(EvalResult)
         .join(Conversation, Conversation.id == EvalResult.conversation_id)
-        .where(Conversation.user_id == user_id)
+        .where(Conversation.user_id == user_id, EvalResult.pei.is_not(None))
     ) or 0
     avg_eval_pei = await db.scalar(
         select(func.avg(EvalResult.pei))
@@ -342,6 +342,49 @@ async def user_activity(
 # Per-conversation drill-down (full transcript + per-turn evaluation)
 # ---------------------------------------------------------------------------
 
+def _pair_messages(msgs) -> list[dict]:
+    """(role, content, sender_user_id) rows, oldest first -> one dict per turn:
+    {"user", "assistant", "sender_user_id"}. Turn N is the Nth pair, which is
+    how every turn path numbers turns (EvalResult.turn_number)."""
+    pairs: list[dict] = []
+    pending: Optional[dict] = None
+    for role, content, sender in msgs:
+        if role == "user":
+            if pending is not None:  # two users in a row — flush the first
+                pairs.append(pending)
+            pending = {"user": content, "assistant": None, "sender_user_id": sender}
+        elif role == "assistant":
+            if pending is None:
+                pairs.append({"user": None, "assistant": content, "sender_user_id": None})
+            else:
+                pending["assistant"] = content
+                pairs.append(pending)
+                pending = None
+    if pending is not None:
+        pairs.append(pending)
+    return pairs
+
+
+def _evals_by_turn(pairs: list[dict], evals: list) -> list[tuple[int, object]]:
+    """[(pair_index, eval)] matching each eval to the turn it scored.
+
+    By turn_number, not position. Matching positionally shifted every later
+    score onto the wrong prompt as soon as one turn had no EvalResult (a group
+    turn whose scoring failed, for instance) — and the consent flag and author
+    shifted with it. Legacy conversations whose turn numbers repeat (an old
+    resume bug restarted them at 1) cannot be matched by number, so those alone
+    fall back to position."""
+    numbers = [e.turn_number for e in evals]
+    if len(set(numbers)) != len(numbers):
+        return list(zip(range(len(pairs)), evals))
+    out = []
+    for e in sorted(evals, key=lambda e: e.turn_number):
+        idx = (e.turn_number or 0) - 1
+        if 0 <= idx < len(pairs):
+            out.append((idx, e))
+    return out
+
+
 @router.get("/conversations/{conversation_id}")
 async def conversation_detail(
     conversation_id: str,
@@ -357,39 +400,30 @@ async def conversation_detail(
     owner = await db.get(User, conv.user_id)
 
     mr = await db.execute(
-        select(Message.role, Message.content, Message.created_at)
+        select(Message.role, Message.content, Message.sender_user_id)
         .where(Message.conversation_id == conversation_id)
         .order_by(Message.created_at)
     )
-    # Pair messages into (user, assistant) turns in chronological order.
-    pairs: list[tuple[Optional[str], Optional[str]]] = []
-    pending_user: Optional[str] = None
-    for role, content, _created in mr.all():
-        if role == "user":
-            if pending_user is not None:
-                pairs.append((pending_user, None))
-            pending_user = content
-        elif role == "assistant":
-            pairs.append((pending_user, content))
-            pending_user = None
-    if pending_user is not None:
-        pairs.append((pending_user, None))
+    pairs = _pair_messages(mr.all())
 
     er = await db.execute(
         select(EvalResult)
         .where(EvalResult.conversation_id == conversation_id)
         .order_by(EvalResult.turn_number)
     )
-    evals = er.scalars().all()
+    by_index = dict(_evals_by_turn(pairs, er.scalars().all()))
 
     turns = []
-    for i, (user_msg, asst_msg) in enumerate(pairs):
-        ev = evals[i] if i < len(evals) else None
+    for i, pair in enumerate(pairs):
+        ev = by_index.get(i)
         fr = ev.full_result if (ev and isinstance(ev.full_result, dict)) else {}
         turns.append({
-            "turn": ev.turn_number if ev else i + 1,
-            "prompt": user_msg,
-            "response": asst_msg,
+            "turn": i + 1,
+            "prompt": pair["user"],
+            "response": pair["assistant"],
+            # Who wrote the prompt: in a shared group chat, not the owner.
+            "sender_user_id": pair["sender_user_id"] or conv.user_id,
+            "score_status": (ev.score_status or "scored") if ev else None,
             "scores": None if not ev else {
                 "pei": ev.pei, "psq": ev.psq, "ccm": ev.ccm,
                 "tsi": ev.tsi, "clm": ev.clm, "ras": ev.ras,
@@ -627,61 +661,47 @@ async def _gather_export_rows(db: AsyncSession, consent_only: bool) -> list[dict
     conv_meta = {row[0]: {"user_id": row[1], "started_at": row[2]} for row in cr.all()}
 
     mr = await db.execute(
-        select(Message.conversation_id, Message.role, Message.content, Message.created_at)
+        select(Message.conversation_id, Message.role, Message.content, Message.sender_user_id)
         .where(Message.conversation_id.in_(conv_ids))
         .order_by(Message.conversation_id, Message.created_at)
     )
-    msgs_by_conv: dict[str, list[tuple[str, str]]] = {}
-    for cid, role, content, _created in mr.all():
-        msgs_by_conv.setdefault(cid, []).append((role, content))
+    msgs_by_conv: dict[str, list[tuple]] = {}
+    for cid, role, content, sender in mr.all():
+        msgs_by_conv.setdefault(cid, []).append((role, content, sender))
 
-    # Per conversation, evals in turn order. We match them to message pairs
-    # positionally (resumed sessions don't always start at turn 1, so the
-    # turn_number value is not a reliable index — but ordering is).
     evals_by_conv: dict[str, list[EvalResult]] = {}
     for e in evals:
         evals_by_conv.setdefault(e.conversation_id, []).append(e)
-    for lst in evals_by_conv.values():
-        lst.sort(key=lambda e: e.turn_number)
 
     rows: list[dict] = []
     for cid in conv_ids:
         meta = conv_meta.get(cid)
         if not meta:
             continue
-        name, email, _consent = user_info.get(meta["user_id"], (None, None, False))
-
-        student_pseudonym = pseudonymize(meta["user_id"], "anon")
         conv_pseudonym = pseudonymize(cid, "conv")
         started = meta["started_at"]
         week = started.strftime("%G-W%V") if started else None
 
-        # Pair messages into (user, assistant) turns in chronological order.
-        pairs: list[tuple[Optional[str], Optional[str]]] = []
-        pending_user: Optional[str] = None
-        for role, content in msgs_by_conv.get(cid, []):
-            if role == "user":
-                if pending_user is not None:  # two users in a row — flush the first
-                    pairs.append((pending_user, None))
-                pending_user = content
-            elif role == "assistant":
-                pairs.append((pending_user, content))
-                pending_user = None
-        if pending_user is not None:
-            pairs.append((pending_user, None))
-
-        turn_evals = evals_by_conv.get(cid, [])
-        # Match scored turns to message pairs positionally, in order.
-        for ev, (user_msg, asst_msg) in zip(turn_evals, pairs):
-            # Per-turn consent snapshot: only export turns the student consented to.
+        pairs = _pair_messages(msgs_by_conv.get(cid, []))
+        for idx, ev in _evals_by_turn(pairs, evals_by_conv.get(cid, [])):
+            pair = pairs[idx]
+            # The prompt's author, not the conversation's owner: in a shared
+            # group chat the owner is whoever created the team, and every
+            # teammate's prompt used to be exported under that one student.
+            author = pair["sender_user_id"] or meta["user_id"]
+            name, email, _consent = user_info.get(author, (None, None, False))
+            # Consent is the per-turn snapshot, which for a group turn is the
+            # prompt author's own (see _save_group_turn); matching by turn
+            # number keeps it attached to the right message.
             if consent_only and not bool(getattr(ev, "consent_research", False)):
                 continue
             fr = ev.full_result if isinstance(ev.full_result, dict) else {}
             breakdown = fr.get("breakdown", {}) if isinstance(fr, dict) else {}
+            user_msg, asst_msg = pair["user"], pair["assistant"]
             rows.append({
-                "student_pseudonym": student_pseudonym,
+                "student_pseudonym": pseudonymize(author, "anon"),
                 "conversation_pseudonym": conv_pseudonym,
-                "turn": ev.turn_number,
+                "turn": idx + 1,
                 "week": week,
                 "domain": _parse_domain(fr.get("domain_raw")),
                 "classification": ev.classification,
@@ -689,6 +709,8 @@ async def _gather_export_rows(db: AsyncSession, consent_only: bool) -> list[dict
                 "pei": ev.pei, "psq": ev.psq, "ccm": ev.ccm,
                 "tsi": ev.tsi, "clm": ev.clm, "ras": ev.ras,
                 "breakdown": {k: breakdown.get(k) for k in _BREAKDOWN_KEYS},
+                # "scored" | "scored_late" | "pending" | "failed" (see EvalResult).
+                "score_status": ev.score_status or "scored",
                 "prompt": scrub(user_msg, name, email),
                 "response": scrub(asst_msg, name, email),
             })
@@ -732,7 +754,8 @@ async def export_conversations(
     # CSV: flatten breakdown sub-metrics into their own columns.
     cols = (
         ["student_pseudonym", "conversation_pseudonym", "turn", "week", "domain",
-         "classification", "leading_status", "pei", "psq", "ccm", "tsi", "clm", "ras"]
+         "classification", "leading_status", "pei", "psq", "ccm", "tsi", "clm", "ras",
+         "score_status"]
         + _BREAKDOWN_KEYS
         + ["prompt", "response"]
     )
@@ -744,7 +767,7 @@ async def export_conversations(
         writer.writerow(
             [r["student_pseudonym"], r["conversation_pseudonym"], r["turn"], r["week"],
              r["domain"], r["classification"], r["leading_status"],
-             r["pei"], r["psq"], r["ccm"], r["tsi"], r["clm"], r["ras"]]
+             r["pei"], r["psq"], r["ccm"], r["tsi"], r["clm"], r["ras"], r["score_status"]]
             + [bd.get(k) for k in _BREAKDOWN_KEYS]
             + [r["prompt"], r["response"]]
         )

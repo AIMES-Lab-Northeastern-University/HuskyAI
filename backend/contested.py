@@ -33,12 +33,13 @@ router = APIRouter(prefix="/contested", tags=["contested"])
 
 ADOPTIONS = ("a", "b", "neither", "merged")
 
-# An "inspection" is an expand or a dwell on the contested section. Opening the
-# artifact panel is not inspecting a particular option.
-INSPECT_ACTIONS = {"section_expand", "dwell"}
-# Reading the coach's side means having the coach turn in view; the closest
-# honest proxy in the log is the student's own coach turn on this section.
-COACH_VIEW_ACTIONS = {"turn"}
+# An inspection is the student opening THAT option: each option in the
+# contested card starts collapsed, and expanding it logs contested.option_expand
+# (and option_dwell when it closes). Until #16 this was inferred from proxies —
+# an expand of the artifact section for A, any coach turn for B — which credited
+# a student with reading an option they may never have opened.
+INSPECT_ACTIONS = {"option_expand", "option_dwell"}
+OPTIONS = ("a", "b")
 
 
 class AdoptBody(BaseModel):
@@ -51,36 +52,86 @@ class AdoptBody(BaseModel):
     dwell_ms_b: int | None = None
 
 
-async def derive_inspection(db: AsyncSession, pair: ContestedPair) -> tuple[bool, bool]:
-    """Did this student actually look at each option before now?
-
-    A: an expand/dwell of the contested section, after the pair was surfaced.
-    B: a coach turn of their own in this session, after the pair was surfaced —
-       the coach's answer reached them through their own conversation.
-
-    Both windows start at `surfaced_at`: reading the section an hour before the
-    pair existed is not inspecting this contested option."""
-    since = pair.surfaced_at or pair.created_at
-    events = (await db.execute(
+async def _option_events(db: AsyncSession, pair: ContestedPair) -> list:
+    return list((await db.execute(
         select(StudyEvent).where(
             StudyEvent.group_session_id == pair.group_session_id,
             StudyEvent.actor_user_id == pair.surfaced_to_user_id,
+            StudyEvent.target == "contested",
+            StudyEvent.ref_id == pair.id,
+            StudyEvent.action.in_(INSPECT_ACTIONS),
+            StudyEvent.actor_kind == "student",
         ).order_by(StudyEvent.seq)
-    )).scalars().all()
+    )).scalars().all())
 
-    inspected_a = any(
-        e.target == "artifact" and e.action in INSPECT_ACTIONS
-        and e.actor_kind == "student"
-        and (e.payload or {}).get("section_key") == pair.subproblem_key
-        and (since is None or e.server_ts >= since)
-        for e in events
+
+async def derive_inspection(db: AsyncSession, pair: ContestedPair) -> tuple[bool, bool]:
+    """Did this student actually open each option before now?
+
+    Only from this pair's own option_expand / option_dwell events, after the
+    pair was surfaced to them."""
+    since = pair.surfaced_at or pair.created_at
+    seen = {
+        (e.payload or {}).get("option")
+        for e in await _option_events(db, pair)
+        if since is None or e.server_ts >= since
+    }
+    return "a" in seen, "b" in seen
+
+
+async def derive_dwell(db: AsyncSession, pair: ContestedPair) -> tuple[int | None, int | None]:
+    """Total time each option was open, summed from the log. None when the
+    student never had it open long enough to record."""
+    totals = {"a": 0, "b": 0}
+    for e in await _option_events(db, pair):
+        p = e.payload or {}
+        if e.action == "option_dwell" and p.get("option") in totals and isinstance(p.get("duration_ms"), int):
+            totals[p["option"]] += p["duration_ms"]
+    return (totals["a"] or None), (totals["b"] or None)
+
+
+async def log_option_read(group_session_id: str, user_id: str, data: dict):
+    """A student opened (or closed, with dwell) one option of a contested pair.
+
+    Returns the EventResult, or None when the frame names a pair that is not
+    this student's in this session (it can never be recorded, so the caller
+    acks it anyway to stop the client replaying it)."""
+    from database import AsyncSessionLocal
+    from events import record_event
+
+    pair_id, option = data.get("pair_id"), data.get("option")
+    if not pair_id or option not in OPTIONS:
+        return None
+    async with AsyncSessionLocal() as db:
+        pair = await db.get(ContestedPair, pair_id)
+        if (pair is None or pair.group_session_id != group_session_id
+                or pair.surfaced_to_user_id != user_id):
+            return None
+        gs = await db.get(GroupSession, group_session_id)
+        challenge_id = gs.challenge_id if gs else None
+    if data.get("type") == "contested_option_dwell":
+        ms = data.get("duration_ms")
+        if not isinstance(ms, int) or ms <= 0:
+            return None
+        action, payload = "option_dwell", {"option": option, "duration_ms": ms}
+        from artifacts import DWELL_FLUSH_REASONS
+        if data.get("flush") in DWELL_FLUSH_REASONS:
+            payload["flush"] = data["flush"]
+    else:
+        action, payload = "option_expand", {"option": option}
+    client_ts = None
+    raw = data.get("client_ts")
+    if raw:
+        try:
+            client_ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            client_ts = None
+    return await record_event(
+        action=action, target="contested", actor_kind="student",
+        group_session_id=group_session_id, actor_user_id=user_id,
+        challenge_id=challenge_id, ref_id=pair_id, payload=payload,
+        idempotency_key=data.get("event_id"), client_ts=client_ts,
     )
-    inspected_b = any(
-        e.target == "coach" and e.action in COACH_VIEW_ACTIONS
-        and (since is None or e.server_ts >= since)
-        for e in events
-    )
-    return inspected_a, inspected_b
 
 
 async def surface_pair(pair_id: str) -> None:
@@ -243,13 +294,17 @@ async def adopt(
         raise HTTPException(status_code=409, detail="Already answered")
 
     inspected_a, inspected_b = await derive_inspection(db, pair)
+    # From the log when it has them; the client's figures only for a client
+    # that predates option events.
+    logged_a, logged_b = await derive_dwell(db, pair)
 
     student = await db.get(User, user_id)
     resp = ContestedResponse(
         pair_id=pair_id, user_id=user_id, adopted=body.adopted,
         consent_research=bool(student.consent_research) if student else False,
         inspected_a=inspected_a, inspected_b=inspected_b,
-        dwell_ms_a=body.dwell_ms_a, dwell_ms_b=body.dwell_ms_b,
+        dwell_ms_a=logged_a if logged_a is not None else body.dwell_ms_a,
+        dwell_ms_b=logged_b if logged_b is not None else body.dwell_ms_b,
         rationale_text=body.rationale_text,
         responded_at=datetime.utcnow(),
     )

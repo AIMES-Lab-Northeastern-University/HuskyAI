@@ -258,9 +258,11 @@ function SessionBlock({ s, nameById, first }) {
             <div style={{ minWidth: '230px' }}>
               <div style={{ ...SECTION_LABEL, marginBottom: '6px' }}>
                 Coach reliance
-                <InfoIcon text="Among writes made when a teammate's work was available to adopt: coach-copied text versus text the student typed after reading a teammate. Both are adoption; the question is adoption of whose work." />
+                <InfoIcon text="Among writes made when a teammate's work was available to adopt: coach-copied text versus text the student typed after reading a teammate. Coach-copied includes text inserted with Copy to document and text pasted from the student's own coach replies. Both are adoption; the question is adoption of whose work." />
               </div>
-              {reliance.ratio == null ? (
+              {reliance.measured === false ? (
+                <NoValue reason="Not measured: this session's writes could not record whether text came from the coach." />
+              ) : reliance.ratio == null ? (
                 <NoValue reason="No coach-copied or teammate-informed write yet." />
               ) : (
                 <>
