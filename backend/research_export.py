@@ -43,7 +43,7 @@ log = logging.getLogger("research_export")
 
 router = APIRouter(prefix="/research", tags=["research"])
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 
 def export_filename(bundle: dict, fmt: str) -> str:
@@ -200,6 +200,11 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
                 "classification": ev.classification,
                 "leading_status": ev.leading_status,
                 "is_graded_revision": bool(ev.is_graded_revision),
+                # "scored" (on time), "scored_late" (a background retry filled
+                # it in: the student saw it later, or never), "pending" or
+                # "failed" (no score; excluded from every average).
+                "score_status": ev.score_status or "scored",
+                "scored_at": ev.scored_at.isoformat() if ev.scored_at else None,
             })
 
     # ── Verification ────────────────────────────────────────────────────────

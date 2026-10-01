@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
-import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import { API_URL, authHeaders, formatApiErrorDetail, clearSession } from '../lib/api'
 import InviteTemplate from './InviteTemplate'
 import AdminBenchmark from './AdminBenchmark'
 
@@ -459,8 +459,7 @@ export default function Admin() {
   const [exportMsg, setExportMsg] = useState('')
 
   const handleLogout = () => {
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 

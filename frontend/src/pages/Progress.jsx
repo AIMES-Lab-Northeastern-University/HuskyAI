@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import InfoIcon from '../components/InfoIcon'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, clearSession } from '../lib/api'
 import { DIM_META, PEI_INFO } from '../lib/metricInfo'
 
 function PeiRing({ score }) {
@@ -139,8 +139,7 @@ export default function Progress() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 

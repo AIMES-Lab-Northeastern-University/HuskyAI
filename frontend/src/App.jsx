@@ -1,4 +1,5 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { safeNextPath } from './lib/api'
 import LandingPage from './pages/LandingPage'
 import AuthPage from './pages/AuthPage'
 import ForgotPassword from './pages/ForgotPassword'
@@ -23,7 +24,11 @@ import CoachWorkspace from './pages/CoachWorkspace'
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
-  if (!token) return <Navigate to="/login" replace />
+  const location = useLocation()
+  if (!token) {
+    const next = safeNextPath(location.pathname + location.search)
+    return <Navigate to={next ? `/login?next=${encodeURIComponent(next)}` : '/login'} replace />
+  }
   return <ConsentGate>{children}</ConsentGate>
 }
 

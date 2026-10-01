@@ -218,6 +218,15 @@ class EvalResult(Base):
     # for that session. The pre-revision score is retained as its own row, so
     # the delta between seeing the feed and acting on it stays measurable.
     is_graded_revision: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Whether this turn has its score yet. NULL: scored when the turn was
+    # taken (every row that predates this column). "pending": the evaluator
+    # failed and a background retry is due. "scored_late": a retry succeeded;
+    # scored_at says when, which analysis needs because the student saw this
+    # score later than the turn (or not at all, if they had left). "failed":
+    # every retry failed; the scores stay NULL. Unscored turns never count
+    # toward the minimum turns and are skipped by every average.
+    score_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -663,7 +672,7 @@ class CorpusDocument(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     openai_file_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    # pending | ready | failed
+    # pending | indexing (claimed by an ingest) | ready | failed
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     uploaded_by_user_id: Mapped[str] = mapped_column(
         String, ForeignKey("users.id"), nullable=False, index=True
@@ -841,7 +850,7 @@ class ArtifactRevision(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
-    # student_typed | coach_copied | verification_edit
+    # student_typed | coach_copied | coach_pasted | verification_edit
     origin: Mapped[str] = mapped_column(String(32), nullable=False)
     bytes_added: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     bytes_removed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -872,6 +881,8 @@ _SQLITE_ADDED_COLUMNS = [
     ("verification_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
+    ("eval_results", "score_status", "VARCHAR(16)"),
+    ("eval_results", "scored_at", "DATETIME"),
 ]
 
 
@@ -965,6 +976,13 @@ async def init_db():
                 "consent_research BOOLEAN NOT NULL DEFAULT false",
                 "ALTER TABLE verification_assignments ADD COLUMN IF NOT EXISTS "
                 "replaces_assignment_id VARCHAR",
+                # Scoring-pending turns (see EvalResult.score_status). NULL for
+                # every existing row, which reads as "scored at the time".
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS score_status VARCHAR(16)",
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
+                "scored_at TIMESTAMP WITHOUT TIME ZONE",
+                "CREATE INDEX IF NOT EXISTS ix_eval_results_score_status "
+                "ON eval_results (score_status)",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens

@@ -3,8 +3,9 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
 import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
+import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -46,9 +47,36 @@ function timeAgo(iso) {
   return `${Math.floor(s / 86400)}d ago`
 }
 
+/* Coach-derived text (#13). Rendered markdown and the raw reply differ in
+ * markup and whitespace, so both sides are reduced to their words before a
+ * pasted chunk is compared with the student's own coach replies. */
+export function normaliseForMatch(s = '') {
+  // Words only: markup, punctuation and spacing all differ between the raw
+  // reply and what the browser copies from its rendering.
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+}
+const MIN_COACH_CHUNK = 20
+
+export function isCoachText(text, coachReplies) {
+  const t = normaliseForMatch(text)
+  if (t.length < MIN_COACH_CHUNK) return false
+  return coachReplies.some(r => normaliseForMatch(r).includes(t))
+}
+
+/* Where the saved text came from. Copied (the explicit action) outranks pasted;
+ * a chunk only counts while it is still in the draft, so text the student
+ * inserted and then deleted is not credited to the coach. */
+export function originFor(draft, copied, pasted) {
+  const d = normaliseForMatch(draft)
+  const present = (chunk) => d.includes(normaliseForMatch(chunk))
+  if (copied.some(present)) return 'coach_copied'
+  if (pasted.some(present)) return 'coach_pasted'
+  return 'student_typed'
+}
+
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen }) {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(section.content || '')
@@ -59,6 +87,19 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   const [baseVersion, setBaseVersion] = useState(section.version)
   // The text we last sent, so a conflict can hand it back.
   const sentDraft = useRef('')
+  // Why the last save did not land (offline, refused by the server). The
+  // editor stays open with the draft in it whenever this is set.
+  const [saveError, setSaveError] = useState(null)
+  // Coach text that entered this draft: by "Copy to document", or pasted.
+  const copiedChunks = useRef([])
+  const pastedChunks = useRef([])
+  // Whether THIS mounted editor has a save waiting for its answer. Answers and
+  // conflicts live in the parent, which outlives us: closing the document panel
+  // unmounts every section, and on remount the last answer would replay —
+  // closing an editor "Copy to document" just opened, or reopening an empty one
+  // under an old error. Only answers to our own sends apply.
+  const awaitingSave = useRef(false)
+
 
   // Follow the server's copy while not actively editing, so a teammate's edit
   // lands live instead of being silently overwritten by a stale draft.
@@ -66,12 +107,33 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // Declared after the effect above so it runs second: on a conflict that effect
   // has just replaced the draft with the teammate's text, and this restores ours.
   useEffect(() => {
-    if (!conflict) return
+    if (!conflict || !awaitingSave.current) return
+    awaitingSave.current = false
     setSaving(false)
     setDraft(sentDraft.current)
     setBaseVersion(conflict.version)
     setEditing(true)
   }, [conflict])
+  // Declared after the follow effect for the same reason: on a render where
+  // both fire, the inserted text must be applied last.
+  // "Copy to document" on a coach reply, aimed at this section: open the
+  // editor (from the current version, unless a draft is already open) and
+  // append the reply for the student to edit before saving. Opening it this
+  // way emits no read event: the rule is that only the student's own click
+  // on a section is a read.
+  useEffect(() => {
+    if (!insertRequest || readOnly) return
+    setOpen(true)
+    if (!editing) setBaseVersion(section.version)
+    setEditing(true)
+    setDraft(prev => {
+      const base = prev || ''
+      return base.trim() ? `${base.replace(/\s+$/, '')}\n\n${insertRequest.text}` : insertRequest.text
+    })
+    copiedChunks.current.push(insertRequest.text)
+    // Consumed: cleared in the parent so a later remount cannot apply it again.
+    onInsertSeen?.(insertRequest.n)
+  }, [insertRequest]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle = () => {
     const next = !open
@@ -80,11 +142,36 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
     next ? onExpand(section.key) : onCollapse(section.key)
   }
 
+  // The server's answer to our save. The editor closes only on a confirmed
+  // write: closing it at send time lost the draft whenever the socket was down
+  // or the server refused the write, and left the button stuck on "Saving…".
+  useEffect(() => {
+    if (!saveResult || !awaitingSave.current) return
+    awaitingSave.current = false
+    setSaving(false)
+    if (saveResult.kind === 'ok') {
+      setSaveError(null)
+      setEditing(false)
+      copiedChunks.current = []
+      pastedChunks.current = []
+    } else {
+      setSaveError(saveResult.message || 'Your save was not accepted.')
+      setDraft(sentDraft.current)
+      setEditing(true)
+    }
+  }, [saveResult])
+
   const save = () => {
-    setSaving(true)
     sentDraft.current = draft
-    onSave(section.key, draft, baseVersion)
-    setEditing(false)
+    setSaveError(null)
+    const origin = originFor(draft, copiedChunks.current, pastedChunks.current)
+    const sent = onSave(section.key, draft, baseVersion, origin)
+    if (sent === false) {
+      setSaveError('Not connected, so nothing was saved. Your draft is still here; save again once you are reconnected.')
+      return
+    }
+    awaitingSave.current = true
+    setSaving(true)
   }
 
   const empty = !(section.content || '').trim()
@@ -134,17 +221,26 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
               <textarea
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
+                onPaste={e => {
+                  // Only the student's OWN coach replies are matched: this
+                  // page never holds a teammate's private coaching.
+                  const text = e.clipboardData?.getData('text') || ''
+                  if (isCoachText(text, coachReplies)) pastedChunks.current.push(text)
+                }}
                 rows={8}
                 className="w-full p-3 text-[13px] text-[#16120E] bg-white border border-[#E7E0D8] rounded-[10px] resize-y font-mono leading-relaxed focus:outline-none focus:border-[#C8102E]"
                 style={{ borderWidth: '1.5px' }}
                 placeholder="Write the team's work for this section…"
               />
+              {saveError && (
+                <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>
+              )}
               <div className="flex gap-2 mt-2">
                 <button onClick={save} disabled={saving}
                         className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
                   {saving ? 'Saving…' : 'Save'}
                 </button>
-                <button onClick={() => { setEditing(false); setDraft(section.content || '') }}
+                <button onClick={() => { setEditing(false); setSaving(false); setSaveError(null); setDraft(section.content || ''); copiedChunks.current = []; pastedChunks.current = [] }}
                         className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
                   Cancel
                 </button>
@@ -155,11 +251,14 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
               {empty
                 ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
                 : <div className="prose-chat text-[13px] text-[#16120E]"><ReactMarkdown remarkPlugins={[remarkGfm]}>{section.content}</ReactMarkdown></div>}
-              <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
-                      className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
-                      style={{ borderWidth: '1.5px' }}>
-                {empty ? 'Write this section' : 'Edit'}
-              </button>
+              {/* A finished session is read-only; the server refuses writes too. */}
+              {!readOnly && (
+                <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
+                        className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
+                        style={{ borderWidth: '1.5px' }}>
+                  {empty ? 'Write this section' : 'Edit'}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -186,7 +285,10 @@ export default function CoachWorkspace() {
   const [isTyping, setIsTyping]       = useState(false)
   const [isEvaluating, setIsEval]     = useState(false)
   const [evalData, setEvalData]       = useState(null)
+  const [scoreNotice, setScoreNotice] = useState(null)
   const [turnCount, setTurnCount]     = useState(0)
+  const turnCountRef = useRef(0)
+  useEffect(() => { turnCountRef.current = turnCount }, [turnCount])
   const [input, setInput]             = useState('')
   const [connStatus, setConn]         = useState('disconnected')
   const [members, setMembers]         = useState([])
@@ -200,10 +302,19 @@ export default function CoachWorkspace() {
   // No artifact_open fires on mount: showing the panel is a render, not a read.
   const [artifactOpen, setArtOpen]    = useState(true)
   const [conflicts, setConflicts]     = useState({})
+  // section_key -> { kind: 'ok' | 'error', message?, n } for the last save.
+  // `n` makes every answer a new object, so two identical outcomes in a row
+  // still reach the Section's effect.
+  const [saveResults, setSaveResults] = useState({})
+  // { key, text, n } — a "Copy to document" aimed at one section.
+  const [insertReq, setInsertReq]     = useState(null)
+  const [copyPicker, setCopyPicker]   = useState(null)   // message index choosing a section
+  const pendingSaves = useRef(new Set())
   const [teamChat, setTeamChat]       = useState([])
   const [teamInput, setTeamInput]     = useState('')
   const [sessionEnded, setEnded]      = useState(false)
   const [ending, setEnding]           = useState(false)
+  const [endError, setEndError]       = useState('')
   const [summary, setSummary]         = useState(null)
   const [groupSessionId, setGsId]     = useState(null)
   const [inbox, setInbox]             = useState([])
@@ -213,9 +324,10 @@ export default function CoachWorkspace() {
 
   const wsRef        = useRef(null)
   const reconnectRef = useRef(null)
+  const lastSentRef = useRef('')   // handed back if the server answers busy
   const streamBuf    = useRef('')
   const endRef       = useRef(null)
-  const dwellRef     = useRef({})   // section_key -> started-at ms
+  const dwellRef     = useRef({})   // clock id -> { started, accumulated, emitDwell }
   const recentTimers = useRef({})
   const teamEndRef   = useRef(null)
   const endedRef     = useRef(false)
@@ -250,19 +362,78 @@ export default function CoachWorkspace() {
     reader.current.flush()
   }, [])
 
+  /* Dwell (#17). One clock per open thing: a section, or one contested
+   * option. The clock pauses while the tab is hidden (a background tab is not
+   * being read), and every open clock is flushed when the page goes away or
+   * the session ends, instead of that last interval being lost. `flush` says
+   * what closed it (see docs/metrics-codebook.md). */
+  const startDwell = useCallback((id, emitDwell) => {
+    dwellRef.current[id] = { started: document.hidden ? null : Date.now(), accumulated: 0, emitDwell }
+  }, [])
+
+  const stopDwell = useCallback((id, flush) => {
+    const d = dwellRef.current[id]
+    if (!d) return
+    delete dwellRef.current[id]
+    const ms = d.accumulated + (d.started != null ? Date.now() - d.started : 0)
+    if (ms > 500) d.emitDwell(Math.round(ms), flush)
+  }, [])
+
+  const flushAllDwell = useCallback((flush) => {
+    for (const id of Object.keys(dwellRef.current)) stopDwell(id, flush)
+  }, [stopDwell])
+
+  useEffect(() => {
+    const onVisibility = () => {
+      const now = Date.now()
+      for (const d of Object.values(dwellRef.current)) {
+        if (document.hidden) {
+          if (d.started != null) { d.accumulated += now - d.started; d.started = null }
+        } else if (d.started == null) {
+          d.started = now
+        }
+      }
+    }
+    // pagehide, not beforeunload: it also fires on mobile tab switches and
+    // bfcache navigations. Each emit is written to the durable buffer before
+    // it is sent, so a flush the socket cannot deliver now is replayed on the
+    // next visit.
+    const onPageHide = () => flushAllDwell('pagehide')
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', onPageHide)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', onPageHide)
+      flushAllDwell('unmount')
+    }
+  }, [flushAllDwell])
+
   const onExpand = useCallback((key) => {
-    dwellRef.current[key] = Date.now()
     emit({ type: 'artifact_expand', section_key: key })
-  }, [emit])
+    startDwell(`s:${key}`, (ms, flush) =>
+      emit({ type: 'artifact_dwell', section_key: key, duration_ms: ms, flush }))
+  }, [emit, startDwell])
 
   const onCollapse = useCallback((key) => {
-    const started = dwellRef.current[key]
-    delete dwellRef.current[key]
-    if (started) {
-      const ms = Date.now() - started
-      if (ms > 500) emit({ type: 'artifact_dwell', section_key: key, duration_ms: ms })
+    stopDwell(`s:${key}`, 'collapse')
+  }, [stopDwell])
+
+  /* Contested options (#16) start collapsed, like sections, and opening one
+   * is the only thing that counts as inspecting it. The options stay
+   * unlabelled: which side came from the coach is never shown. */
+  const [openOptions, setOpenOptions] = useState({})
+  const toggleOption = useCallback((pairId, option) => {
+    const id = `o:${pairId}:${option}`
+    const next = !openOptions[id]
+    setOpenOptions(prev => ({ ...prev, [id]: next }))
+    if (next) {
+      emit({ type: 'contested_option_expand', pair_id: pairId, option })
+      startDwell(id, (ms, flush) =>
+        emit({ type: 'contested_option_dwell', pair_id: pairId, option, duration_ms: ms, flush }))
+    } else {
+      stopDwell(id, 'collapse')
     }
-  }, [emit])
+  }, [openOptions, emit, startDwell, stopDwell])
 
   /**
    * Emitting happens HERE, not inside the setArtOpen updater.
@@ -278,20 +449,49 @@ export default function CoachWorkspace() {
   const togglePanel = useCallback(() => {
     const next = !artifactOpen
     if (!next) {
-      // Closing the panel ends any open dwells.
-      for (const key of Object.keys(dwellRef.current)) onCollapse(key)
+      // Closing the panel ends any open dwells (sections and options both
+      // live in it, and unmount with it).
+      flushAllDwell('panel_close')
+      setOpenOptions({})
+      // Open drafts unmount with the panel, so a conflict about one is moot.
+      setConflicts({})
     }
     setArtOpen(next)
     emit({ type: next ? 'artifact_open' : 'artifact_close' })
-  }, [artifactOpen, emit, onCollapse])
+  }, [artifactOpen, emit, flushAllDwell])
 
-  const saveSection = useCallback((key, content, expectedVersion) => {
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return
-    wsRef.current.send(JSON.stringify({
-      type: 'artifact_write', section_key: key, content,
-      expected_version: expectedVersion, origin: 'student_typed',
-    }))
+  const saveCounter = useRef(0)
+  const settleSave = useCallback((key, kind, message) => {
+    pendingSaves.current.delete(key)
+    saveCounter.current += 1
+    setSaveResults(prev => ({ ...prev, [key]: { kind, message, n: saveCounter.current } }))
   }, [])
+
+  // Returns false when nothing was sent, so the editor can keep the draft.
+  const saveSection = useCallback((key, content, expectedVersion, origin = 'student_typed') => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return false
+    try {
+      wsRef.current.send(JSON.stringify({
+        type: 'artifact_write', section_key: key, content,
+        expected_version: expectedVersion, origin,
+        // Tells the reliance metric this client can detect coach-derived
+        // text, so "none adopted" is a real zero rather than a missing signal.
+        origin_tracking: 'copy+paste',
+      }))
+    } catch { return false }
+    pendingSaves.current.add(key)
+    return true
+  }, [])
+
+  const insertCounter = useRef(0)
+  const copyToSection = useCallback((key, text) => {
+    insertCounter.current += 1
+    setInsertReq({ key, text, n: insertCounter.current })
+    setCopyPicker(null)
+    // The document must be visible to edit in. Opened through the normal
+    // toggle, so the open is recorded exactly as if the student clicked it.
+    if (!artifactOpen) togglePanel()
+  }, [artifactOpen, togglePanel])
 
   const markRecentEdit = useCallback((key, name) => {
     setRecentEdits(prev => ({ ...prev, [key]: name }))
@@ -335,6 +535,7 @@ export default function CoachWorkspace() {
         // edited it) stays exactly as it was.
         if (data.unchanged) {
           setConflicts(prev => { const n = { ...prev }; delete n[data.section_key]; return n })
+          settleSave(data.section_key, 'ok')
           break
         }
         // Apply our own saved text. The broadcast that carries content excludes
@@ -348,9 +549,11 @@ export default function CoachWorkspace() {
             : s),
         }))
         setConflicts(prev => { const n = { ...prev }; delete n[data.section_key]; return n })
+        settleSave(data.section_key, 'ok')
         break
       case 'artifact_conflict':
         // Their text wins on screen; our draft stays in the editor to rebase.
+        pendingSaves.current.delete(data.section_key)
         setConflicts(prev => ({ ...prev, [data.section_key]: { version: data.version } }))
         setArtifact(prev => prev && ({
           ...prev,
@@ -359,7 +562,10 @@ export default function CoachWorkspace() {
         }))
         break
       case 'artifact_error':
-        console.error('artifact error:', data.message)
+        console.error('artifact error:', data.message || data.error)
+        // Refused writes carry their section; the editor keeps the draft and
+        // says why instead of silently closing.
+        if (data.section_key) settleSave(data.section_key, 'error', data.message || data.error)
         break
       case 'typing': setIsTyping(true); setIsStreaming(false); streamBuf.current = ''; setStreaming(''); break
       case 'stream':
@@ -373,8 +579,21 @@ export default function CoachWorkspace() {
         streamBuf.current = ''; setStreaming('')
         break
       case 'eval_start': setIsEval(true); break
-      case 'eval': setIsEval(false); setEvalData(data.data); setTurnCount(t => t + 1); break
+      case 'eval':
+        setIsEval(false); setEvalData(data.data); setScoreNotice(null)
+        setTurnCount(t => t + 1)
+        break
       case 'eval_error': setIsEval(false); break
+      case 'eval_pending':
+      case 'eval_late':
+      case 'eval_rescore_failed': {
+        const a = lateScoreAction(data, turnCountRef.current)
+        setIsEval(false)
+        if (a.countTurn) setTurnCount(t => t + 1)
+        if (a.show) setEvalData(a.show)
+        setScoreNotice(a.notice)
+        break
+      }
       case 'presence': if (Array.isArray(data.members)) setMembers(data.members); break
       case 'verification_assigned':
         // A teammate's save was routed to someone; refresh in case it is mine.
@@ -394,8 +613,24 @@ export default function CoachWorkspace() {
         setTeamChat(prev => [...prev, { senderName: data.sender_name, content: data.content, isSelf: false }])
         break
       case 'session_ended':
+        // Close every open clock now. The server accepts these for a short
+        // grace window after the end, because they measure reading done
+        // during the session (see _closing_dwell in main.py).
+        flushAllDwell('session_end')
         endedRef.current = true
         setEnded(true)
+        break
+      case 'busy':
+        // This student's coach already has a turn running (another tab, or a
+        // double send): nothing was sent, so undo the optimistic message and
+        // hand the text back.
+        setIsTyping(false)
+        setMessages(prev => {
+          const i = prev.findLastIndex(m => m.role === 'user')
+          return i === -1 ? prev : prev.slice(0, i).concat(prev.slice(i + 1))
+        })
+        setInput(cur => cur || lastSentRef.current)
+        setScoreNotice('Another tab is still waiting for a reply in this chat, so this message was not sent. Try again in a moment.')
         break
       case 'read_ack':
         // The server has this read. Only now is it safe to stop holding it —
@@ -409,7 +644,7 @@ export default function CoachWorkspace() {
         break
       default: break
     }
-  }, [markRecentEdit, user?.id])
+  }, [markRecentEdit, settleSave, flushAllDwell, user?.id])
 
   const connect = useCallback(() => {
     if (!token || !groupId) return
@@ -424,8 +659,14 @@ export default function CoachWorkspace() {
     ws.onclose = (e) => {
       if (wsRef.current !== ws) return
       setConn('disconnected'); setIsStreaming(false); setIsTyping(false); setIsEval(false)
+      // A save still waiting for its answer may or may not have landed. Keep
+      // the draft and say so; saving again is safe, because a write that did
+      // land comes back as a conflict carrying the saved text.
+      for (const key of [...pendingSaves.current]) {
+        settleSave(key, 'error', 'The connection dropped before your save was confirmed. Your draft is still here; save again once you are reconnected.')
+      }
       if (e.code === 4001) {
-        localStorage.removeItem('token'); localStorage.removeItem('user')
+        clearSession()
         // Drop every buffered read on the way out. On a shared machine the next
         // student's socket would otherwise flush what this one left behind, and
         // the server attributes an event to whoever is authenticated — a
@@ -439,7 +680,7 @@ export default function CoachWorkspace() {
     }
     ws.onerror = () => setConn('error')
     ws.onmessage = (e) => { try { handleMessage(JSON.parse(e.data)) } catch {} }
-  }, [token, groupId, sessionNum, handleMessage, flushOutbox, navigate])
+  }, [token, groupId, sessionNum, handleMessage, flushOutbox, navigate, settleSave])
 
   useEffect(() => {
     if (!token) { navigate('/login', { replace: true }); return }
@@ -458,6 +699,7 @@ export default function CoachWorkspace() {
     const content = input.trim()
     if (!content || isStreaming || isTyping || isEvaluating) return
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
+    lastSentRef.current = content
     setMessages(prev => [...prev, { role: 'user', content }])
     wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: [] }))
     setInput('')
@@ -474,18 +716,25 @@ export default function CoachWorkspace() {
   const endSession = useCallback(async () => {
     if (!window.confirm('End this session for the whole team? Everyone will be disconnected.')) return
     setEnding(true)
+    setEndError('')
     try {
       const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/end`,
         { method: 'POST', headers: authHeaders() })
-      if (r.ok) setSummary(await r.json())
+      // Locked only on success. A refused or failed end used to lock this tab
+      // anyway, leaving the student looking at "Session ended" while the
+      // session stayed open on the server for everyone else.
+      if (!r.ok) { setEndError(await readApiError(r, 'Could not end the session')); return }
+      flushAllDwell('session_end')
+      setSummary(await r.json().catch(() => null))
       endedRef.current = true
       setEnded(true)
     } catch (e) {
       console.error('could not end session', e)
+      setEndError('Could not reach the server, so the session is still open. Try again.')
     } finally {
       setEnding(false)
     }
-  }, [groupId, sessionNum])
+  }, [groupId, sessionNum, flushAllDwell])
 
   // Review inbox and contested pairs. Polled on change rather than pushed:
   // both are low-frequency, and a dedicated socket message for each would add
@@ -520,6 +769,10 @@ export default function CoachWorkspace() {
   }, [])
 
   const adoptOption = useCallback(async (pairId, adopted) => {
+    // Close this pair's option clocks first, so their dwell is sent before
+    // the choice is recorded.
+    stopDwell(`o:${pairId}:a`, 'collapse')
+    stopDwell(`o:${pairId}:b`, 'collapse')
     try {
       const r = await fetch(`${API_URL}/contested/pairs/${pairId}/adopt`, {
         method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
@@ -527,13 +780,14 @@ export default function CoachWorkspace() {
       })
       if (r.ok) setPairs(prev => prev.filter(x => x.pair_id !== pairId))
     } catch (e) { console.error('adopt failed', e) }
-  }, [])
+  }, [stopDwell])
 
   const nameFor = (uidStr) => {
     if (uidStr && user?.id === uidStr) return 'You'
     return members.find(m => m.user_id === uidStr)?.name
   }
 
+  const coachReplies = messages.filter(m => m.role === 'assistant').map(m => m.content)
   const pei = evalData?.scores?.PEI ?? 0
   const busy = isStreaming || isTyping || isEvaluating || sessionEnded
 
@@ -548,8 +802,9 @@ export default function CoachWorkspace() {
             {challengeContext?.title || 'Collaborative session'}
           </div>
           <div className="text-[11px] text-[#9A948E]">
+            {/* The study condition is deliberately NOT shown: a student who can
+                read their arm or prominence knows what is being measured. */}
             Session {sessionNum} · Your coach is private to you
-            {condition ? ` · ${condition.arm} / ${condition.prominence}` : ''}
           </div>
         </div>
         <div className="flex items-center gap-1.5">
@@ -570,6 +825,9 @@ export default function CoachWorkspace() {
             <div className="font-serif text-[20px] leading-none" style={{ color: scoreColor(pei) }}>{Math.round(pei)}</div>
             <div className="text-[9px] font-bold text-[#9A948E] uppercase tracking-[0.5px]">Your PEI</div>
           </div>
+        )}
+        {!sessionEnded && endError && (
+          <span role="alert" className="text-[12px] text-[#C8102E] max-w-[260px]">{endError}</span>
         )}
         {!sessionEnded && (
           <button onClick={endSession} disabled={ending}
@@ -635,6 +893,30 @@ export default function CoachWorkspace() {
                   {m.role === 'user'
                     ? <p className="whitespace-pre-wrap">{m.content}</p>
                     : <div className="prose-chat"><ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown></div>}
+                  {m.role === 'assistant' && !sessionEnded && artifact?.sections?.length > 0 && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      {copyPicker === i ? (
+                        <>
+                          <span className="text-[11px] text-[#9A948E]">Copy into:</span>
+                          {artifact.sections.map(s => (
+                            <button key={s.key} onClick={() => copyToSection(s.key, m.content)}
+                                    className="px-2 py-0.5 text-[11px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[6px] cursor-pointer">
+                              {s.title || s.key}
+                            </button>
+                          ))}
+                          <button onClick={() => setCopyPicker(null)}
+                                  className="text-[11px] text-[#9A948E] underline cursor-pointer">Cancel</button>
+                        </>
+                      ) : (
+                        <button onClick={() => artifact.sections.length === 1
+                                            ? copyToSection(artifact.sections[0].key, m.content)
+                                            : setCopyPicker(i)}
+                                className="text-[11px] font-bold text-[#6B6560] hover:text-[#16120E] underline cursor-pointer">
+                          Copy to document
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -647,6 +929,7 @@ export default function CoachWorkspace() {
               </div>
             )}
             {isEvaluating && <div className="text-[12px] text-[#9A948E]">Scoring your turn…</div>}
+            <ScoreNotice message={scoreNotice} />
             <div ref={endRef} />
           </div>
 
@@ -714,16 +997,27 @@ export default function CoachWorkspace() {
                     <div className="text-[12px] text-[#6B6560] mb-3">
                       Section “{p.subproblem_key}”. Which do you go with?
                     </div>
-                    {[['a', p.option_a], ['b', p.option_b]].map(([k, text]) => (
+                    {[['a', p.option_a], ['b', p.option_b]].map(([k, text]) => {
+                      const isOpen = !!openOptions[`o:${p.pair_id}:${k}`]
+                      return (
                       <div key={k} className="mb-2 p-3 rounded-[10px] bg-white border border-[#E7E0D8]"
                            style={{ borderWidth: '1.5px' }}>
-                        <div className="text-[13px] text-[#16120E] whitespace-pre-wrap mb-2">{text}</div>
+                        <button onClick={() => toggleOption(p.pair_id, k)}
+                                aria-expanded={isOpen}
+                                className="w-full flex items-center gap-2 text-left cursor-pointer mb-2">
+                          <svg className={`w-3 h-3 stroke-[#7C3AED] fill-none flex-shrink-0 transition-transform ${isOpen ? 'rotate-90' : ''}`}
+                               viewBox="0 0 24 24" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+                          <span className="text-[12px] font-bold text-[#16120E]">Option {k.toUpperCase()}</span>
+                          {!isOpen && <span className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[0.5px] ml-auto">Click to read</span>}
+                        </button>
+                        {isOpen && <div className="text-[13px] text-[#16120E] whitespace-pre-wrap mb-2">{text}</div>}
                         <button onClick={() => adoptOption(p.pair_id, k)}
                                 className="px-3 py-1 text-[12px] font-bold text-white bg-[#7C3AED] rounded-[8px] cursor-pointer">
                           Use this one
                         </button>
                       </div>
-                    ))}
+                      )
+                    })}
                     <div className="flex gap-2 mt-1">
                       <button onClick={() => adoptOption(p.pair_id, 'merged')}
                               className="px-3 py-1 text-[12px] font-bold text-[#7C3AED] bg-white border border-[#D8B4FE] rounded-[8px] cursor-pointer"
@@ -778,6 +1072,11 @@ export default function CoachWorkspace() {
                     conflict={conflicts[s.key]}
                     onDismissConflict={(k) => setConflicts(p => { const n = { ...p }; delete n[k]; return n })}
                     justUpdatedBy={recentEdits[s.key]}
+                    saveResult={saveResults[s.key]}
+                    readOnly={sessionEnded}
+                    coachReplies={coachReplies}
+                    insertRequest={insertReq?.key === s.key ? insertReq : null}
+                    onInsertSeen={(n) => setInsertReq(r => (r && r.n === n ? null : r))}
                   />
                 ))}
               </div>

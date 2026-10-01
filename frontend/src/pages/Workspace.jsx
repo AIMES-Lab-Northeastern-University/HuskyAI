@@ -5,7 +5,8 @@ import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
 import SessionAnalysisCard from '../components/SessionAnalysisCard'
 import InfoIcon from '../components/InfoIcon'
-import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
+import { API_URL, authHeaders, formatApiErrorDetail, clearSession, readApiError } from '../lib/api'
 import { DIM_META, PEI_INFO } from '../lib/metricInfo'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
 
@@ -82,7 +83,7 @@ function fmtClock(ms) {
 }
 
 /* ─── Eval Panel ─── */
-function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed }) {
+function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreNotice }) {
   // A session can be configured to score every turn without showing the score.
   // That is an experimental condition, not a failure, so it gets its own
   // deliberate panel — an empty or errored-looking sidebar would read as the
@@ -133,6 +134,7 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed }) {
       </div>
 
       <div className="p-5 flex flex-col gap-4 flex-1">
+        <ScoreNotice message={scoreNotice} />
         {/* PEI ring */}
         <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] p-5 text-center" style={{ borderWidth: '1.5px' }}>
           <PeiRing pei={pei} />
@@ -424,6 +426,13 @@ export default function Workspace() {
   const [evalData, setEvalData]           = useState(null)
   const [connStatus, setConnStatus]       = useState('disconnected')
   const [turnCount, setTurnCount]         = useState(0)
+  // Turns that got a score: what the minimum-turns rule counts, server-side
+  // and here. A turn whose scoring failed does not move this.
+  const [scoredTurns, setScoredTurns]     = useState(0)
+  // Why the latest turn has no score yet (our scoring failed; it is retried).
+  const [scoreNotice, setScoreNotice]     = useState(null)
+  const turnCountRef = useRef(0)
+  useEffect(() => { turnCountRef.current = turnCount }, [turnCount])
   const [input, setInput]                 = useState('')
   const [attachments, setAttachments]     = useState([]) // [{ name, mime, data(base64), size }]
   const [attachNotice, setAttachNotice]   = useState('') // upload error shown in a dialog
@@ -459,6 +468,7 @@ export default function Workspace() {
 
   const wsRef              = useRef(null)
   const reconnectTimer     = useRef(null)
+  const lastSentRef = useRef('')   // handed back if the server answers busy
   const sessionEndedRef    = useRef(false)
   const warnedRef          = useRef(false)
   const autoEndRef         = useRef(false)
@@ -472,7 +482,13 @@ export default function Workspace() {
   /* ─── File attachments (doc/image upload) ─── */
   // All limits kept in sync with the backend.
   const ATTACH_ACCEPT = '.pdf,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.gif'
-  const MAX_ATTACH_BYTES = 15 * 1024 * 1024        // per file
+  // A message travels as ONE websocket frame and the server's frame limit is
+  // 16 MB. Base64 adds a third, so 11 MB of files is ~14.7 MB on the wire;
+  // anything larger was silently dropped as an oversized frame.
+  const MAX_ATTACH_BYTES = 10 * 1024 * 1024        // per file
+  const MAX_MESSAGE_BYTES = 11 * 1024 * 1024       // combined, per message
+  const ATTACH_MB = Math.round(MAX_ATTACH_BYTES / (1024 * 1024))
+  const MESSAGE_MB = Math.round(MAX_MESSAGE_BYTES / (1024 * 1024))
   const MAX_FILES_PER_MESSAGE = 5
   const MAX_FILES_PER_CHAT = 15
   const MAX_CHAT_BYTES = 50 * 1024 * 1024          // combined across the whole chat
@@ -495,14 +511,16 @@ export default function Workspace() {
     const tooBig = []
     let usedCount = chatFiles + attachments.length // files already committed + pending
     let usedBytes = chatBytes + pendingBytes
-    let hitMsgCap = false, hitChatCount = false, hitChatBytes = false
+    let messageBytes = pendingBytes
+    let hitMsgCap = false, hitMsgBytes = false, hitChatCount = false, hitChatBytes = false
 
     for (const file of files) {
       if (file.size > MAX_ATTACH_BYTES) { tooBig.push(file.name); continue }
       if (attachments.length + accepted.length >= MAX_FILES_PER_MESSAGE) { hitMsgCap = true; continue }
+      if (messageBytes + file.size > MAX_MESSAGE_BYTES) { hitMsgBytes = true; continue }
       if (usedCount >= MAX_FILES_PER_CHAT) { hitChatCount = true; continue }
       if (usedBytes + file.size > MAX_CHAT_BYTES) { hitChatBytes = true; continue }
-      accepted.push(file); usedCount += 1; usedBytes += file.size
+      accepted.push(file); usedCount += 1; usedBytes += file.size; messageBytes += file.size
     }
 
     accepted.forEach((file) => {
@@ -519,11 +537,13 @@ export default function Workspace() {
 
     // Surface a single, most-relevant reason if anything was turned away.
     if (tooBig.length === 1) {
-      showAttachNotice(`"${tooBig[0]}" is too large. Each file must be under 15 MB.`)
+      showAttachNotice(`"${tooBig[0]}" is too large. Each file must be under ${ATTACH_MB} MB.`)
     } else if (tooBig.length > 1) {
-      showAttachNotice(`${tooBig.length} files are too large. Each file must be under 15 MB.`)
+      showAttachNotice(`${tooBig.length} files are too large. Each file must be under ${ATTACH_MB} MB.`)
     } else if (hitMsgCap) {
       showAttachNotice(`You can attach up to ${MAX_FILES_PER_MESSAGE} files per message.`)
+    } else if (hitMsgBytes) {
+      showAttachNotice(`One message can carry up to ${MESSAGE_MB} MB of files. Send the rest in your next message.`)
     } else if (hitChatCount) {
       showAttachNotice(`This chat has reached its limit of ${MAX_FILES_PER_CHAT} files.`)
     } else if (hitChatBytes) {
@@ -544,8 +564,7 @@ export default function Workspace() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     wsRef.current?.close()
     navigate('/login', { replace: true })
   }
@@ -556,6 +575,8 @@ export default function Workspace() {
         setConversationId(data.conversation_id)
         setMinTurns(typeof data.min_turns === 'number' ? data.min_turns : null)
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
+        setScoredTurns(typeof data.scored_turns === 'number' ? data.scored_turns
+          : (typeof data.turn_count === 'number' ? data.turn_count : 0))
         {
           const owed = typeof data.revision_owed_after_turn === 'number' ? data.revision_owed_after_turn : null
           setRevisionOwedTurn(owed)
@@ -617,8 +638,10 @@ export default function Workspace() {
       case 'eval_start': setIsEvaluating(true); break
       case 'eval':
         setIsEvaluating(false)
+        setScoreNotice(null)
         setEvalData(data.data)
         setTurnCount(t => t + 1)
+        setScoredTurns(t => t + 1)
         // Tell the Sidebar (and anyone else who cares) the Husky Score may have shifted
         try { window.dispatchEvent(new CustomEvent('husky:eval')) } catch {}
         break
@@ -652,6 +675,22 @@ export default function Workspace() {
         break
       }
       case 'eval_error': setIsEvaluating(false); break
+      case 'eval_pending':
+      case 'eval_late':
+      case 'eval_late_suppressed':
+      case 'eval_rescore_failed': {
+        const a = lateScoreAction(data, turnCountRef.current)
+        setIsEvaluating(false)
+        if (a.countTurn) setTurnCount(t => t + 1)
+        if (a.suppressed) setFeedSuppressed(true)
+        if (a.scored) setScoredTurns(t => t + 1)
+        if (a.show) {
+          setEvalData(a.show)
+          try { window.dispatchEvent(new CustomEvent('husky:eval')) } catch {}
+        }
+        setScoreNotice(a.notice)
+        break
+      }
       case 'eval_suppressed':
         // The turn WAS scored and stored — only the display is withheld. Shown
         // as a deliberate state rather than silence, so a suppressed feed is
@@ -659,6 +698,7 @@ export default function Workspace() {
         setIsEvaluating(false)
         setFeedSuppressed(true)
         setTurnCount(t => t + 1)
+        setScoredTurns(t => t + 1)
         break
       case 'revision_required':
         setRevisionRequired(data.after_turn ?? true)
@@ -678,6 +718,18 @@ export default function Workspace() {
         break
       }
       case 'citations_error': break
+      case 'busy':
+        // Another tab of this conversation has a turn in flight (A4). Nothing
+        // was sent to the coach: take the message back out of the chat and
+        // put the text back in the box, so it is not lost.
+        setIsTyping(false)
+        setMessages(prev => {
+          const i = prev.findLastIndex(m => m.role === 'user')
+          return i === -1 ? prev : prev.slice(0, i).concat(prev.slice(i + 1))
+        })
+        setInput(cur => cur || lastSentRef.current)
+        setAttachNotice('Another tab is still waiting for a reply in this chat, so this message was not sent. Try again in a moment.')
+        break
       case 'error':
         setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
         console.error('Server error:', data.message); break
@@ -688,6 +740,14 @@ export default function Workspace() {
   const connect = useCallback(() => {
     if (isDemo || !token) return
     if (wsRef.current?.readyState === WebSocket.OPEN) return
+    // Tear down any existing socket WITHOUT letting its onclose schedule a
+    // reconnect. Otherwise a socket closed by unmount (navigating away, or
+    // StrictMode's mount→unmount→remount) comes back 3s later on a page that
+    // is gone, and keeps a second live connection to the same conversation.
+    if (wsRef.current) {
+      try { wsRef.current.onclose = null; wsRef.current.close() } catch {}
+      wsRef.current = null
+    }
     setConnStatus('connecting')
     let wsUrl = `${WS_BASE}?token=${token}`
     if (challengeId) wsUrl += `&challenge_id=${challengeId}`
@@ -696,8 +756,11 @@ export default function Workspace() {
     wsRef.current = ws
     ws.onopen  = () => { setConnStatus('connected'); clearTimeout(reconnectTimer.current) }
     ws.onclose = (e) => {
+      if (wsRef.current !== ws) return // superseded by a newer socket; ignore
       setConnStatus('disconnected'); setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
       if (e.code === 4001) { handleLogout(); return }
+      // Not allowed to play this challenge: retrying every 3s cannot fix that.
+      if (e.code === 4003) { setConnStatus('error'); return }
       if (sessionEndedRef.current) return
       reconnectTimer.current = setTimeout(connect, 3000)
     }
@@ -706,13 +769,19 @@ export default function Workspace() {
   }, [token, challengeId, sessionNum, handleWsMessage, isDemo])
 
   useEffect(() => {
+    // Null onclose before closing so the intentional teardown on unmount does
+    // not schedule a reconnect for a page that no longer exists.
+    const teardown = () => {
+      clearTimeout(reconnectTimer.current)
+      if (wsRef.current) { try { wsRef.current.onclose = null; wsRef.current.close() } catch {} ; wsRef.current = null }
+    }
     if (isDemo) {
       setConnStatus('connected')
-      return () => { clearTimeout(reconnectTimer.current); wsRef.current?.close() }
+      return teardown
     }
     if (!token) { navigate('/login', { replace: true }); return }
     connect()
-    return () => { clearTimeout(reconnectTimer.current); wsRef.current?.close() }
+    return teardown
   }, [connect, isDemo, token, navigate])
 
   useEffect(() => {
@@ -789,11 +858,11 @@ export default function Workspace() {
       } else if (!auto) {
         // Normally unreachable: the button is disabled while a gate applies.
         // Shown inline for a stale tab, instead of failing silently.
-        const data = await resp.json().catch(() => ({}))
-        setEndError(typeof data.detail === 'string' ? data.detail : 'Could not end the session')
+        setEndError(await readApiError(resp, 'Could not end the session'))
       }
     } catch (e) {
       console.error('Failed to end session', e)
+      if (!auto) setEndError('Could not reach the server, so the session is still open. Try again.')
     } finally {
       setEndingSession(false)
     }
@@ -881,12 +950,14 @@ export default function Workspace() {
           setEvalData(SAMPLE_EVAL)
           setIsEvaluating(false)
           setTurnCount((t) => t + 1)
+          setScoredTurns((t) => t + 1)
         }, 450)
       }, 550)
       return
     }
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     const outFiles = attachments.map(a => ({ filename: a.name, mime_type: a.mime, data: a.data }))
+    lastSentRef.current = content
     setMessages(prev => [...prev, { role: 'user', content, attachments: fileChips }])
     // When a revision is owed, this submission IS it — the scored artifact of
     // record for the session. The server ignores the flag unless the assignment
@@ -997,12 +1068,12 @@ export default function Workspace() {
               </button>
             )}
             {conversationId && !isDemo && (() => {
-              const minTurnsMet = minTurns == null || turnCount >= minTurns
-              const turnsLeft = minTurns != null ? Math.max(0, minTurns - turnCount) : 0
+              const minTurnsMet = minTurns == null || scoredTurns >= minTurns
+              const turnsLeft = minTurns != null ? Math.max(0, minTurns - scoredTurns) : 0
               const revisionPending = revisionOwedTurn != null && !revisionDone
               const disabled = sessionEnded || endingSession || !minTurnsMet || revisionPending
               const title = sessionEnded ? undefined
-                : !minTurnsMet ? `Send ${turnsLeft} more turn${turnsLeft !== 1 ? 's' : ''} to end`
+                : !minTurnsMet ? `Send ${turnsLeft} more scored turn${turnsLeft !== 1 ? 's' : ''} to end`
                 : revisionPending
                   ? (turnCount < revisionOwedTurn
                     ? `After the feedback on turn ${revisionOwedTurn} you'll send one revised attempt; you can end the session after that`
@@ -1033,7 +1104,7 @@ export default function Workspace() {
                     : endingSession
                       ? 'Ending…'
                       : !minTurnsMet
-                        ? `End Session (${turnCount}/${minTurns})`
+                        ? `End Session (${scoredTurns}/${minTurns})`
                         : revisionPending
                           ? 'End Session (revision needed)'
                           : 'End Session'}
@@ -1238,7 +1309,7 @@ export default function Workspace() {
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
                       disabled={isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
-                      title="Attach a document or image (PDF, DOCX, TXT, MD, CSV, images · max 15 MB)"
+                      title="Attach a document or image (PDF, DOCX, TXT, MD, CSV, images · max 10 MB)"
                       className="w-9 h-9 rounded-[9px] bg-[#F7F3EE] hover:bg-[#EDEAE4] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border border-[#E7E0D8] cursor-pointer"
                       style={{ borderWidth: '1.5px' }}
                     >
@@ -1280,7 +1351,7 @@ export default function Workspace() {
 
           {/* Eval panel */}
           <div className="w-[380px] flex-shrink-0 overflow-hidden">
-            <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} />
+            <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} scoreNotice={scoreNotice} />
           </div>
         </div>
       </div>

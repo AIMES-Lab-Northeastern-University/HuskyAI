@@ -5,6 +5,7 @@ import json
 import base64
 import asyncio
 import logging
+import weakref
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,7 +30,7 @@ from study_policy import resolve_for_group_session
 
 # Version of the study event schema (docs/event-schema.md). Echoed in research
 # responses so an exported dataset is interpretable against a fixed spec.
-STUDY_SCHEMA_VERSION = "1.0.0"
+STUDY_SCHEMA_VERSION = "1.1.0"
 from auth import router as auth_router, resolve_token_user_id, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
@@ -202,6 +203,9 @@ async def lifespan(app: FastAPI):
     await seed_demo_classroom()
     await seed_pilot_classroom()
     await _resweep_stuck_analyses()
+    await _resweep_pending_scores()
+    from corpus import release_stranded_claims
+    await release_stranded_claims()
 
     # Group rooms: in-process (one Uvicorn worker) or Redis (any number).
     # Checked here so a configured-but-unreachable Redis is a loud boot problem
@@ -269,9 +273,15 @@ async def health_check():
 # Uploaded files are also persisted to the DB (see _save_turn) so a resumed
 # conversation can rebuild the model's file context.
 
-_MAX_ATTACH_BYTES = 15 * 1024 * 1024        # 15 MB per file (pre-base64)
+# A message arrives as ONE websocket frame, and uvicorn drops any frame over
+# ws_max_size (16 MB) before this code sees it — the student just gets a
+# disconnect. Base64 inflates by 4/3, so 11 MB of files is ~14.7 MB on the wire,
+# leaving room for the JSON around it. The old 15/30 MB caps could never be
+# reached: anything near them was cut off at the transport. Mirrored in
+# frontend/src/pages/Workspace.jsx.
+_MAX_ATTACH_BYTES = 10 * 1024 * 1024        # 10 MB per file (pre-base64)
 _MAX_ATTACH_COUNT = 5                        # files per message
-_MAX_ATTACH_TOTAL_BYTES = 30 * 1024 * 1024   # combined per message (guards the WS frame)
+_MAX_ATTACH_TOTAL_BYTES = 11 * 1024 * 1024   # combined per message (fits the WS frame)
 # Cumulative caps across an entire conversation (all turns).
 _MAX_CHAT_ATTACH_COUNT = 15
 _MAX_CHAT_ATTACH_BYTES = 50 * 1024 * 1024
@@ -624,7 +634,10 @@ async def _build_gemini_history(conversation_history: list) -> list:
     return history
 
 
-async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None, is_graded_revision: bool = False):
+async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None, is_graded_revision: bool = False) -> str | None:
+    """Persist one turn. Returns the EvalResult id, or None if the save failed.
+    A failed evaluation (eval_failed) is saved with NULL scores as "pending"."""
+    score_pending = bool(eval_data.get("eval_failed"))
     try:
         async with AsyncSessionLocal() as db:
             user_message = Message(conversation_id=conversation_id, role="user", content=user_msg)
@@ -663,7 +676,7 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
             if conv:
                 owner = await db.get(User, conv.user_id)
                 consent_now = bool(owner.consent_research) if owner else False
-            db.add(EvalResult(
+            eval_row = EvalResult(
                 conversation_id=conversation_id,
                 turn_number=turn_num,
                 pei=scores.get("PEI"),
@@ -680,7 +693,9 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                 full_result=eval_data,
                 consent_research=consent_now,
                 is_graded_revision=is_graded_revision,
-            ))
+                score_status="pending" if score_pending else None,
+            )
+            db.add(eval_row)
             res = await db.execute(
                 update(Conversation)
                 .where(Conversation.id == conversation_id)
@@ -704,7 +719,10 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                     )
                 )
                 ucs = ucs_q.scalar_one_or_none()
-                if ucs:
+                # Frozen once the session is completed: a turn that was already
+                # in flight when it ended is kept, but cannot change the score
+                # the session finished with.
+                if ucs and ucs.status != "completed":
                     try:
                         pei_val = float(new_pei)
                     except (TypeError, ValueError):
@@ -718,14 +736,17 @@ async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, ev
                             ucs.status = "in_progress"
 
             await db.commit()
+            eval_id = eval_row.id
     except Exception as e:
         log.error(f"DB save failed for turn {turn_num}: {e}")
-        return
+        return None
 
     # Study log. After the commit, so the log records what actually persisted,
     # and outside the try, so a logging problem can't be mistaken for a save
     # failure. log_event never raises.
-    await _log_coach_turn(conversation_id, user_message.id, turn_num, scores, condition=condition)
+    await _log_coach_turn(conversation_id, user_message.id, turn_num, scores, condition=condition,
+                          score_pending=score_pending)
+    return eval_id
 
 
 async def _log_coach_turn(
@@ -735,6 +756,7 @@ async def _log_coach_turn(
     scores: dict,
     sender_user_id: str | None = None,
     condition: dict | None = None,
+    score_pending: bool = False,
 ):
     """Record one completed coach turn in the study event log.
 
@@ -781,7 +803,10 @@ async def _log_coach_turn(
         actor_user_id=actor_user_id,
         classroom_id=classroom_id,
         ref_id=message_id,
-        payload={"turn": turn_num, "pei": scores.get("PEI")},
+        # score_pending: the PEI is not known yet; it arrives in a later
+        # coach.score_late event (or coach.score_failed if it never does).
+        payload={"turn": turn_num, "pei": scores.get("PEI"),
+                 **({"score_pending": True} if score_pending else {})},
         condition=condition,
     )
 
@@ -983,13 +1008,399 @@ async def _log_feed_event(conversation_id: str, action: str, payload: dict,
     await log_event(
         action=action,
         target="feed",
-        actor_kind="system" if action in ("feed.suppressed", "revision.missed") else "student",
+        actor_kind="system" if action in ("feed.suppressed", "revision.missed", "feed.score_pending") else "student",
         user_challenge_session_id=ucs_id,
         actor_user_id=actor,
         classroom_id=classroom_id,
         payload=payload,
         condition=condition,
     )
+
+
+# --- Scoring that failed: save as pending, retry in the background -----------
+# A turn whose evaluation failed is saved with NULL scores and score_status
+# "pending" (see EvalResult.score_status), the student is told their score will
+# follow, and it is re-scored after 1, 5 and 15 minutes. Before, the evaluator
+# returned zeros and they were saved and shown as the turn's real score.
+#
+# The retry reads the conversation back from the database, so it survives the
+# student leaving, and a restart re-queues whatever was still pending
+# (_resweep_pending_scores). Applying a late score is a conditional UPDATE, so
+# two workers retrying the same row cannot both write it.
+
+_RESCORE_DELAYS = (60, 300, 900)
+_rescore_tasks: set = set()
+
+SCORE_PENDING_MESSAGE = (
+    "We had a problem scoring this turn on our end. Your score will update "
+    "automatically, and this turn will count toward your minimum once it has one."
+)
+SCORE_FAILED_MESSAGE = (
+    "We still could not score turn {turn}, so it will not count toward your "
+    "minimum turns. Your other turns are unaffected."
+)
+
+# Open solo sockets per conversation, so a late score can reach the tab the
+# student is on now, not the one that sent the turn.
+_solo_sockets: dict[str, set] = {}
+
+
+def _failed_eval(corpus_store_id: str | None) -> dict:
+    """The evaluator's failure shape, plus what a retry needs to score the same
+    turn the same way later."""
+    from evaluator_v3 import _default_eval
+
+    out = _default_eval()
+    out["rescore"] = {"corpus_vector_store_id": corpus_store_id}
+    return out
+
+
+def _is_failed_eval(result) -> bool:
+    return not isinstance(result, dict) or bool(result.get("eval_failed"))
+
+
+def _schedule_rescore(eval_id: str) -> None:
+    task = asyncio.create_task(_rescore(eval_id))
+    _rescore_tasks.add(task)
+    task.add_done_callback(_rescore_tasks.discard)
+
+
+async def _history_for_eval(db, ev) -> list[dict]:
+    """The conversation as it stood when this turn was taken: its first
+    turn_number exchanges. Turn N is the Nth saved user/assistant pair, which is
+    how every turn path numbers turns."""
+    msgs = (await db.execute(
+        select(Message).where(Message.conversation_id == ev.conversation_id)
+        .order_by(Message.created_at)
+    )).scalars().all()
+    return [{"role": m.role, "content": m.content} for m in msgs[: 2 * ev.turn_number]]
+
+
+async def _rescore(eval_id: str) -> None:
+    for delay in _RESCORE_DELAYS:
+        await asyncio.sleep(delay)
+        try:
+            # Read, then close the session before the model call: holding a
+            # pooled connection across a multi-second LLM call starves the pool.
+            async with AsyncSessionLocal() as db:
+                ev = await db.get(EvalResult, eval_id)
+                if ev is None or ev.score_status != "pending":
+                    return
+                history = await _history_for_eval(db, ev)
+                corpus = ((ev.full_result or {}).get("rescore") or {}).get("corpus_vector_store_id")
+        except Exception as e:
+            log.error(f"[RESCORE] could not load {eval_id}: {e}")
+            continue
+        if not history:
+            continue
+        try:
+            result = await evaluate_conversation(history, corpus_vector_store_id=corpus)
+        except Exception as e:
+            log.warning(f"[RESCORE] attempt failed for {eval_id}: {type(e).__name__}: {e}")
+            result = None
+        if not _is_failed_eval(result):
+            await _apply_late_score(eval_id, result)
+            return
+    await _give_up_on_score(eval_id)
+
+
+async def _pending_context(conversation_id: str) -> dict | None:
+    """Who and where a late score goes: the conversation's kind and scope."""
+    async with AsyncSessionLocal() as db:
+        conv = await db.get(Conversation, conversation_id)
+        if conv is None:
+            return None
+        ucs = None
+        if not conv.group_session_id:
+            ucs = (await db.execute(select(UserChallengeSession).where(
+                UserChallengeSession.conversation_id == conversation_id))).scalar_one_or_none()
+        return {
+            "user_id": conv.user_id,
+            "group_session_id": conv.group_session_id,
+            "kind": conv.kind,
+            "challenge_id": ucs.challenge_id if ucs else None,
+            "session_number": ucs.session_number if ucs else None,
+            "session_completed": bool(ucs and ucs.status == "completed"),
+        }
+
+
+async def _apply_late_score(eval_id: str, result: dict) -> None:
+    s = result.get("scores") or {}
+    now = datetime.utcnow()
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            update(EvalResult)
+            .where(EvalResult.id == eval_id, EvalResult.score_status == "pending")
+            .values(
+                pei=s.get("PEI"), psq=s.get("PSQ"), ccm=s.get("CCM"), tsi=s.get("TSI"),
+                clm=s.get("CLM"), ras=s.get("RAS"),
+                grounding=(result.get("grounding") or {}).get("grounding"),
+                classification=result.get("classification"),
+                leading_status=result.get("leading_status"),
+                full_result=result,
+                score_status="scored_late",
+                scored_at=now,
+            )
+        )
+        if res.rowcount != 1:
+            await db.rollback()
+            return      # another worker got there first, or it is no longer pending
+        ev = await db.get(EvalResult, eval_id)
+        conversation_id, turn = ev.conversation_id, ev.turn_number
+        conv = await db.get(Conversation, conversation_id)
+        pei = s.get("PEI")
+        # Roll into best_pei like an on-time score would have, unless the
+        # session has since finished: a completed session's score is frozen.
+        if conv is not None and pei is not None:
+            if conv.group_session_id and conv.kind != "coach_private":
+                gs = await db.get(GroupSession, conv.group_session_id)
+                if gs and gs.status != "completed" and (gs.best_pei is None or pei > gs.best_pei):
+                    gs.best_pei = float(pei)
+            elif not conv.group_session_id:
+                ucs = (await db.execute(select(UserChallengeSession).where(
+                    UserChallengeSession.conversation_id == conversation_id))).scalar_one_or_none()
+                if ucs and ucs.status != "completed" and (ucs.best_pei is None or pei > ucs.best_pei):
+                    ucs.best_pei = float(pei)
+        await db.commit()
+    log.info(f"[RESCORE] turn {turn} of {conversation_id[:8]} scored late: PEI={pei}")
+    await _deliver_late_score(conversation_id, turn, result)
+
+
+async def _deliver_late_score(conversation_id: str, turn: int, result: dict) -> None:
+    ctx = await _pending_context(conversation_id)
+    if ctx is None:
+        return
+    pei = (result.get("scores") or {}).get("PEI")
+    await _log_score_event(conversation_id, ctx, "score_late", {"turn": turn, "pei": pei})
+
+    if ctx["group_session_id"]:
+        frame = {"type": "eval_late", "turn": turn, "data": result}
+        try:
+            if ctx["kind"] == "coach_private":
+                # Private coach output stays on this worker by design (see
+                # GroupRoom.send_to_user); the score is in the database either way.
+                room = rooms.peek(ctx["group_session_id"])
+                if room is not None:
+                    await room.send_to_user(ctx["user_id"], frame)
+            else:
+                await rooms.notify(ctx["group_session_id"], frame)
+        except Exception as e:
+            log.warning(f"[RESCORE] could not deliver late score: {e}")
+        return
+
+    # Solo: the feed decides whether the student sees it, exactly as on time.
+    policy, feed_enabled, revision_turn = await _resolve_solo_study_config(
+        ctx["user_id"], ctx["challenge_id"], ctx["session_number"])
+    condition = policy.as_condition()
+    # A revision can only open in a session that is still running: after the
+    # end (e.g. the timer, which already logged revision.missed) it cannot.
+    opens_revision = (revision_turn is not None and turn == revision_turn and feed_enabled
+                      and not ctx["session_completed"])
+    frames = [{"type": "eval_late", "turn": turn, "data": result} if feed_enabled
+              else {"type": "eval_late_suppressed", "turn": turn}]
+    if opens_revision:
+        frames.append({"type": "revision_required", "after_turn": turn})
+    delivered = False
+    for ws in list(_solo_sockets.get(conversation_id, ())):
+        try:
+            for frame in frames:
+                await ws.send_text(json.dumps(frame))
+            delivered = True
+        except Exception:
+            continue
+    # feed.shown means the student was shown it. With no open tab nobody was,
+    # and coach.score_late (above) is the whole record; the student meets the
+    # score later in their history, not as feedback on the turn.
+    if delivered:
+        await _log_feed_event(
+            conversation_id, "feed.shown" if feed_enabled else "feed.suppressed",
+            {"turn": turn, "pei": pei, "late": True}, condition,
+        )
+        if opens_revision:
+            await _log_feed_event(conversation_id, "revision.opened",
+                                  {"after_turn": turn, "pei_before": pei, "late": True}, condition)
+
+
+async def _give_up_on_score(eval_id: str) -> None:
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            update(EvalResult)
+            .where(EvalResult.id == eval_id, EvalResult.score_status == "pending")
+            .values(score_status="failed", scored_at=None)
+        )
+        await db.commit()
+        if res.rowcount != 1:
+            return
+        ev = await db.get(EvalResult, eval_id)
+        conversation_id, turn = ev.conversation_id, ev.turn_number
+    log.error(f"[RESCORE] gave up on turn {turn} of {conversation_id[:8]}")
+    ctx = await _pending_context(conversation_id)
+    if ctx is None:
+        return
+    await _log_score_event(conversation_id, ctx, "score_failed", {"turn": turn})
+    feed_enabled = True
+    if not ctx["group_session_id"]:
+        _p, feed_enabled, _r = await _resolve_solo_study_config(
+            ctx["user_id"], ctx["challenge_id"], ctx["session_number"])
+    # A feed-off session shows no scores, so it gets no scoring notice either
+    # (as with eval_pending); the frame still arrives so the client stays in step.
+    frame = {"type": "eval_rescore_failed", "turn": turn,
+             "message": SCORE_FAILED_MESSAGE.format(turn=turn) if feed_enabled else None}
+    try:
+        if ctx["group_session_id"]:
+            if ctx["kind"] == "coach_private":
+                room = rooms.peek(ctx["group_session_id"])
+                if room is not None:
+                    await room.send_to_user(ctx["user_id"], frame)
+            else:
+                await rooms.notify(ctx["group_session_id"], frame)
+        else:
+            for ws in list(_solo_sockets.get(conversation_id, ())):
+                await ws.send_text(json.dumps(frame))
+    except Exception as e:
+        log.warning(f"[RESCORE] could not deliver give-up notice: {e}")
+
+
+async def _log_score_event(conversation_id: str, ctx: dict, action: str, payload: dict) -> None:
+    """coach.score_late / coach.score_failed: the log's own record that a
+    turn's score arrived late (with the PEI the turn event could not carry) or
+    never did."""
+    ucs_id = None
+    actor = ctx["user_id"]
+    if not ctx["group_session_id"]:
+        async with AsyncSessionLocal() as db:
+            ucs_id = (await db.execute(select(UserChallengeSession.id).where(
+                UserChallengeSession.conversation_id == conversation_id))).scalar_one_or_none()
+        if ucs_id is None:
+            return      # an ad-hoc chat, outside the study
+    elif ctx["kind"] != "coach_private":
+        # A shared group chat is owned by whoever created the team; the turn
+        # belongs to the teammate who sent that prompt (turn N = Nth prompt).
+        async with AsyncSessionLocal() as db:
+            senders = (await db.execute(
+                select(Message.sender_user_id).where(
+                    Message.conversation_id == conversation_id, Message.role == "user")
+                .order_by(Message.created_at)
+            )).scalars().all()
+        n = payload.get("turn") or 0
+        if 1 <= n <= len(senders) and senders[n - 1]:
+            actor = senders[n - 1]
+    await log_event(
+        action=action, target="coach", actor_kind="system",
+        group_session_id=ctx["group_session_id"], user_challenge_session_id=ucs_id,
+        actor_user_id=actor, payload=payload,
+    )
+
+
+async def _resweep_pending_scores() -> None:
+    """Startup: re-queue scores a previous process was still retrying."""
+    try:
+        async with AsyncSessionLocal() as db:
+            ids = [i for (i,) in (await db.execute(
+                select(EvalResult.id).where(EvalResult.score_status == "pending"))).all()]
+        for eval_id in ids:
+            _schedule_rescore(eval_id)
+        if ids:
+            log.info(f"[RESCORE] re-queued {len(ids)} pending score(s) on startup")
+    except Exception as e:
+        log.error(f"[RESCORE] startup sweep failed: {type(e).__name__}: {e}")
+
+
+# Per-conversation turn locks for /ws. Weak values: a lock lives exactly as
+# long as some open socket on this conversation holds it. In-process, so it
+# orders the tabs served by ONE worker (the deployment runs one); the history
+# reload below is what keeps a turn from building on a stale history either way.
+_solo_turn_locks: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
+
+
+def _solo_turn_lock(conversation_id: str) -> asyncio.Lock:
+    lock = _solo_turn_locks.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _solo_turn_locks[conversation_id] = lock
+    return lock
+
+
+async def _fresh_history(conversation_id: str, current: list[dict]) -> list[dict]:
+    """The conversation as saved, if it has moved on without this socket.
+
+    A socket keeps its history in memory (with the Files API handles cached
+    on each attachment, so files are not re-uploaded every turn). That copy
+    goes stale when another tab, or another worker, saves a turn to the same
+    conversation — and a turn built on it re-uses a turn number and leaves the
+    coach without the other tab's exchange. Counting rows is cheap; the full
+    reload only happens when the counts differ."""
+    try:
+        async with AsyncSessionLocal() as db:
+            saved = (await db.execute(
+                select(func.count(Message.id)).where(Message.conversation_id == conversation_id)
+            )).scalar() or 0
+        if saved == len(current):
+            return current
+        log.info(f"[HISTORY] {conversation_id[:8]} moved on elsewhere ({len(current)} -> {saved} msgs); reloading")
+        return await _load_group_history(conversation_id)
+    except Exception as e:
+        log.error(f"[HISTORY] could not refresh {conversation_id}: {e}")
+        return current
+
+
+async def _can_play_solo(user_id: str, challenge_id: str) -> bool | None:
+    """True/False from the access rule; None when it could not be checked.
+
+    A failed check (a pooler blip, say) is not a refusal: the client treats
+    4003 as final and stops reconnecting, which would strand a student who is
+    allowed in. The caller closes with a retryable code instead."""
+    try:
+        from challenges import _can_play_challenge, _challenge_access_sets
+        async with AsyncSessionLocal() as db:
+            ch = await db.get(Challenge, challenge_id)
+            if ch is None:
+                return False
+            _, _, is_admin = await _challenge_access_sets(db, user_id)
+            return await _can_play_challenge(db, user_id, challenge_id, ch, is_admin)
+    except Exception as e:
+        log.error(f"could not check access to challenge {challenge_id}: {e}")
+        return None
+
+
+# How long after a session ends a dwell flushed by the end is still accepted
+# (see _closing_dwell in /ws/coach). Long enough for the end broadcast to reach
+# every tab and the flush to come back; short enough that it cannot become a
+# way to keep recording after the session.
+_END_DWELL_GRACE_SECONDS = 30
+
+
+async def _solo_session_completed(conversation_id: str | None) -> bool:
+    """Whether this conversation's challenge session is finished.
+
+    Checked per message, not once at connect: a session also ends while the
+    socket is open (the timer, /end from another tab, "Mark as complete" on the
+    challenge page), and a completed session must not keep taking scored turns
+    that move best_pei after the fact. Free-workspace chats have no session and
+    never complete."""
+    if not conversation_id:
+        return False
+    try:
+        async with AsyncSessionLocal() as db:
+            status = (await db.execute(
+                select(UserChallengeSession.status).where(
+                    UserChallengeSession.conversation_id == conversation_id)
+            )).scalar_one_or_none()
+        return status == "completed"
+    except Exception as e:
+        log.error(f"could not check session status for {conversation_id}: {e}")
+        return False
+
+
+async def _group_session_completed(group_session_id: str) -> bool:
+    """The group-session counterpart, for /ws/group and /ws/coach."""
+    try:
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            return bool(gs and gs.status == "completed")
+    except Exception as e:
+        log.error(f"could not check group session status for {group_session_id}: {e}")
+        return False
 
 
 @app.websocket("/ws")
@@ -1007,6 +1418,20 @@ async def websocket_endpoint(
     if not user_id:
         await websocket.close(code=4001, reason="Invalid or expired token")
         return
+
+    # The same access rule as starting the session over HTTP. Checked before
+    # anything about the challenge is loaded: without it, any signed-in user
+    # with a challenge id could open a chat on it and be sent its brief, goal
+    # and coaching prompt, whether or not it was ever assigned to them.
+    if challenge_id:
+        allowed = await _can_play_solo(user_id, challenge_id)
+        if allowed is None:
+            # 1013 = try again later; the client reconnects on anything but 4001/4003.
+            await websocket.close(code=1013, reason="Could not check access; retrying")
+            return
+        if not allowed:
+            await websocket.close(code=4003, reason="Challenge not available")
+            return
 
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
@@ -1151,6 +1576,15 @@ async def websocket_endpoint(
         if session_deadline else None
     )
 
+    scored_turns = 0
+    if conversation_id:
+        try:
+            from challenges import scored_turn_count
+            async with AsyncSessionLocal() as db:
+                scored_turns = await scored_turn_count(db, conversation_id)
+        except Exception as e:
+            log.error(f"could not count scored turns for {conversation_id}: {e}")
+
     # Always send conversation_id so the client can call the end-session REST endpoint
     if conversation_id:
         await websocket.send_text(json.dumps({
@@ -1160,6 +1594,8 @@ async def websocket_endpoint(
             "min_turns": session_min_turns,
             "remaining_seconds": remaining_seconds,
             "turn_count": len(conversation_history) // 2,
+            # What the minimum-turns rule counts: turns that got a score.
+            "scored_turns": scored_turns,
             "revision_owed_after_turn": None if session_is_completed else revision_owed_turn,
         }))
 
@@ -1199,6 +1635,10 @@ async def websocket_endpoint(
     if session_is_completed:
         await websocket.send_text(json.dumps({"type": "session_ended"}))
 
+    if conversation_id:
+        _solo_sockets.setdefault(conversation_id, set()).add(websocket)
+    solo_lock = _solo_turn_lock(conversation_id) if conversation_id else asyncio.Lock()
+
     client_host = websocket.client.host if websocket.client else "unknown"
     mode = f"challenge={challenge_id}/session={session_num}" if challenge_id else "free"
     log.info(
@@ -1213,6 +1653,19 @@ async def websocket_endpoint(
 
             if data.get("type") != "message":
                 log.debug(f"[WS] Ignoring non-message packet: type={data.get('type')}")
+                continue
+
+            # A completed session is read-only. Refused before anything else
+            # runs, so a late message is neither scored, stored, nor indexed.
+            if session_is_completed or await _solo_session_completed(conversation_id):
+                session_is_completed = True
+                await websocket.send_text(json.dumps({"type": "session_ended"}))
+                log.info(f"[WS] Message rejected, session already completed (conv: {conversation_id})")
+                continue
+
+            # Another tab of this conversation has a turn in flight.
+            if solo_lock.locked():
+                await websocket.send_text(json.dumps({"type": "busy"}))
                 continue
 
             user_content = data.get("content", "").strip()
@@ -1256,192 +1709,233 @@ async def websocket_endpoint(
                 log.info(f"[WS] Message rejected, session past deadline (conv: {conversation_id})")
                 continue
 
-            turn = len(conversation_history) // 2 + 1
-            preview = user_content[:120]
-            ellipsis = "..." if len(user_content) > 120 else ""
-            log.info(f"[TURN {turn}] User ({len(user_content)} chars): {preview!r}{ellipsis}")
+            # One turn at a time per conversation (A4). Two tabs on the same
+            # session used to run turns concurrently from their own in-memory
+            # histories: both claimed the same turn number and the saved
+            # conversation interleaved. A second tab is now told "busy" while a
+            # turn is in flight (checked above), and every turn starts from
+            # what was saved.
+            async with solo_lock:
+                if conversation_id:
+                    conversation_history = await _fresh_history(conversation_id, conversation_history)
+                turn = len(conversation_history) // 2 + 1
+                preview = user_content[:120]
+                ellipsis = "..." if len(user_content) > 120 else ""
+                log.info(f"[TURN {turn}] User ({len(user_content)} chars): {preview!r}{ellipsis}")
 
-            # Downscale large images before they're uploaded/stored (CPU-bound).
-            if attachments:
-                await asyncio.to_thread(_preprocess_attachments, attachments)
-            gemini_history = await _build_gemini_history(conversation_history)
-            turn_parts = await _build_attachment_parts(attachments)
-            turn_parts.append(types.Part(text=user_content))
-            contents = gemini_history + [
-                types.Content(role="user", parts=turn_parts)
-            ]
-            if attachments:
-                names = ", ".join(a.get("filename", "file") for a in attachments)
-                log.info(f"[TURN {turn}] User attached {len(attachments)} file(s): {names}")
+                # Downscale large images before they're uploaded/stored (CPU-bound).
+                if attachments:
+                    await asyncio.to_thread(_preprocess_attachments, attachments)
+                gemini_history = await _build_gemini_history(conversation_history)
+                turn_parts = await _build_attachment_parts(attachments)
+                turn_parts.append(types.Part(text=user_content))
+                contents = gemini_history + [
+                    types.Content(role="user", parts=turn_parts)
+                ]
+                if attachments:
+                    names = ", ".join(a.get("filename", "file") for a in attachments)
+                    log.info(f"[TURN {turn}] User attached {len(attachments)} file(s): {names}")
 
-            # Keep attachments on the in-memory history item so the model retains the
-            # file context across later turns (the cached Files API handle rides along
-            # on each att dict). The bytes are also persisted in _save_turn, so a
-            # resumed conversation can replay them.
-            conversation_history.append(
-                {"role": "user", "content": user_content, "attachments": attachments}
-            )
+                # Keep attachments on the in-memory history item so the model retains the
+                # file context across later turns (the cached Files API handle rides along
+                # on each att dict). The bytes are also persisted in _save_turn, so a
+                # resumed conversation can replay them.
+                conversation_history.append(
+                    {"role": "user", "content": user_content, "attachments": attachments}
+                )
 
-            await websocket.send_text(json.dumps({"type": "typing"}))
-            log.debug(f"[TURN {turn}] Sent 'typing' signal to client")
+                await websocket.send_text(json.dumps({"type": "typing"}))
+                log.debug(f"[TURN {turn}] Sent 'typing' signal to client")
 
-            # -- Chat streaming --
-            full_response = ""
-            chunk_count = 0
-            last_chunk = None
-            log.info(f"[TURN {turn}] Streaming chat -> gemini-2.5-pro (history depth: {len(gemini_history)})")
+                # -- Chat streaming --
+                full_response = ""
+                chunk_count = 0
+                last_chunk = None
+                log.info(f"[TURN {turn}] Streaming chat -> gemini-2.5-pro (history depth: {len(gemini_history)})")
 
-            try:
-                async for chunk in await client.aio.models.generate_content_stream(
-                    model="gemini-2.5-pro",
-                    contents=contents,
-                    config=chat_config,
-                ):
-                    text = chunk.text
-                    if text:
-                        full_response += text
-                        chunk_count += 1
-                        await websocket.send_text(json.dumps({
-                            "type": "stream",
-                            "content": text
-                        }))
-                    last_chunk = chunk
-
-                usage = last_chunk.usage_metadata if last_chunk else None
-                if usage:
-                    log.info(
-                        f"[TURN {turn}] Chat done -- "
-                        f"chunks={chunk_count}, "
-                        f"in={usage.prompt_token_count} tok, "
-                        f"out={usage.candidates_token_count} tok, "
-                        f"response={len(full_response)} chars"
-                    )
-                else:
-                    log.info(f"[TURN {turn}] Chat done -- chunks={chunk_count}, response={len(full_response)} chars")
-
-            except Exception as e:
-                err_str = str(e)
-                if "API_KEY_INVALID" in err_str or "API key not valid" in err_str:
-                    log.error(f"[TURN {turn}] AUTH FAILED -- check GOOGLE_API_KEY")
-                    msg = "Authentication failed -- is GOOGLE_API_KEY set correctly?"
-                elif "quota" in err_str.lower() or "rate" in err_str.lower() or "429" in err_str:
-                    log.warning(f"[TURN {turn}] Rate limited: {e}")
-                    msg = "Rate limited. Please wait a moment and try again."
-                elif "billing" in err_str.lower() or "credit" in err_str.lower():
-                    log.error(f"[TURN {turn}] BILLING ISSUE: {e}")
-                    msg = "Billing issue -- check your Google Cloud / AI Studio account."
-                else:
-                    log.error(f"[TURN {turn}] Chat stream error: {type(e).__name__}: {e}", exc_info=True)
-                    msg = f"Chat error: {type(e).__name__}: {e}"
-                await websocket.send_text(json.dumps({"type": "error", "message": msg}))
-                conversation_history.pop()
-                continue
-
-            conversation_history.append({"role": "assistant", "content": full_response})
-
-            await websocket.send_text(json.dumps({
-                "type": "done",
-                "full_response": full_response
-            }))
-            log.debug(f"[TURN {turn}] Sent 'done' to client")
-
-            # -- Related-passages citations (never blocks 'done' above) --
-            vector_store_id = await _get_conversation_vector_store_id(conversation_id) if conversation_id else None
-            if vector_store_id:
                 try:
-                    related = await asyncio.wait_for(
-                        _retrieve_related_passages(vector_store_id, user_content, full_response),
-                        timeout=8,
-                    )
-                    await websocket.send_text(json.dumps({
-                        "type": "citations", "turn": turn, "citations": related
-                    }))
+                    async for chunk in await client.aio.models.generate_content_stream(
+                        model="gemini-2.5-pro",
+                        contents=contents,
+                        config=chat_config,
+                    ):
+                        text = chunk.text
+                        if text:
+                            full_response += text
+                            chunk_count += 1
+                            await websocket.send_text(json.dumps({
+                                "type": "stream",
+                                "content": text
+                            }))
+                        last_chunk = chunk
+
+                    usage = last_chunk.usage_metadata if last_chunk else None
+                    if usage:
+                        log.info(
+                            f"[TURN {turn}] Chat done -- "
+                            f"chunks={chunk_count}, "
+                            f"in={usage.prompt_token_count} tok, "
+                            f"out={usage.candidates_token_count} tok, "
+                            f"response={len(full_response)} chars"
+                        )
+                    else:
+                        log.info(f"[TURN {turn}] Chat done -- chunks={chunk_count}, response={len(full_response)} chars")
+
                 except Exception as e:
-                    log.warning(f"[TURN {turn}] Citation retrieval failed: {type(e).__name__}: {e}")
-                    await websocket.send_text(json.dumps({"type": "citations_error", "turn": turn}))
+                    err_str = str(e)
+                    if "API_KEY_INVALID" in err_str or "API key not valid" in err_str:
+                        log.error(f"[TURN {turn}] AUTH FAILED -- check GOOGLE_API_KEY")
+                        msg = "Authentication failed -- is GOOGLE_API_KEY set correctly?"
+                    elif "quota" in err_str.lower() or "rate" in err_str.lower() or "429" in err_str:
+                        log.warning(f"[TURN {turn}] Rate limited: {e}")
+                        msg = "Rate limited. Please wait a moment and try again."
+                    elif "billing" in err_str.lower() or "credit" in err_str.lower():
+                        log.error(f"[TURN {turn}] BILLING ISSUE: {e}")
+                        msg = "Billing issue -- check your Google Cloud / AI Studio account."
+                    else:
+                        log.error(f"[TURN {turn}] Chat stream error: {type(e).__name__}: {e}", exc_info=True)
+                        msg = f"Chat error: {type(e).__name__}: {e}"
+                    await websocket.send_text(json.dumps({"type": "error", "message": msg}))
+                    conversation_history.pop()
+                    continue
 
-            # -- Evaluation --
-            await websocket.send_text(json.dumps({"type": "eval_start"}))
-            log.info(f"[TURN {turn}] Starting eval (total history: {len(conversation_history)} msgs)")
+                conversation_history.append({"role": "assistant", "content": full_response})
 
-            eval_result = None
-            try:
-                eval_result = await evaluate_conversation(
-                    conversation_history, corpus_vector_store_id=corpus_store_id
-                )
-                scores = eval_result.get("scores", {})
-                log.info(
-                    f"[TURN {turn}] Eval -> "
-                    f"PEI={scores.get('PEI', 0):.1f}  "
-                    f"PSQ={scores.get('PSQ', 0):.1f}  "
-                    f"CCM={scores.get('CCM', 0):.1f}  "
-                    f"TSI={scores.get('TSI', 0):.1f}  "
-                    f"CLM={scores.get('CLM', 0):.1f}  "
-                    f"RAS={scores.get('RAS', 0):.1f}  "
-                    f"| {eval_result.get('classification')} / {eval_result.get('leading_status')}"
-                )
-                log.debug(f"[TURN {turn}] Suggestions: {eval_result.get('suggestions', [])}")
-                log.debug(f"[TURN {turn}] Red flags:   {eval_result.get('red_flags', [])}")
-                # Persist before notifying the client so a fast disconnect cannot cancel the save.
-                # A graded revision is defined as the submission AFTER the feed
-                # was shown for the designated turn. So it counts only in a
-                # session that shows the feed, and only once that turn has
-                # passed — an early or feed-less "revision" is not a response
-                # to feedback, and a client cannot make it one by setting a flag.
-                is_revision = (bool(data.get("is_revision")) and revision_turn is not None
-                               and feed_enabled and turn > revision_turn)
-                if conversation_id:
-                    await _save_turn(
-                        conversation_id, user_content, full_response, eval_result, turn,
-                        attachments, condition=study_condition,
-                        is_graded_revision=is_revision,
-                    )
-                pei_now = (eval_result or {}).get("scores", {}).get("PEI")
-                # Log BEFORE notifying the client, matching the rule the save
-                # above follows: a client that disconnects the moment it gets
-                # its score would otherwise cancel this write, and whether the
-                # feed was shown IS the intervention — losing it silently
-                # unlabels the turn.
-                if conversation_id:
-                    if is_revision:
-                        await _log_feed_event(
-                            conversation_id, "revision.submitted",
-                            {"turn": turn, "pei_after": pei_now}, study_condition,
-                        )
-                    await _log_feed_event(
-                        conversation_id,
-                        "feed.shown" if feed_enabled else "feed.suppressed",
-                        {"turn": turn, "pei": pei_now}, study_condition,
-                    )
-                    if revision_turn is not None and turn == revision_turn and feed_enabled:
-                        await _log_feed_event(
-                            conversation_id, "revision.opened",
-                            {"after_turn": turn, "pei_before": pei_now}, study_condition,
-                        )
-
-                if feed_enabled:
-                    await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
-                else:
-                    # Removing the intervention must not remove the measurement:
-                    # the turn is scored and stored exactly as normal, the score
-                    # simply is not shown. The client is told so it can render a
-                    # deliberate "no feedback this session" state rather than a
-                    # silent failure.
-                    await websocket.send_text(json.dumps({
-                        "type": "eval_suppressed", "turn": turn,
-                    }))
-                if revision_turn is not None and turn == revision_turn and feed_enabled:
-                    # The feed has been shown for the designated turn; the next
-                    # submission is the one that counts.
-                    await websocket.send_text(json.dumps({
-                        "type": "revision_required", "after_turn": turn,
-                    }))
-            except Exception as e:
-                log.error(f"[TURN {turn}] Eval error: {type(e).__name__}: {e}", exc_info=True)
                 await websocket.send_text(json.dumps({
-                    "type": "eval_error",
-                    "message": str(e)
+                    "type": "done",
+                    "full_response": full_response
                 }))
+                log.debug(f"[TURN {turn}] Sent 'done' to client")
+
+                # -- Related-passages citations (never blocks 'done' above) --
+                vector_store_id = await _get_conversation_vector_store_id(conversation_id) if conversation_id else None
+                if vector_store_id:
+                    try:
+                        related = await asyncio.wait_for(
+                            _retrieve_related_passages(vector_store_id, user_content, full_response),
+                            timeout=8,
+                        )
+                        await websocket.send_text(json.dumps({
+                            "type": "citations", "turn": turn, "citations": related
+                        }))
+                    except Exception as e:
+                        log.warning(f"[TURN {turn}] Citation retrieval failed: {type(e).__name__}: {e}")
+                        await websocket.send_text(json.dumps({"type": "citations_error", "turn": turn}))
+
+                # -- Evaluation --
+                await websocket.send_text(json.dumps({"type": "eval_start"}))
+                log.info(f"[TURN {turn}] Starting eval (total history: {len(conversation_history)} msgs)")
+
+                try:
+                    eval_result = await evaluate_conversation(
+                        conversation_history, corpus_vector_store_id=corpus_store_id
+                    )
+                except Exception as e:
+                    log.error(f"[TURN {turn}] Eval error: {type(e).__name__}: {e}", exc_info=True)
+                    eval_result = None
+                eval_failed = _is_failed_eval(eval_result)
+                if eval_failed:
+                    eval_result = _failed_eval(corpus_store_id)
+                try:
+                    scores = eval_result.get("scores", {})
+                    if eval_failed:
+                        log.warning(f"[TURN {turn}] Eval failed; saving as scoring-pending")
+                    else:
+                        log.info(
+                            f"[TURN {turn}] Eval -> "
+                            f"PEI={scores.get('PEI') or 0:.1f}  "
+                            f"PSQ={scores.get('PSQ') or 0:.1f}  "
+                            f"CCM={scores.get('CCM') or 0:.1f}  "
+                            f"TSI={scores.get('TSI') or 0:.1f}  "
+                            f"CLM={scores.get('CLM') or 0:.1f}  "
+                            f"RAS={scores.get('RAS') or 0:.1f}  "
+                            f"| {eval_result.get('classification')} / {eval_result.get('leading_status')}"
+                        )
+                    log.debug(f"[TURN {turn}] Suggestions: {eval_result.get('suggestions', [])}")
+                    log.debug(f"[TURN {turn}] Red flags:   {eval_result.get('red_flags', [])}")
+                    # Persist before notifying the client so a fast disconnect cannot cancel the save.
+                    # A graded revision is defined as the submission AFTER the feed
+                    # was shown for the designated turn. So it counts only in a
+                    # session that shows the feed, and only once that turn has
+                    # passed — an early or feed-less "revision" is not a response
+                    # to feedback, and a client cannot make it one by setting a flag.
+                    is_revision = (bool(data.get("is_revision")) and revision_turn is not None
+                                   and feed_enabled and turn > revision_turn)
+                    eval_id = None
+                    if conversation_id:
+                        eval_id = await _save_turn(
+                            conversation_id, user_content, full_response, eval_result, turn,
+                            attachments, condition=study_condition,
+                            is_graded_revision=is_revision,
+                        )
+                    if eval_failed and eval_id:
+                        # Before notifying, for the same reason as the save above.
+                        _schedule_rescore(eval_id)
+                    pei_now = (eval_result or {}).get("scores", {}).get("PEI")
+                    # Log BEFORE notifying the client, matching the rule the save
+                    # above follows: a client that disconnects the moment it gets
+                    # its score would otherwise cancel this write, and whether the
+                    # feed was shown IS the intervention — losing it silently
+                    # unlabels the turn.
+                    if conversation_id:
+                        if is_revision:
+                            await _log_feed_event(
+                                conversation_id, "revision.submitted",
+                                {"turn": turn, "pei_after": pei_now,
+                                 **({"score_pending": True} if eval_failed else {})},
+                                study_condition,
+                            )
+                        if eval_failed:
+                            # Nothing was shown yet: feed.shown/suppressed is logged
+                            # when the late score arrives (with "late": true).
+                            await _log_feed_event(
+                                conversation_id, "feed.score_pending", {"turn": turn}, study_condition,
+                            )
+                        else:
+                            await _log_feed_event(
+                                conversation_id,
+                                "feed.shown" if feed_enabled else "feed.suppressed",
+                                {"turn": turn, "pei": pei_now}, study_condition,
+                            )
+                        if revision_turn is not None and turn == revision_turn and feed_enabled \
+                                and not eval_failed:
+                            await _log_feed_event(
+                                conversation_id, "revision.opened",
+                                {"after_turn": turn, "pei_before": pei_now}, study_condition,
+                            )
+
+                    if eval_failed:
+                        # A feed-off session shows no scores anyway, so the student
+                        # gets no scoring notice there — only the suppressed state.
+                        await websocket.send_text(json.dumps({
+                            "type": "eval_pending", "turn": turn,
+                            "suppressed": not feed_enabled,
+                            "message": None if not feed_enabled else SCORE_PENDING_MESSAGE,
+                        }))
+                    elif feed_enabled:
+                        await websocket.send_text(json.dumps({"type": "eval", "data": eval_result}))
+                    else:
+                        # Removing the intervention must not remove the measurement:
+                        # the turn is scored and stored exactly as normal, the score
+                        # simply is not shown. The client is told so it can render a
+                        # deliberate "no feedback this session" state rather than a
+                        # silent failure.
+                        await websocket.send_text(json.dumps({
+                            "type": "eval_suppressed", "turn": turn,
+                        }))
+                    if revision_turn is not None and turn == revision_turn and feed_enabled \
+                            and not eval_failed:
+                        # The feed has been shown for the designated turn; the next
+                        # submission is the one that counts.
+                        await websocket.send_text(json.dumps({
+                            "type": "revision_required", "after_turn": turn,
+                        }))
+                except Exception as e:
+                    log.error(f"[TURN {turn}] Eval error: {type(e).__name__}: {e}", exc_info=True)
+                    await websocket.send_text(json.dumps({
+                        "type": "eval_error",
+                        "message": str(e)
+                    }))
 
     except WebSocketDisconnect:
         log.info(f"[WS] User {user_id[:8]}... disconnected after {len(conversation_history) // 2} turns")
@@ -1455,6 +1949,13 @@ async def websocket_endpoint(
             pass
         if conversation_id:
             await _close_conversation(conversation_id)
+    finally:
+        if conversation_id:
+            socks = _solo_sockets.get(conversation_id)
+            if socks is not None:
+                socks.discard(websocket)
+                if not socks:
+                    _solo_sockets.pop(conversation_id, None)
 
 
 # ============================ Group challenges ============================
@@ -1608,10 +2109,13 @@ async def _save_group_turn(
     eval_data: dict | None,
     turn_num: int,
     attachments=None,
-):
+) -> str | None:
     """Persist one group turn: the user message (attributed to its sender), the
-    assistant reply, attachments, and — when scoring succeeded — the shared
-    EvalResult rolled into the GroupSession's best/started state."""
+    assistant reply, attachments, and the shared EvalResult rolled into the
+    GroupSession's best/started state. A failed evaluation is saved with NULL
+    scores as "pending". Returns the EvalResult id, or None."""
+    eval_id = None
+    score_pending = bool((eval_data or {}).get("eval_failed"))
     try:
         async with AsyncSessionLocal() as db:
             user_message = Message(
@@ -1646,7 +2150,7 @@ async def _save_group_turn(
                 # export unit). The sender is the natural owner of their own prompt.
                 sender = await db.get(User, sender_user_id)
                 consent_now = bool(sender.consent_research) if sender else False
-                db.add(EvalResult(
+                eval_row = EvalResult(
                     conversation_id=conversation_id,
                     turn_number=turn_num,
                     pei=scores.get("PEI"),
@@ -1660,7 +2164,11 @@ async def _save_group_turn(
                     leading_status=eval_data.get("leading_status"),
                     full_result=eval_data,
                     consent_research=consent_now,
-                ))
+                    score_status="pending" if score_pending else None,
+                )
+                db.add(eval_row)
+                await db.flush()
+                eval_id = eval_row.id
 
             await db.execute(
                 update(Conversation).where(Conversation.id == conversation_id).values(turn_count=turn_num)
@@ -1676,7 +2184,8 @@ async def _save_group_turn(
                     if gs.started_at is None:
                         gs.started_at = datetime.utcnow()
                     new_pei = scores.get("PEI")
-                    if new_pei is not None:
+                    # Frozen after the team's session ended (see _save_turn).
+                    if new_pei is not None and gs.status != "completed":
                         try:
                             pei_val = float(new_pei)
                         except (TypeError, ValueError):
@@ -1686,11 +2195,13 @@ async def _save_group_turn(
             await db.commit()
     except Exception as e:
         log.error(f"DB save failed for group turn {turn_num}: {e}")
-        return
+        return None
 
     await _log_coach_turn(
-        conversation_id, user_message.id, turn_num, scores, sender_user_id=sender_user_id
+        conversation_id, user_message.id, turn_num, scores, sender_user_id=sender_user_id,
+        score_pending=score_pending,
     )
+    return eval_id
 
 
 @app.websocket("/ws/group")
@@ -1789,6 +2300,11 @@ async def group_websocket_endpoint(
     if team_chat:
         await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
 
+    # Joining a finished session is read-only: history, no new turns.
+    group_ended = await _group_session_completed(group_session_id)
+    if group_ended:
+        await websocket.send_text(json.dumps({"type": "session_ended"}))
+
     # Tell everyone (including this client) who is now present.
     await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
     await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
@@ -1830,6 +2346,11 @@ async def group_websocket_endpoint(
                 continue
 
             if mtype != "message":
+                continue
+
+            if group_ended or await _group_session_completed(group_session_id):
+                group_ended = True
+                await websocket.send_text(json.dumps({"type": "session_ended"}))
                 continue
 
             # Strict group-only: a coach turn needs at least team_min distinct
@@ -1922,14 +2443,20 @@ async def group_websocket_endpoint(
                     eval_result = await evaluate_conversation(room.history)
                 except Exception as e:
                     log.error(f"[WS-GROUP] eval error: {type(e).__name__}: {e}", exc_info=True)
-                # Persist messages regardless; include the eval when it succeeded.
-                await _save_group_turn(
+                eval_failed = _is_failed_eval(eval_result)
+                if eval_failed:
+                    eval_result = _failed_eval(None)
+                # Persist messages regardless; a failed eval is saved as pending.
+                eval_id = await _save_group_turn(
                     conversation_id, user_id, user_content, full_response, eval_result, turn, attachments
                 )
-                if eval_result is not None:
-                    await room.broadcast({"type": "eval", "data": eval_result})
+                if eval_failed:
+                    if eval_id:
+                        _schedule_rescore(eval_id)
+                    await room.broadcast({"type": "eval_pending", "turn": turn,
+                                          "message": SCORE_PENDING_MESSAGE})
                 else:
-                    await room.broadcast({"type": "eval_error", "message": "evaluation failed"})
+                    await room.broadcast({"type": "eval", "data": eval_result})
             finally:
                 room.turn_lock.release()
 
@@ -2200,6 +2727,36 @@ async def coach_websocket_endpoint(
     if team_chat:
         await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
 
+    # A finished session opens read-only: the artifact and history are shown,
+    # nothing new is accepted. Cached once seen, because completion is final.
+    ended = {"v": await _group_session_completed(group_session_id)}
+    if ended["v"]:
+        await websocket.send_text(json.dumps({"type": "session_ended"}))
+
+    async def _is_ended() -> bool:
+        if not ended["v"]:
+            ended["v"] = await _group_session_completed(group_session_id)
+        return ended["v"]
+
+    async def _closing_dwell(data: dict) -> bool:
+        """The one read still recorded after the end: a dwell the client
+        flushed BECAUSE the session ended, arriving within the grace window.
+        It measures reading done during the session — a section a teammate
+        still had open when someone else pressed End — which would otherwise
+        be lost exactly at the end of every session (#17). New reads after
+        the end are still not recorded (#6)."""
+        if data.get("type") not in ("artifact_dwell", "contested_option_dwell"):
+            return False
+        if data.get("flush") != "session_end":
+            return False
+        try:
+            async with AsyncSessionLocal() as db:
+                gs = await db.get(GroupSession, group_session_id)
+                done = gs.completed_at if gs else None
+        except Exception:
+            return False
+        return done is not None and datetime.utcnow() - done <= timedelta(seconds=_END_DWELL_GRACE_SECONDS)
+
     await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
     await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
 
@@ -2214,22 +2771,24 @@ async def coach_websocket_endpoint(
         except Exception:
             return None
 
-    async def _ack_read(data: dict):
+    async def _ack_read(data: dict, result):
         """Tell the client this read is safely recorded, so it can stop holding it.
 
-        Sent for a *handled* read whether or not the row was new: a duplicate
-        arriving from an at-least-once flush was already recorded once, which is
-        exactly what the client needs to hear. Without an ack the client can
-        only guess, and a send into a socket that is OPEN but already dead —
-        the normal shape of a dropped connection, since readyState lags reality
-        by seconds — looks identical to a delivered one. Then the buffer is the
-        only copy, and the one signal the study cannot reconstruct is gone.
+        Sent only when the row is in the log: newly saved, or a duplicate from
+        an at-least-once flush that an earlier delivery already recorded, which
+        is exactly what the client needs to hear. A read whose write FAILED is
+        not acked, so the client keeps it buffered and replays it on the next
+        connect. Acking a failure used to make the client delete the only copy
+        of a read the database never got.
 
         A read with no event_id is a client that predates the buffer; nothing to
         ack and nothing is waiting for one.
         """
         event_id = data.get("event_id")
         if not event_id:
+            return
+        if result is not None and not result.recorded:
+            log.error(f"[WS-COACH] read {data.get('type')} not recorded; not acking {event_id}")
             return
         try:
             await websocket.send_text(json.dumps({"type": "read_ack", "event_id": event_id}))
@@ -2245,41 +2804,61 @@ async def coach_websocket_endpoint(
             mtype = data.get("type")
 
             # ---- Reads. Each is a measurement, fired by a real human action. ----
+            # After the session ends, reads are NOT recorded: the measurement
+            # window is the session. They are still acked (result=None), or the
+            # client would hold and replay them on every reconnect forever.
+            if mtype in ("artifact_open", "artifact_expand", "artifact_dwell", "artifact_close",
+                         "contested_option_expand", "contested_option_dwell") \
+                    and await _is_ended() and not await _closing_dwell(data):
+                await _ack_read(data, None)
+                continue
+
+            # A contested option opened (or closed, with its dwell). The only
+            # evidence of inspection the contested outcome uses (#16).
+            if mtype in ("contested_option_expand", "contested_option_dwell"):
+                from contested import log_option_read
+                res = await log_option_read(group_session_id, user_id, data)
+                # None: a frame that can never be recorded (not this student's
+                # pair). Acked so the client stops replaying it.
+                await _ack_read(data, res)
+                continue
+
             if mtype == "artifact_open":
-                await artifacts.log_open(
+                res = await artifacts.log_open(
                     group_session_id, user_id,
                     idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                 )
-                await _ack_read(data)
+                await _ack_read(data, res)
                 continue
 
             if mtype == "artifact_expand":
                 key = data.get("section_key")
                 if key:
-                    await artifacts.log_section_expand(
+                    res = await artifacts.log_section_expand(
                         group_session_id, user_id, key,
                         idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                     )
-                    await _ack_read(data)
+                    await _ack_read(data, res)
                 continue
 
             if mtype == "artifact_dwell":
                 key = data.get("section_key")
                 ms = data.get("duration_ms")
                 if key and isinstance(ms, int) and ms > 0:
-                    await artifacts.log_dwell(
+                    res = await artifacts.log_dwell(
                         group_session_id, user_id, key, ms,
                         idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
+                        flush=data.get("flush"),
                     )
-                    await _ack_read(data)
+                    await _ack_read(data, res)
                 continue
 
             if mtype == "artifact_close":
-                await artifacts.log_close(
+                res = await artifacts.log_close(
                     group_session_id, user_id,
                     idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
                 )
-                await _ack_read(data)
+                await _ack_read(data, res)
                 continue
 
             # ---- Writes ----
@@ -2293,6 +2872,13 @@ async def coach_websocket_endpoint(
                         "message": "artifact_write needs section_key, content and expected_version",
                     }))
                     continue
+                if await _is_ended():
+                    await websocket.send_text(json.dumps({
+                        "type": "artifact_error",
+                        "section_key": key,
+                        "message": "This session has ended, so the document can no longer be changed.",
+                    }))
+                    continue
                 result = await artifacts.write_section(
                     group_session_id=group_session_id,
                     section_key=key,
@@ -2300,6 +2886,7 @@ async def coach_websocket_endpoint(
                     author_user_id=user_id,
                     expected_version=expected,
                     origin=data.get("origin") or "student_typed",
+                    origin_tracking=data.get("origin_tracking"),
                 )
                 if not result.get("ok"):
                     # A conflict is not an error the student caused; it carries the
@@ -2398,6 +2985,10 @@ async def coach_websocket_endpoint(
                 continue
 
             # ---- A private coach turn ----
+            if await _is_ended():
+                await websocket.send_text(json.dumps({"type": "session_ended"}))
+                continue
+
             # No team_min gate and no shared turn lock: this student's coach is
             # theirs alone, and teammates' coaches run concurrently by design.
             # The claim covers every worker when a fan-out is configured, so a
@@ -2428,6 +3019,9 @@ async def coach_websocket_endpoint(
                 await websocket.send_text(json.dumps({"type": "busy"}))
                 continue
             try:
+                # Reloaded when another tab or worker saved a turn to this
+                # coach conversation since this worker last looked (A4).
+                state["history"] = await _fresh_history(conversation_id, state["history"])
                 history = state["history"]
                 turn = len(history) // 2 + 1
                 if attachments:
@@ -2489,17 +3083,21 @@ async def coach_websocket_endpoint(
                     )
                 except Exception as e:
                     log.error(f"[WS-COACH] eval error: {type(e).__name__}: {e}", exc_info=True)
-                await _save_turn(
-                    conversation_id, user_content, full_response, eval_result or {}, turn,
+                eval_failed = _is_failed_eval(eval_result)
+                if eval_failed:
+                    eval_result = _failed_eval(corpus_store_id)
+                eval_id = await _save_turn(
+                    conversation_id, user_content, full_response, eval_result, turn,
                     attachments, condition=condition,
                 )
                 await _mark_group_session_started(group_session_id)
-                if eval_result is not None:
-                    await room.send_to_user(user_id, {"type": "eval", "data": eval_result})
+                if eval_failed:
+                    if eval_id:
+                        _schedule_rescore(eval_id)
+                    await room.send_to_user(user_id, {"type": "eval_pending", "turn": turn,
+                                                      "message": SCORE_PENDING_MESSAGE})
                 else:
-                    await room.send_to_user(
-                        user_id, {"type": "eval_error", "message": "evaluation failed"}
-                    )
+                    await room.send_to_user(user_id, {"type": "eval", "data": eval_result})
             finally:
                 await room.release_user_turn(user_id, turn_token)
 
@@ -2517,80 +3115,107 @@ async def coach_websocket_endpoint(
         log.info(f"[WS-COACH] {user_id[:8]} left group={group_id[:8]}")
 
 
+# At most this many post-session analyses call the model at once. A class
+# ending together (the timer, or an instructor saying "wrap up") used to start
+# one LLM call per student simultaneously, each holding a pooled DB connection
+# for its whole duration, which could exhaust the pool for everyone else.
+_ANALYSIS_CONCURRENCY = 3
+_analysis_slots_by_loop: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _analysis_slots() -> asyncio.Semaphore:
+    """The cap, per event loop (a Semaphore belongs to the loop it first waits
+    on, and tests run many loops in one process)."""
+    loop = asyncio.get_running_loop()
+    sem = _analysis_slots_by_loop.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_ANALYSIS_CONCURRENCY)
+        _analysis_slots_by_loop[loop] = sem
+    return sem
+
+
+def _per_turn_rows(evals) -> list[dict]:
+    per_turn = []
+    for i, e in enumerate(evals, start=1):
+        fr = e.full_result or {}
+        per_turn.append({
+            "turn": i,
+            "pei": e.pei,
+            "scores": {"PSQ": e.psq, "CCM": e.ccm, "TSI": e.tsi, "CLM": e.clm, "RAS": e.ras},
+            "classification": e.classification,
+            "turn_summary": fr.get("turn_summary") or "",
+            # The concrete per-turn feedback the evaluator already produced.
+            # The session analyst consolidates these into session takeaways
+            # instead of inventing generic advice from scratch.
+            "suggestions": fr.get("suggestions") or [],
+            "red_flags": fr.get("red_flags") or [],
+        })
+    return per_turn
+
+
+async def _load_analysis_inputs(db, conversation_id: str, challenge_id: str | None):
+    msgs = (await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at, Message.id)
+    )).scalars().all()
+    transcript = [{"role": m.role, "content": m.content} for m in msgs]
+    # Order positionally by creation time (turn_number is unreliable across
+    # resumed sessions); enumerate to give each turn a stable display index.
+    evals = (await db.execute(
+        select(EvalResult)
+        .where(EvalResult.conversation_id == conversation_id)
+        .order_by(EvalResult.created_at, EvalResult.id)
+    )).scalars().all()
+    challenge_ctx = None
+    ch = await db.get(Challenge, challenge_id) if challenge_id else None
+    if ch is not None:
+        challenge_ctx = {"title": ch.title, "objective": ch.description}
+    return transcript, _per_turn_rows(evals), challenge_ctx
+
+
 async def _generate_session_analysis(conversation_id: str, user_id: str):
     """
     Background task: build the post-session analysis for a completed session and
-    store it on UserChallengeSession.session_analysis. Opens its own DB session
-    (the request's session is already closed by the time this runs). Idempotent:
-    skips if a "ready" analysis already exists; records {"status": "failed"} so
-    the UI can stop polling and the next /end call can retry.
+    store it on UserChallengeSession.session_analysis. Idempotent: skips if a
+    "ready" analysis already exists; records {"status": "failed"} so the UI can
+    stop polling and the next /end call can retry.
+
+    Three steps, and the DB connection is only held for the first and last:
+    read the inputs, call the model (capped by _analysis_slots), write the
+    result. Holding one session across the whole thing kept a pooled
+    connection checked out for the entire LLM call.
     """
+
+    def _ucs_query():
+        return select(UserChallengeSession).where(
+            UserChallengeSession.conversation_id == conversation_id,
+            UserChallengeSession.user_id == user_id,
+        )
+
     try:
         async with AsyncSessionLocal() as db:
-            ucs_q = await db.execute(
-                select(UserChallengeSession).where(
-                    UserChallengeSession.conversation_id == conversation_id,
-                    UserChallengeSession.user_id == user_id,
-                )
-            )
-            ucs = ucs_q.scalar_one_or_none()
-            if ucs is None:
+            ucs = (await db.execute(_ucs_query())).scalar_one_or_none()
+            if ucs is None or (ucs.session_analysis or {}).get("status") == "ready":
                 return
-            if (ucs.session_analysis or {}).get("status") == "ready":
-                return
+            transcript, per_turn, challenge_ctx = await _load_analysis_inputs(
+                db, conversation_id, ucs.challenge_id)
 
-            msgs = (await db.execute(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.created_at, Message.id)
-            )).scalars().all()
-            transcript = [{"role": m.role, "content": m.content} for m in msgs]
-
-            # Order positionally by creation time (turn_number is unreliable across
-            # resumed sessions); enumerate to give each turn a stable display index.
-            evals = (await db.execute(
-                select(EvalResult)
-                .where(EvalResult.conversation_id == conversation_id)
-                .order_by(EvalResult.created_at, EvalResult.id)
-            )).scalars().all()
-            per_turn = []
-            for i, e in enumerate(evals, start=1):
-                fr = e.full_result or {}
-                per_turn.append({
-                    "turn": i,
-                    "pei": e.pei,
-                    "scores": {"PSQ": e.psq, "CCM": e.ccm, "TSI": e.tsi, "CLM": e.clm, "RAS": e.ras},
-                    "classification": e.classification,
-                    "turn_summary": fr.get("turn_summary") or "",
-                    # The concrete per-turn feedback the evaluator already produced.
-                    # The session analyst consolidates these into session takeaways
-                    # instead of inventing generic advice from scratch.
-                    "suggestions": fr.get("suggestions") or [],
-                    "red_flags": fr.get("red_flags") or [],
-                })
-
-            challenge_ctx = None
-            ch = await db.get(Challenge, ucs.challenge_id)
-            if ch is not None:
-                challenge_ctx = {"title": ch.title, "objective": ch.description}
-
+        async with _analysis_slots():
             analysis = await analyze_session(transcript, per_turn, challenge_ctx)
 
-            # Re-fetch inside this session to attach the result to a live row.
+        async with AsyncSessionLocal() as db:
+            ucs = (await db.execute(_ucs_query())).scalar_one_or_none()
+            if ucs is None or (ucs.session_analysis or {}).get("status") == "ready":
+                return      # a concurrent run finished first; keep that one
             ucs.session_analysis = analysis
             await db.commit()
-            log.info(f"[SESSION-ANALYSIS] stored for conversation {conversation_id[:8]}...")
+        log.info(f"[SESSION-ANALYSIS] stored for conversation {conversation_id[:8]}...")
     except Exception as e:
         log.error(f"[SESSION-ANALYSIS] failed for {conversation_id[:8]}...: {type(e).__name__}: {e}", exc_info=True)
         try:
             async with AsyncSessionLocal() as db2:
-                ucs_q = await db2.execute(
-                    select(UserChallengeSession).where(
-                        UserChallengeSession.conversation_id == conversation_id,
-                        UserChallengeSession.user_id == user_id,
-                    )
-                )
-                ucs = ucs_q.scalar_one_or_none()
+                ucs = (await db2.execute(_ucs_query())).scalar_one_or_none()
                 if ucs is not None and (ucs.session_analysis or {}).get("status") != "ready":
                     ucs.session_analysis = {"status": "failed"}
                     await db2.commit()
@@ -2617,36 +3242,20 @@ async def end_conversation(
     )
     ucs = ucs_result.scalar_one_or_none()
 
-    # Did the timer already lapse? Decided server-side so the recorded end_reason
-    # can't be spoofed by the client, and reused by the min-turns gate below.
-    past_deadline = bool(
-        ucs
-        and ucs.time_limit_minutes
-        and ucs.started_at
-        and datetime.utcnow() >= ucs.started_at + timedelta(minutes=ucs.time_limit_minutes)
-    )
-
-    # Min-turns gate: block an early manual end until the minimum turns are met,
-    # unless the timer has already expired (the timer is a hard cap that wins).
-    if ucs and ucs.min_turns:
-        turns_done = conv.turn_count or 0
-        if turns_done < ucs.min_turns and not past_deadline:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Send at least {ucs.min_turns} turns before ending (you have {turns_done}).",
-            )
-
-    # Consequential revision: the same gate the challenge page's complete button
-    # hits, so ending from inside the chat is not a way round it. The timer is a
-    # hard cap and wins, as it does for min turns — but a session that ran out
-    # with the revision still owed is recorded as such, not silently completed.
+    # Minimum scored turns, the timer and the consequential revision: the same
+    # check the challenge page's "Mark as complete" uses (challenges.finish_check),
+    # so neither way of finishing is a way round the other. Decided server-side,
+    # so the recorded end_reason cannot be spoofed by the client. The timer is a
+    # hard cap and wins — but a session that ran out with the revision still
+    # owed is recorded as such, not silently completed.
+    past_deadline = False
     missed_revision_turn = None
-    if ucs and ucs.status != "completed" and ucs.challenge_id:
-        from challenges import REVISION_OWED_DETAIL, revision_owed
-        owed = await revision_owed(db, user_id, ucs.challenge_id, ucs)
-        if owed is not None and not past_deadline:
-            raise HTTPException(status_code=409, detail=REVISION_OWED_DETAIL)
-        missed_revision_turn = owed
+    if ucs:
+        from challenges import finish_check, raise_if_blocked
+        check = await finish_check(db, user_id, ucs.challenge_id, ucs)
+        raise_if_blocked(check)
+        past_deadline = check.past_deadline
+        missed_revision_turn = check.revision_owed_turn
 
     result = await db.execute(
         select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
@@ -2696,8 +3305,8 @@ async def end_conversation(
 
 async def _generate_group_session_analysis(group_session_id: str):
     """Background: post-session analysis for a completed GROUP session, stored on
-    GroupSession.session_analysis. Mirrors _generate_session_analysis but keyed on
-    the group session (one shared analysis for the whole team)."""
+    GroupSession.session_analysis. Mirrors _generate_session_analysis (same
+    read / capped model call / write shape) but keyed on the group session."""
     try:
         async with AsyncSessionLocal() as db:
             gs = await db.get(GroupSession, group_session_id)
@@ -2705,42 +3314,19 @@ async def _generate_group_session_analysis(group_session_id: str):
                 return
             if (gs.session_analysis or {}).get("status") == "ready":
                 return
-            conversation_id = gs.conversation_id
+            transcript, per_turn, challenge_ctx = await _load_analysis_inputs(
+                db, gs.conversation_id, gs.challenge_id)
 
-            msgs = (await db.execute(
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.created_at, Message.id)
-            )).scalars().all()
-            transcript = [{"role": m.role, "content": m.content} for m in msgs]
-
-            evals = (await db.execute(
-                select(EvalResult)
-                .where(EvalResult.conversation_id == conversation_id)
-                .order_by(EvalResult.created_at, EvalResult.id)
-            )).scalars().all()
-            per_turn = []
-            for i, e in enumerate(evals, start=1):
-                fr = e.full_result or {}
-                per_turn.append({
-                    "turn": i,
-                    "pei": e.pei,
-                    "scores": {"PSQ": e.psq, "CCM": e.ccm, "TSI": e.tsi, "CLM": e.clm, "RAS": e.ras},
-                    "classification": e.classification,
-                    "turn_summary": fr.get("turn_summary") or "",
-                    "suggestions": fr.get("suggestions") or [],
-                    "red_flags": fr.get("red_flags") or [],
-                })
-
-            challenge_ctx = None
-            ch = await db.get(Challenge, gs.challenge_id)
-            if ch is not None:
-                challenge_ctx = {"title": ch.title, "objective": ch.description}
-
+        async with _analysis_slots():
             analysis = await analyze_session(transcript, per_turn, challenge_ctx)
+
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            if gs is None or (gs.session_analysis or {}).get("status") == "ready":
+                return
             gs.session_analysis = analysis
             await db.commit()
-            log.info(f"[GROUP-ANALYSIS] stored for group_session {group_session_id[:8]}...")
+        log.info(f"[GROUP-ANALYSIS] stored for group_session {group_session_id[:8]}...")
     except Exception as e:
         log.error(f"[GROUP-ANALYSIS] failed for {group_session_id[:8]}...: {type(e).__name__}: {e}", exc_info=True)
         try:
@@ -2757,6 +3343,15 @@ def _spawn_group_analysis(group_session_id: str):
     task = asyncio.create_task(_generate_group_session_analysis(group_session_id))
     _analysis_tasks.add(task)
     task.add_done_callback(_analysis_tasks.discard)
+
+
+async def _notify_session_ended(group_session_id: str) -> None:
+    try:
+        await rooms.notify(group_session_id, {"type": "session_ended"})
+    except Exception as e:
+        # The session IS ended (committed above); a tab that missed this is
+        # still refused on its next turn or write (#6) and told then.
+        log.error(f"could not announce session end for {group_session_id}: {e}")
 
 
 async def _group_session_or_403(db, group_id: str, session_num: int, user_id: str):
@@ -2901,9 +3496,10 @@ async def _end_coach_session(db, gs, private_conversations: list) -> dict:
         gs.end_reason = "manual"
     await db.commit()
 
-    room = rooms.peek(gs.id)
-    if room is not None:
-        await room.broadcast({"type": "session_ended"})
+    # notify, not peek+broadcast: under Redis the team's sockets may be on
+    # other workers, and a worker that holds no room for this session would
+    # otherwise tell nobody. Every teammate's tab must lock, wherever it is.
+    await _notify_session_ended(gs.id)
 
     return {
         "arm": "collab_coach_artifact",
@@ -2972,10 +3568,8 @@ async def end_group_session(
     if schedule_analysis:
         _spawn_group_analysis(gs.id)
 
-    # Lock the live room for every connected member.
-    room = rooms.peek(gs.id)
-    if room is not None:
-        await room.broadcast({"type": "session_ended"})
+    # Lock the live room for every connected member, on every worker.
+    await _notify_session_ended(gs.id)
 
     return {
         "session_avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,

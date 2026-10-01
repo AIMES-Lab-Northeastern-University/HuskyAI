@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, readApiError } from '../lib/api'
 
 /* Reference corpus manager (Phase 2).
  *
@@ -17,6 +17,7 @@ import { API_URL, authHeaders } from '../lib/api'
 const STATUS_STYLE = {
   ready:    { bg: '#DCFCE7', fg: '#16A34A', label: 'Indexed' },
   pending:  { bg: '#FEF3E8', fg: '#D97706', label: 'Indexing…' },
+  indexing: { bg: '#FEF3E8', fg: '#D97706', label: 'Indexing…' },
   building: { bg: '#FEF3E8', fg: '#D97706', label: 'Indexing…' },
   failed:   { bg: '#FDE8EC', fg: '#C8102E', label: 'Failed' },
 }
@@ -31,7 +32,11 @@ function StatusChip({ status }) {
   )
 }
 
-export default function CorpusManager({ classroomChallengeId, corpusId: initialCorpusId }) {
+/* `onChange(corpusId | null)` tells the parent which corpus the assignment now
+ * points at. Without it the parent keeps the id it loaded with, so closing and
+ * reopening the panel after creating a corpus offered to create another one,
+ * and after detaching one it loaded the detached corpus straight back. */
+export default function CorpusManager({ classroomChallengeId, corpusId: initialCorpusId, onChange }) {
   const [corpus, setCorpus] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
@@ -57,7 +62,7 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
     // status alone would hit the API every 2.5s forever and re-render the panel
     // for no reason. Only poll while a document is actually settling.
     const settling = docs.length > 0 &&
-      (corpus.status === 'building' || docs.some(d => d.status === 'pending'))
+      (corpus.status === 'building' || docs.some(d => d.status === 'pending' || d.status === 'indexing'))
     if (!settling) return
     pollRef.current = setInterval(() => load(corpus.id), 2500)
     return () => clearInterval(pollRef.current)
@@ -69,8 +74,11 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
       const r = await fetch(`${API_URL}/corpus/assignments/${classroomChallengeId}`, {
         method: 'POST', headers: authHeaders(),
       })
-      if (r.ok) setCorpus(await r.json())
-      else setError((await r.json()).detail || 'Could not create corpus')
+      if (r.ok) {
+        const created = await r.json()
+        setCorpus(created)
+        onChange?.(created.id)
+      } else setError(await readApiError(r, 'Could not create corpus'))
     } catch (e) { setError(String(e)) } finally { setBusy(false) }
   }
 
@@ -84,7 +92,7 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
         const r = await fetch(`${API_URL}/corpus/${corpus.id}/documents`, {
           method: 'POST', headers: authHeaders(), body: fd,
         })
-        if (!r.ok) setError((await r.json()).detail || `Could not upload ${file.name}`)
+        if (!r.ok) setError(await readApiError(r, `Could not upload ${file.name}`))
       } catch (e) { setError(String(e)) }
     }
     await load(corpus.id)
@@ -93,15 +101,26 @@ export default function CorpusManager({ classroomChallengeId, corpusId: initialC
   }
 
   const removeDoc = async (docId) => {
-    await fetch(`${API_URL}/corpus/${corpus.id}/documents/${docId}`,
-      { method: 'DELETE', headers: authHeaders() })
+    setError(null)
+    try {
+      const r = await fetch(`${API_URL}/corpus/${corpus.id}/documents/${docId}`,
+        { method: 'DELETE', headers: authHeaders() })
+      // The server keeps the document when it cannot remove it from the search
+      // index, so a failure here means it is still being scored against.
+      if (!r.ok) setError(await readApiError(r, 'Could not remove the document'))
+    } catch (e) { setError(String(e)) }
     load(corpus.id)
   }
 
   const detach = async () => {
     if (!window.confirm('Stop scoring against this corpus? The files are kept, and past scores stay valid.')) return
-    await fetch(`${API_URL}/corpus/${corpus.id}`, { method: 'DELETE', headers: authHeaders() })
+    setError(null)
+    try {
+      const r = await fetch(`${API_URL}/corpus/${corpus.id}`, { method: 'DELETE', headers: authHeaders() })
+      if (!r.ok) { setError(await readApiError(r, 'Could not detach the corpus')); return }
+    } catch (e) { setError(String(e)); return }
     setCorpus(null)
+    onChange?.(null)
   }
 
   const docs = corpus?.documents || []

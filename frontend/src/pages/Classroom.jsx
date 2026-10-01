@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, clearSession } from '../lib/api'
 
 function DualBar({ label, yourPct, partnerPct, yourColor, partnerColor }) {
   return (
@@ -210,8 +210,7 @@ export default function Classroom() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 

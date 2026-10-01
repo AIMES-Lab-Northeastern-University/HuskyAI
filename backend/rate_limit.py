@@ -42,6 +42,15 @@ class SlidingWindowLimiter:
         bucket.append(now)
         return True
 
+    def count(self, key: str) -> int:
+        """How many events are inside the window now, without adding one."""
+        now = monotonic()
+        bucket = self._buckets.get(key)
+        if not bucket:
+            return 0
+        bucket[:] = [t for t in bucket if now - t < self.window_sec]
+        return len(bucket)
+
     def clear(self) -> None:
         self._buckets.clear()
 
@@ -92,6 +101,13 @@ class _RedisSlidingWindow:
             args=[time.time(), self.window_sec, max_events, uuid.uuid4().hex],
         )
         return bool(int(allowed))
+
+    async def count(self, key: str) -> int:
+        """Events inside the window now, without adding one. Not atomic with a
+        later hit, which is fine for a read-only check."""
+        k = f"huskyai:rl:{self._ns}:{key}"
+        await self._redis.zremrangebyscore(k, "-inf", time.time() - self.window_sec)
+        return int(await self._redis.zcard(k))
 
     async def clear(self) -> None:
         """Test helper: drop every key in this namespace."""
@@ -150,11 +166,43 @@ async def _allowed(namespace: str, local: SlidingWindowLimiter, key: str, max_ev
     return local.hit(key, max_events)
 
 
+def _trusted_hops() -> int:
+    try:
+        return max(1, int(os.getenv("TRUSTED_PROXY_HOPS", "1")))
+    except ValueError:
+        return 1
+
+
 def _client_ip(request: Request) -> str:
-    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    if forwarded:
-        return forwarded
+    """The address the request really came from, as far as we can trust.
+
+    X-Forwarded-For is a list each proxy APPENDS to, so only its right-hand
+    end is written by infrastructure we control; anything to the left came
+    from the client and can be anything. This used to take the LEFTMOST entry,
+    so a client could send a fresh made-up address on every request and get a
+    fresh rate-limit budget each time. Now it takes the entry TRUSTED_PROXY_HOPS
+    from the right (1 = the address our edge proxy saw), or, if CLIENT_IP_HEADER
+    names a header the platform sets itself (e.g. x-real-ip), that header.
+
+    NOTE: which of these Railway sets, and how many hops it adds, has not been
+    verified against the live deployment; the defaults assume one proxy that
+    appends to X-Forwarded-For.
+    """
+    header = os.getenv("CLIENT_IP_HEADER", "").strip().lower()
+    if header:
+        v = (request.headers.get(header) or "").strip()
+        if v:
+            return v
+    hops = [h.strip() for h in (request.headers.get("x-forwarded-for") or "").split(",") if h.strip()]
+    if hops:
+        return hops[-min(_trusted_hops(), len(hops))]
     return request.client.host if request.client else "unknown"
+
+
+def _account_tag(email: str) -> str:
+    """A stable, non-reversible label for an account in logs (no raw emails)."""
+    import hashlib
+    return hashlib.sha256(email.strip().lower().encode()).hexdigest()[:10]
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +240,77 @@ async def check_auth_rate_limit(request: Request) -> None:
     mx = _effective_auth_max()
     if mx <= 0:
         return
-    if not await _allowed("auth", _auth_limiter, _client_ip(request), mx):
+    ip = _client_ip(request)
+    if not await _allowed("auth", _auth_limiter, ip, mx):
+        log.warning("rate limited: auth request from %s (%s)", ip, request.url.path)
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Try again later.",
         )
+
+
+# Failed sign-ins per ACCOUNT, independent of IP. The per-IP budget cannot stop
+# a guesser spread over many addresses, and on a campus network it cannot be
+# tight either (a whole section shares one egress IP). So: a short pause, not a
+# lockout. After a handful of wrong passwords for one email within a minute,
+# that email is paused until the window slides; nobody is locked out for long,
+# and the right password during the pause is refused too, so the pause cannot
+# be used to confirm a guess. Counted for any email string, existing or not, so
+# the response never reveals whether an account exists.
+_login_fail_limiter = SlidingWindowLimiter(60.0)
+LOGIN_PAUSED_DETAIL = "Too many sign-in attempts for this account. Wait a minute, then try again."
+
+
+def _login_fail_max() -> int:
+    if _testing():
+        return int(os.getenv("LOGIN_FAIL_TEST_MAX", "1000000"))
+    return int(os.getenv("LOGIN_FAIL_MAX_PER_MINUTE", "5"))
+
+
+def _login_key(email: str) -> str:
+    # Hashed: the key lives in Redis, which is a cache, not a place for emails.
+    return f"email:{_account_tag(email or '')}"
+
+
+async def check_login_paused(request: Request, email: str) -> None:
+    mx = _login_fail_max()
+    if mx <= 0:
+        return
+    key = _login_key(email)
+    shared = _shared_window("login_fail", _login_fail_limiter.window_sec)
+    count = None
+    if shared is not None:
+        try:
+            count = await shared.count(key)
+        except Exception as e:
+            log.error("Rate limit: Redis unavailable for login pause check (%s)", e)
+    if count is None:
+        count = _login_fail_limiter.count(key)
+    if count >= mx:
+        log.warning("login paused for account %s (%d failures in %ss) from %s",
+                    _account_tag(email), count, int(_login_fail_limiter.window_sec),
+                    _client_ip(request))
+        raise HTTPException(status_code=429, detail=LOGIN_PAUSED_DETAIL,
+                            headers={"Retry-After": str(int(_login_fail_limiter.window_sec))})
+
+
+async def record_login_failure(request: Request, email: str) -> None:
+    mx = _login_fail_max()
+    if mx <= 0:
+        return
+    await _allowed("login_fail", _login_fail_limiter, _login_key(email), mx)
+    log.info("failed sign-in for account %s from %s", _account_tag(email), _client_ip(request))
+
+
+async def clear_login_fail_buckets() -> None:
+    """Test helper. See clear_auth_rate_buckets for why this builds the window."""
+    _login_fail_limiter.clear()
+    shared = _shared_window("login_fail", _login_fail_limiter.window_sec)
+    if shared is not None:
+        try:
+            await shared.clear()
+        except Exception as e:
+            log.warning("could not clear shared login-fail buckets: %s", e)
 
 
 # Password reset is far more sensitive than login: each request can send mail to a
@@ -260,6 +374,7 @@ async def check_reset_rate_limit(request: Request, email: str | None = None, *, 
         if mx <= 0:
             continue
         if not await _allowed("reset", _reset_limiter, key, mx):
+            log.warning("rate limited: password reset (%s) from %s", scope, ip)
             raise HTTPException(
                 status_code=429,
                 detail="Too many reset requests. Try again later.",

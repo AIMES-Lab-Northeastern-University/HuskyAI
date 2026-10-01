@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom'
-import { API_URL, formatApiErrorDetail } from '../lib/api'
+import { API_URL, formatApiErrorDetail, safeNextPath } from '../lib/api'
 
 const ROLES = [
   {
@@ -112,7 +112,8 @@ export default function AuthPage() {
         }
         navigate('/instructor')
       } else {
-        navigate('/dashboard')
+        // Back to wherever an expired session interrupted them, if anywhere.
+        navigate(safeNextPath(searchParams.get('next')) || '/dashboard')
       }
     } catch (err) {
       setError(err.message)

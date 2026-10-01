@@ -25,7 +25,7 @@ from statistics import median
 
 # Bumped whenever any definition in this module changes. Echoed in the API
 # response and recorded alongside exported metrics.
-METRICS_VERSION = "1.1.0"
+METRICS_VERSION = "1.2.0"
 
 # Reads performed by a person. Deliberately excludes read_by_coach: whether a
 # coach-mediated read counts as the student having read their teammate's work is
@@ -35,6 +35,9 @@ HUMAN_READ_ACTIONS = {"open", "section_expand", "dwell"}
 # The subset that names a specific section, and so can be attributed to a
 # teammate's contribution rather than to the artifact as a whole.
 SECTION_READ_ACTIONS = {"section_expand", "dwell"}
+# Write origins that mean the text came out of the student's coach: inserted
+# with "Copy to document", or pasted and matched to one of their coach replies.
+COACH_ORIGINS = {"coach_copied", "coach_pasted"}
 
 
 def _gini(values: list[float]) -> float | None:
@@ -151,7 +154,18 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
     # A write only counts in the denominator if a teammate-authored section
     # actually existed to be read at that point. Counting the unanswerable case
     # as a failure would make early turns look like students ignoring each other.
+    #
+    # 1.2.0: a read only qualifies if a TEAMMATE'S TEXT WAS IN THAT SECTION WHEN
+    # IT WAS READ. Before, any earlier expand of a section that was
+    # teammate-authored at write time counted — including expanding it while
+    # it was still empty, or while it held only the reader's own text, i.e.
+    # "reading" a teammate's work before it existed. Reading an earlier
+    # version of a teammate's text still counts: they saw the teammate's work,
+    # even if it has changed since.
     informed, eligible = 0, 0
+    # Readers who have, by this point in the log, expanded a section while it
+    # held a teammate's text.
+    saw_teammate_text: set[str] = set()
     # Tracked apart from `informed` for the coach-reliance ratio below: a write
     # whose text was lifted from the coach must not also count as adopting a
     # teammate's work, even when that student had read a teammate earlier in the
@@ -164,30 +178,31 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
     # only coach-copied write landed before anyone else had written would report
     # total coach reliance, when there was no teammate work available to adopt --
     # the same artefact the read_before_write denominator exists to avoid.
+    # Includes coach_pasted since 1.2.0 (see COACH_ORIGINS).
     coach_copied_eligible = 0
     section_author: dict[str, str] = {}
     for e in events:
         if e["target"] != "artifact":
             continue
         key = (e.get("payload") or {}).get("section_key")
+        if (e["action"] in SECTION_READ_ACTIONS and e["actor_kind"] == "student"
+                and e["actor_user_id"] and key is not None):
+            author = section_author.get(key)
+            if author is not None and author != e["actor_user_id"]:
+                saw_teammate_text.add(e["actor_user_id"])
+            continue
         if e["action"] == "write":
+            origin = (e.get("payload") or {}).get("origin")
             teammate_sections = {
                 k for k, a in section_author.items() if a != e["actor_user_id"]
             }
             if teammate_sections:
                 eligible += 1
-                if (e.get("payload") or {}).get("origin") == "coach_copied":
+                if origin in COACH_ORIGINS:
                     coach_copied_eligible += 1
-                read_a_teammate = any(
-                    r["seq"] < e["seq"]
-                    and r["actor_user_id"] == e["actor_user_id"]
-                    and r["action"] in SECTION_READ_ACTIONS
-                    and (r.get("payload") or {}).get("section_key") in teammate_sections
-                    for r in human_reads
-                )
-                if read_a_teammate:
+                if e["actor_user_id"] in saw_teammate_text:
                     informed += 1
-                    if (e.get("payload") or {}).get("origin") != "coach_copied":
+                    if origin not in COACH_ORIGINS:
                         informed_typed += 1
             if key:
                 section_author[key] = e["actor_user_id"]
@@ -199,9 +214,17 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
     # teammate's work was there to adopt, how often was the coach's taken
     # instead?". The unrestricted count is still reported for description.
     coach_copied = sum(1 for w in writes if (w.get("payload") or {}).get("origin") == "coach_copied")
+    coach_pasted = sum(1 for w in writes if (w.get("payload") or {}).get("origin") == "coach_pasted")
+    # Measured only if some write in the session came from a client that could
+    # detect coach-derived text (it stamps payload.origin_tracking). Every write
+    # made before detection existed was "student_typed" by default, so a ratio
+    # computed over them would report zero reliance for want of a signal.
+    # A coach-derived origin is itself proof the signal exists.
+    reliance_measured = bool(coach_copied or coach_pasted) or any(
+        (w.get("payload") or {}).get("origin_tracking") for w in writes)
     coach_reliance_ratio = (
         round(coach_copied_eligible / (coach_copied_eligible + informed_typed), 4)
-        if (coach_copied_eligible + informed_typed) > 0 else None
+        if reliance_measured and (coach_copied_eligible + informed_typed) > 0 else None
     )
 
     shares = [writes_by_user[u] for u in sorted(actors)]
@@ -233,10 +256,15 @@ def compute_turn_taking(events: list[dict], members: list[str] | None = None) ->
         },
         "coach_reliance": {
             "ratio": coach_reliance_ratio,
+            # False: no write in this session could have recorded coach-derived
+            # text, so the ratio is not measured (null), not zero.
+            "measured": reliance_measured,
             # Every coach-copied write in the session, eligible or not.
             "coach_copied_writes": coach_copied,
-            # The numerator of the ratio: coach-copied writes made when a
-            # teammate's section already existed to be adopted instead.
+            # Pasted by hand and matched to the writer's own coach reply.
+            "coach_pasted_writes": coach_pasted,
+            # The numerator of the ratio: coach-derived (copied or pasted) writes
+            # made when a teammate's section already existed to be adopted instead.
             "coach_copied_eligible_writes": coach_copied_eligible,
             "teammate_informed_writes": informed_typed,
         },

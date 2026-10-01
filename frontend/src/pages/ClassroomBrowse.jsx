@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, clearSession } from '../lib/api'
 
 const DEMO_LIST = [
   { id: 'demo-1', name: 'Husky Test Section', member_count: 12 },
@@ -91,8 +91,7 @@ export default function ClassroomBrowse() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 
