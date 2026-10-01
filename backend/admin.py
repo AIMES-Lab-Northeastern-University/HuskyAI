@@ -368,15 +368,27 @@ def _pair_messages(msgs) -> list[dict]:
 def _evals_by_turn(pairs: list[dict], evals: list) -> list[tuple[int, object]]:
     """[(pair_index, eval)] matching each eval to the turn it scored.
 
-    By turn_number, not position. Matching positionally shifted every later
-    score onto the wrong prompt as soon as one turn had no EvalResult (a group
-    turn whose scoring failed, for instance) — and the consent flag and author
-    shifted with it. Legacy conversations whose turn numbers repeat (an old
-    resume bug restarted them at 1) cannot be matched by number, so those alone
-    fall back to position."""
+    A turn's messages and its EvalResult are saved in one transaction, so each
+    saved pair has at most one eval. Two ways that breaks down:
+
+    - A pair with no eval (a group turn saved without scoring). Position then
+      shifts every later score, author and consent flag onto the wrong prompt,
+      so match by turn_number.
+    - A turn whose save failed outright. Its messages and eval are both gone,
+      but the in-memory counter moved on, so every later turn_number is one
+      ahead of its pair. Matching by number would shift everything instead.
+
+    So: when every pair has exactly one eval, position is right by
+    construction. Otherwise match by number, unless the numbers repeat (an old
+    resume bug restarted them at 1) or run past the saved pairs, where
+    position is the only usable signal."""
     numbers = [e.turn_number for e in evals]
-    if len(set(numbers)) != len(numbers):
-        return list(zip(range(len(pairs)), evals))
+    if (
+        len(evals) == len(pairs)
+        or len(set(numbers)) != len(numbers)
+        or any(not (1 <= (n or 0) <= len(pairs)) for n in numbers)
+    ):
+        return list(zip(range(len(pairs)), sorted(evals, key=lambda e: (e.created_at or datetime.min, e.turn_number or 0))))
     out = []
     for e in sorted(evals, key=lambda e: e.turn_number):
         idx = (e.turn_number or 0) - 1

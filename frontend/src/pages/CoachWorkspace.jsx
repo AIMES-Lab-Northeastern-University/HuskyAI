@@ -76,7 +76,7 @@ export function originFor(draft, copied, pasted) {
 
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen }) {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(section.content || '')
@@ -93,6 +93,12 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // Coach text that entered this draft: by "Copy to document", or pasted.
   const copiedChunks = useRef([])
   const pastedChunks = useRef([])
+  // Whether THIS mounted editor has a save waiting for its answer. Answers and
+  // conflicts live in the parent, which outlives us: closing the document panel
+  // unmounts every section, and on remount the last answer would replay —
+  // closing an editor "Copy to document" just opened, or reopening an empty one
+  // under an old error. Only answers to our own sends apply.
+  const awaitingSave = useRef(false)
 
 
   // Follow the server's copy while not actively editing, so a teammate's edit
@@ -101,7 +107,8 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // Declared after the effect above so it runs second: on a conflict that effect
   // has just replaced the draft with the teammate's text, and this restores ours.
   useEffect(() => {
-    if (!conflict) return
+    if (!conflict || !awaitingSave.current) return
+    awaitingSave.current = false
     setSaving(false)
     setDraft(sentDraft.current)
     setBaseVersion(conflict.version)
@@ -124,6 +131,8 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
       return base.trim() ? `${base.replace(/\s+$/, '')}\n\n${insertRequest.text}` : insertRequest.text
     })
     copiedChunks.current.push(insertRequest.text)
+    // Consumed: cleared in the parent so a later remount cannot apply it again.
+    onInsertSeen?.(insertRequest.n)
   }, [insertRequest]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle = () => {
@@ -137,7 +146,8 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // write: closing it at send time lost the draft whenever the socket was down
   // or the server refused the write, and left the button stuck on "Saving…".
   useEffect(() => {
-    if (!saveResult) return
+    if (!saveResult || !awaitingSave.current) return
+    awaitingSave.current = false
     setSaving(false)
     if (saveResult.kind === 'ok') {
       setSaveError(null)
@@ -160,6 +170,7 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
       setSaveError('Not connected, so nothing was saved. Your draft is still here; save again once you are reconnected.')
       return
     }
+    awaitingSave.current = true
     setSaving(true)
   }
 
@@ -442,6 +453,8 @@ export default function CoachWorkspace() {
       // live in it, and unmount with it).
       flushAllDwell('panel_close')
       setOpenOptions({})
+      // Open drafts unmount with the panel, so a conflict about one is moot.
+      setConflicts({})
     }
     setArtOpen(next)
     emit({ type: next ? 'artifact_open' : 'artifact_close' })
@@ -1063,6 +1076,7 @@ export default function CoachWorkspace() {
                     readOnly={sessionEnded}
                     coachReplies={coachReplies}
                     insertRequest={insertReq?.key === s.key ? insertReq : null}
+                    onInsertSeen={(n) => setInsertReq(r => (r && r.n === n ? null : r))}
                   />
                 ))}
               </div>

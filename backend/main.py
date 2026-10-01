@@ -1344,7 +1344,12 @@ async def _fresh_history(conversation_id: str, current: list[dict]) -> list[dict
         return current
 
 
-async def _can_play_solo(user_id: str, challenge_id: str) -> bool:
+async def _can_play_solo(user_id: str, challenge_id: str) -> bool | None:
+    """True/False from the access rule; None when it could not be checked.
+
+    A failed check (a pooler blip, say) is not a refusal: the client treats
+    4003 as final and stops reconnecting, which would strand a student who is
+    allowed in. The caller closes with a retryable code instead."""
     try:
         from challenges import _can_play_challenge, _challenge_access_sets
         async with AsyncSessionLocal() as db:
@@ -1355,7 +1360,7 @@ async def _can_play_solo(user_id: str, challenge_id: str) -> bool:
             return await _can_play_challenge(db, user_id, challenge_id, ch, is_admin)
     except Exception as e:
         log.error(f"could not check access to challenge {challenge_id}: {e}")
-        return False
+        return None
 
 
 # How long after a session ends a dwell flushed by the end is still accepted
@@ -1418,9 +1423,15 @@ async def websocket_endpoint(
     # anything about the challenge is loaded: without it, any signed-in user
     # with a challenge id could open a chat on it and be sent its brief, goal
     # and coaching prompt, whether or not it was ever assigned to them.
-    if challenge_id and not await _can_play_solo(user_id, challenge_id):
-        await websocket.close(code=4003, reason="Challenge not available")
-        return
+    if challenge_id:
+        allowed = await _can_play_solo(user_id, challenge_id)
+        if allowed is None:
+            # 1013 = try again later; the client reconnects on anything but 4001/4003.
+            await websocket.close(code=1013, reason="Could not check access; retrying")
+            return
+        if not allowed:
+            await websocket.close(code=4003, reason="Challenge not available")
+            return
 
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
     chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
