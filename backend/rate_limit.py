@@ -21,6 +21,9 @@ from fastapi import HTTPException, Request
 
 log = logging.getLogger("rate_limit")
 
+# Upper bound on one Redis round trip before falling back to the local counter.
+REDIS_TIMEOUT_SEC = 3
+
 
 class SlidingWindowLimiter:
     """Per-process sliding window. Used directly on a single worker, and as the
@@ -88,7 +91,12 @@ class _RedisSlidingWindow:
     def __init__(self, url: str, window_sec: float, namespace: str) -> None:
         from redis.asyncio import Redis  # imported here so redis stays optional
 
-        self._redis = Redis.from_url(url, decode_responses=True)
+        # Bounded, so a Redis that hangs rather than refusing becomes an error
+        # (and the per-process fallback) instead of a sign-in that never returns.
+        self._redis = Redis.from_url(
+            url, decode_responses=True,
+            socket_timeout=REDIS_TIMEOUT_SEC, socket_connect_timeout=REDIS_TIMEOUT_SEC,
+        )
         self._script = self._redis.register_script(_HIT_LUA)
         self.window_sec = window_sec
         self._ns = namespace
@@ -368,7 +376,8 @@ async def check_reset_rate_limit(request: Request, email: str | None = None, *, 
 
     checks: list[tuple[str, int]] = [(f"{scope}:ip:{ip}", _reset_max_per_ip())]
     if email:
-        checks.append((f"{scope}:email:{email.strip().lower()}", _reset_max_per_email()))
+        # Hashed like the login key: the key lives in Redis, not a place for emails.
+        checks.append((f"{scope}:email:{_account_tag(email)}", _reset_max_per_email()))
 
     for key, mx in checks:
         if mx <= 0:

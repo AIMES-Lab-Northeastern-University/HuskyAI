@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import coordination
 from challenges import get_current_user, get_db
 from classrooms import _assert_can_manage_classroom
 from database import (AsyncSessionLocal, Classroom, ClassroomChallenge, CorpusDocument,
@@ -205,31 +206,41 @@ async def _ingest_corpus(corpus_id: str) -> None:
             return
 
         for doc_id in candidates:
-            if not await _claim(doc_id):
-                continue        # another ingest has it
-            claimed.append(doc_id)
-            async with AsyncSessionLocal() as db:
-                d = await db.get(CorpusDocument, doc_id)
-                if d is None:
-                    continue    # deleted after the claim
-                filename, data = d.filename, d.data
+            # The lease is taken BEFORE the status moves to "indexing", so a
+            # document at "indexing" whose lease has lapsed really was
+            # abandoned -- which is what release_stranded_claims relies on to
+            # leave a live worker's ingest alone.
+            lease = await coordination.acquire(f"corpus_doc:{doc_id}")
+            if lease is None:
+                continue        # a live worker is indexing it
             try:
-                uploaded = await client.files.create(
-                    file=(filename, io.BytesIO(data)), purpose="assistants"
-                )
-                await client.vector_stores.files.create_and_poll(
-                    vector_store_id=store_id, file_id=uploaded.id
-                )
-                new_status, file_id = "ready", uploaded.id
-            except Exception as e:
-                log.error(f"corpus {corpus_id[:8]} doc {filename!r} failed: {e}")
-                new_status, file_id = "failed", None
-            async with AsyncSessionLocal() as db:
-                d = await db.get(CorpusDocument, doc_id)
-                if d:
-                    d.status = new_status
-                    d.openai_file_id = file_id
-                    await db.commit()
+                if not await _claim(doc_id):
+                    continue        # another ingest has it
+                claimed.append(doc_id)
+                async with AsyncSessionLocal() as db:
+                    d = await db.get(CorpusDocument, doc_id)
+                    if d is None:
+                        continue    # deleted after the claim
+                    filename, data = d.filename, d.data
+                try:
+                    uploaded = await client.files.create(
+                        file=(filename, io.BytesIO(data)), purpose="assistants"
+                    )
+                    await client.vector_stores.files.create_and_poll(
+                        vector_store_id=store_id, file_id=uploaded.id
+                    )
+                    new_status, file_id = "ready", uploaded.id
+                except Exception as e:
+                    log.error(f"corpus {corpus_id[:8]} doc {filename!r} failed: {e}")
+                    new_status, file_id = "failed", None
+                async with AsyncSessionLocal() as db:
+                    d = await db.get(CorpusDocument, doc_id)
+                    if d:
+                        d.status = new_status
+                        d.openai_file_id = file_id
+                        await db.commit()
+            finally:
+                await lease.release()
 
         async with AsyncSessionLocal() as db:
             await _refresh_corpus_status(db, corpus_id)
@@ -260,15 +271,40 @@ async def _ingest_corpus(corpus_id: str) -> None:
 async def release_stranded_claims() -> int:
     """Startup: documents left at "indexing" by a process that died mid-ingest
     (a redeploy) go back to failed, so they can be retried or deleted and the
-    corpus stops showing as building forever. Assumes, like the rest of the
-    deployment, that no other worker is ingesting while this one boots."""
+    corpus stops showing as building forever.
+
+    Only documents no live worker holds the lease for: with several workers, a
+    sibling may be indexing right now, and a restarting worker must not fail
+    its document out from under it. Without Redis there is one worker and no
+    lease can be live, so every "indexing" row is released, as before. If
+    Redis cannot be asked, nothing is released -- a document wrongly marked
+    failed is worse than one left at "indexing" until the next check."""
     try:
         async with AsyncSessionLocal() as db:
+            stuck = [d for (d,) in (await db.execute(
+                select(CorpusDocument.id).where(CorpusDocument.status == "indexing")
+            )).all()]
+        if not stuck:
+            return 0
+        abandoned: list[str] = []
+        for doc_id in stuck:
+            held = await coordination.is_held(f"corpus_doc:{doc_id}")
+            if held is None:
+                log.error(f"could not check corpus leases; leaving {len(stuck)} document(s) "
+                          "at 'indexing' for now")
+                return 0
+            if not held:
+                abandoned.append(doc_id)
+        if not abandoned:
+            return 0
+        async with AsyncSessionLocal() as db:
             res = await db.execute(
-                update(CorpusDocument).where(CorpusDocument.status == "indexing").values(status="failed")
+                update(CorpusDocument)
+                .where(CorpusDocument.id.in_(abandoned), CorpusDocument.status == "indexing")
+                .values(status="failed")
             )
             ids = [c for (c,) in (await db.execute(
-                select(CorpusDocument.corpus_id).where(CorpusDocument.status == "failed").distinct()
+                select(CorpusDocument.corpus_id).where(CorpusDocument.id.in_(abandoned)).distinct()
             )).all()] if res.rowcount else []
             for cid in ids:
                 await _refresh_corpus_status(db, cid)
@@ -279,6 +315,32 @@ async def release_stranded_claims() -> int:
     except Exception as e:
         log.error(f"could not release stranded corpus claims: {e}")
         return 0
+
+
+_recheck_tasks: set = set()
+
+
+def schedule_stranded_recheck() -> None:
+    """Startup, with several workers: check again once every lease a dead
+    process could have left behind has lapsed. On a redeploy the old workers'
+    leases are still live for up to LEASE_TTL_SEC when the new ones boot, so
+    the first check leaves their documents alone; this one releases them."""
+    if not coordination.enabled():
+        return
+
+    async def _later():
+        await asyncio.sleep(coordination.LEASE_TTL_SEC + 5)
+        await release_stranded_claims()
+
+    task = asyncio.create_task(_later())
+    _recheck_tasks.add(task)
+    task.add_done_callback(_recheck_tasks.discard)
+
+
+def cancel_stranded_recheck() -> None:
+    """Shutdown: drop a recheck that has not run yet (the next boot does its own)."""
+    for task in list(_recheck_tasks):
+        task.cancel()
 
 
 # ---------------------------------------------------------------------------
