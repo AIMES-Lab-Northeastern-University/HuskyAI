@@ -20,11 +20,13 @@ import openai
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
 from sqlalchemy import select, update, func
+from sqlalchemy.exc import IntegrityError
 
-from database import init_db, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership
+from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership
 from group_room import RedisUnavailable, rooms
 from events import log_event
 import artifacts
+import coordination
 from rate_limit import close_rate_limit_clients
 from study_policy import resolve_for_group_session
 
@@ -195,17 +197,23 @@ async def lifespan(app: FastAPI):
             "JWT_SECRET is shorter than 32 characters — use a long random secret in production "
             "(e.g. openssl rand -hex 32)."
         )
-    await init_db()
-    await seed_dev_platform_admin()
-    await _sync_platform_admin_emails()
-    log.info("Database initialized")
-    await seed_challenges()
-    await seed_demo_classroom()
-    await seed_pilot_classroom()
+    # Workers booting together take turns through schema setup and seeding
+    # (Postgres advisory lock; a no-op on SQLite). See database.startup_lock.
+    async with startup_lock():
+        await init_db()
+        await seed_dev_platform_admin()
+        await _sync_platform_admin_emails()
+        log.info("Database initialized")
+        await seed_challenges()
+        await seed_demo_classroom()
+        await seed_pilot_classroom()
+    # Every worker sweeps; leases (coordination.py) make each re-queued item
+    # run once across workers rather than once per worker.
     await _resweep_stuck_analyses()
     await _resweep_pending_scores()
-    from corpus import release_stranded_claims
+    from corpus import release_stranded_claims, schedule_stranded_recheck
     await release_stranded_claims()
+    schedule_stranded_recheck()
 
     # Group rooms: in-process (one Uvicorn worker) or Redis (any number).
     # Checked here so a configured-but-unreachable Redis is a loud boot problem
@@ -226,6 +234,9 @@ async def lifespan(app: FastAPI):
     # Shared rate-limit counters hold a Redis connection pool when REDIS_URL is
     # set; closing it on shutdown keeps a reload from leaking connections.
     await close_rate_limit_clients()
+    await coordination.close()
+    from corpus import cancel_stranded_recheck
+    cancel_stranded_recheck()
 
 
 app = FastAPI(title="Husky AI API", lifespan=lifespan)
@@ -1077,6 +1088,24 @@ async def _history_for_eval(db, ev) -> list[dict]:
 
 
 async def _rescore(eval_id: str) -> None:
+    # One retry loop per row across all workers. At boot every worker's sweep
+    # queues the same pending rows; the lease keeps that to one model call per
+    # attempt instead of one per worker. A worker that finds it held waits out
+    # one lease lifetime and asks again: a holder that just died (a worker
+    # restarting re-sweeps within seconds) has lapsed by then, a live one has not.
+    lease = await coordination.acquire(f"rescore:{eval_id}")
+    if lease is None:
+        await asyncio.sleep(coordination.LEASE_TTL_SEC + 5)
+        lease = await coordination.acquire(f"rescore:{eval_id}")
+        if lease is None:
+            return
+    try:
+        await _rescore_attempts(eval_id)
+    finally:
+        await lease.release()
+
+
+async def _rescore_attempts(eval_id: str) -> None:
     for delay in _RESCORE_DELAYS:
         await asyncio.sleep(delay)
         try:
@@ -1997,7 +2026,19 @@ async def _group_team_min(group_id: str) -> int:
 async def _ensure_group_session(group_id: str, session_num: int):
     """Get-or-create the GroupSession for (group, session) and its shared
     Conversation. Returns (group_session_id, conversation_id, challenge_id) or
-    None if the group does not exist."""
+    None if the group does not exist.
+
+    Teammates connect at the same moment (a class starting together), on one
+    worker or several. A racing insert of the session row loses on its unique
+    constraint and retries into the winner's row; see _ensure_group_session_once
+    for the conversation."""
+    try:
+        return await _ensure_group_session_once(group_id, session_num)
+    except IntegrityError:
+        return await _ensure_group_session_once(group_id, session_num)
+
+
+async def _ensure_group_session_once(group_id: str, session_num: int):
     async with AsyncSessionLocal() as db:
         group = await db.get(GroupChallenge, group_id)
         if not group:
@@ -2024,11 +2065,34 @@ async def _ensure_group_session(group_id: str, session_num: int):
             conv = Conversation(user_id=group.created_by, group_session_id=gs.id)
             db.add(conv)
             await db.flush()
-            gs.conversation_id = conv.id
+            # Set only while still unset: two teammates arriving together would
+            # otherwise each create one, the later commit would win, and the
+            # team would be split across two "shared" conversations.
+            res = await db.execute(
+                update(GroupSession)
+                .where(GroupSession.id == gs.id, GroupSession.conversation_id.is_(None))
+                .values(conversation_id=conv.id)
+                .execution_options(synchronize_session=False)
+            )
+            if res.rowcount != 1:
+                await db.delete(conv)       # a teammate's socket set it first
+                await db.flush()
+            await db.refresh(gs)
             if group.status == "open":
                 group.status = "active"
         await db.commit()
         return gs.id, gs.conversation_id, group.challenge_id
+
+
+async def _announce_leave(room, user_id: str, name: str) -> None:
+    """Tell the room a member left. Never raises: it runs in a socket's
+    cleanup, and a presence lookup failing there (Redis down) must not skip
+    the room teardown that follows it."""
+    try:
+        await room.broadcast({"type": "member_left", "user_id": user_id, "name": name})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+    except Exception as e:
+        log.error(f"[ROOM] could not announce {user_id[:8]} leaving: {type(e).__name__}: {e}")
 
 
 async def _load_group_history(conversation_id: str) -> list[dict]:
@@ -2244,10 +2308,15 @@ async def group_websocket_endpoint(
     try:
         room = await rooms.get(group_session_id)
 
-        # Hydrate shared history once per live room.
+        # Hydrate shared history once per live room, and catch it up if turns
+        # were saved by another worker since (the room is only this worker's
+        # view). Not while a turn is running here: then this worker's copy is
+        # the newest one, holding a prompt that is not saved yet.
         if not room.history_loaded:
             room.history = await _load_group_history(conversation_id)
             room.history_loaded = True
+        elif not room.turn_lock.locked():
+            room.history = await _fresh_history(conversation_id, room.history)
 
         await room.add(websocket, user_id, my_name)
     except RedisUnavailable as e:
@@ -2363,26 +2432,31 @@ async def group_websocket_endpoint(
                 }))
                 continue
 
-            # Free-form turns, serialized: if a turn is already in flight, tell this
-            # sender to hold (no await between the check and acquire, so no race).
-            if room.turn_lock.locked():
+            # Free-form turns, serialized across the whole team: if a turn is
+            # already in flight (on this worker or another), tell this sender to
+            # hold. Claimed before any await, so two prompts cannot both pass.
+            turn_token = await room.acquire_group_turn()
+            if turn_token is None:
                 await websocket.send_text(json.dumps({"type": "busy"}))
                 continue
 
-            user_content = data.get("content", "").strip()
-            attachments, rejected = _sanitize_attachments(data.get("attachments"))
-            if attachments and conversation_id:
-                attachments, chat_rejected = await _enforce_chat_attachment_caps(conversation_id, attachments)
-                rejected.extend(chat_rejected)
-            if rejected:
-                await websocket.send_text(json.dumps({"type": "attachment_warning", "files": rejected}))
-            if not user_content and not attachments:
-                continue
-            if not user_content:
-                user_content = "Please take a look at the attached file(s)."
-
-            await room.turn_lock.acquire()
             try:
+                user_content = data.get("content", "").strip()
+                attachments, rejected = _sanitize_attachments(data.get("attachments"))
+                if attachments and conversation_id:
+                    attachments, chat_rejected = await _enforce_chat_attachment_caps(conversation_id, attachments)
+                    rejected.extend(chat_rejected)
+                if rejected:
+                    await websocket.send_text(json.dumps({"type": "attachment_warning", "files": rejected}))
+                if not user_content and not attachments:
+                    continue
+                if not user_content:
+                    user_content = "Please take a look at the attached file(s)."
+
+                # Under the team-wide lock nobody else is mid-turn, so the saved
+                # conversation is complete: catch up on turns another worker
+                # saved, or this one would reuse their turn number.
+                room.history = await _fresh_history(conversation_id, room.history)
                 turn = len(room.history) // 2 + 1
                 if attachments:
                     await asyncio.to_thread(_preprocess_attachments, attachments)
@@ -2458,16 +2532,24 @@ async def group_websocket_endpoint(
                 else:
                     await room.broadcast({"type": "eval", "data": eval_result})
             finally:
-                room.turn_lock.release()
+                await room.release_group_turn(turn_token)
 
     except WebSocketDisconnect:
         pass
+    except RedisUnavailable as e:
+        # Presence or the turn lock could not be reached mid-session. Close with
+        # a retryable code: the client reconnects, and is refused with 4005
+        # only if Redis is still down by then.
+        log.critical(f"[WS-GROUP] collaboration backend lost mid-session: {e}")
+        try:
+            await websocket.close(code=1011, reason="Collaboration backend unavailable")
+        except Exception:
+            pass
     except Exception as e:
         log.error(f"[WS-GROUP] unexpected error: {type(e).__name__}: {e}", exc_info=True)
     finally:
         await room.remove(websocket)
-        await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
-        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+        await _announce_leave(room, user_id, my_name)
         await rooms.drop_if_empty(group_session_id)
         if rooms.peek(group_session_id) is None:
             # Last member gone: release this session's in-process locks (artifact
@@ -2517,12 +2599,17 @@ async def _ensure_coach_conversation(group_session_id: str, user_id: str) -> str
     kind='coach_private', is what makes it private-within-a-team without a new
     table."""
     async with AsyncSessionLocal() as db:
+        # Two tabs (or two workers) creating at once would each make one, and
+        # every later connect would then fail on the duplicate. Serialised on
+        # Postgres; and the oldest is taken, so a duplicate left over from
+        # before never locks the student out of their coach.
+        await lock_for_create(db, f"coach_conv:{group_session_id}:{user_id}")
         conv = (await db.execute(
             select(Conversation).where(
                 Conversation.user_id == user_id,
                 Conversation.group_session_id == group_session_id,
                 Conversation.kind == "coach_private",
-            )
+            ).order_by(Conversation.started_at, Conversation.id).limit(1)
         )).scalar_one_or_none()
         if conv is not None:
             return conv.id
@@ -3103,12 +3190,19 @@ async def coach_websocket_endpoint(
 
     except WebSocketDisconnect:
         pass
+    except RedisUnavailable as e:
+        # As in /ws/group: retryable close, refused with 4005 at reconnect only
+        # if Redis is still down.
+        log.critical(f"[WS-COACH] collaboration backend lost mid-session: {e}")
+        try:
+            await websocket.close(code=1011, reason="Collaboration backend unavailable")
+        except Exception:
+            pass
     except Exception as e:
         log.error(f"[WS-COACH] unexpected error: {type(e).__name__}: {e}", exc_info=True)
     finally:
         await room.remove(websocket)
-        await room.broadcast({"type": "member_left", "user_id": user_id, "name": my_name})
-        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+        await _announce_leave(room, user_id, my_name)
         await rooms.drop_if_empty(group_session_id)
         if rooms.peek(group_session_id) is None:
             await artifacts.forget_session(group_session_id)
@@ -3175,8 +3269,27 @@ async def _load_analysis_inputs(db, conversation_id: str, challenge_id: str | No
 
 
 async def _generate_session_analysis(conversation_id: str, user_id: str):
+    """Background task: one analysis run per session across all workers.
+
+    Every worker's startup sweep re-queues the same pending rows, and the
+    stale-pending retry can fire on whichever worker a poll lands on. If
+    another live worker is already generating this one, leave it to them: it
+    writes "ready" or "failed" when done, and a holder that dies lets its
+    lease lapse, so the stale-pending retry picks the row up again.
     """
-    Background task: build the post-session analysis for a completed session and
+    lease = await coordination.acquire(f"analysis:{conversation_id}:{user_id}")
+    if lease is None:
+        log.info(f"[SESSION-ANALYSIS] {conversation_id[:8]} already generating on another worker")
+        return
+    try:
+        await _build_session_analysis(conversation_id, user_id)
+    finally:
+        await lease.release()
+
+
+async def _build_session_analysis(conversation_id: str, user_id: str):
+    """
+    Build the post-session analysis for a completed session and
     store it on UserChallengeSession.session_analysis. Idempotent: skips if a
     "ready" analysis already exists; records {"status": "failed"} so the UI can
     stop polling and the next /end call can retry.

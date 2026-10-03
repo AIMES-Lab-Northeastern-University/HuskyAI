@@ -1,4 +1,6 @@
+import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import uuid4
 from sqlalchemy import (
@@ -20,6 +22,8 @@ from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
 from sqlalchemy.pool import NullPool
 
 from db_config import resolve_database_url, engine_connect_args, is_transaction_pooler
+
+_log = logging.getLogger("database")
 
 _db_url = resolve_database_url()
 _engine_kw: dict = {"echo": os.getenv("SQL_ECHO", "").lower() in ("1", "true", "yes")}
@@ -57,6 +61,68 @@ elif _db_url.startswith("postgresql"):
 
 engine = create_async_engine(_db_url, **_engine_kw)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def lock_for_create(db: AsyncSession, key: str) -> None:
+    """Serialise a get-or-create on `key` until `db`'s transaction ends.
+
+    For rows with no unique constraint to arbitrate a race (adding one to a
+    populated production table is a migration of its own). A Postgres
+    transaction-scoped advisory lock, so it works through the transaction
+    pooler and is released by the commit. A no-op on SQLite (one process)."""
+    if _db_url.startswith("postgresql"):
+        await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": key})
+
+
+# Arbitrary, fixed key for the boot-time advisory lock below.
+_STARTUP_LOCK_KEY = 0x48555348  # "HUSH"
+
+
+@asynccontextmanager
+async def startup_lock():
+    """Serialise schema setup and seeding across workers booting together.
+
+    Every Uvicorn worker runs the same startup. On Postgres, workers racing
+    through create_all, the defensive ALTERs and the insert-if-missing seeders
+    can collide (a duplicate seeded challenge, or a unique violation that
+    kills the worker's boot). A transaction-scoped advisory lock makes them
+    take turns: the second waits, then finds everything already there.
+
+    Transaction-scoped on purpose: it works through the transaction pooler
+    (:6543), where a session-level lock could be held by a connection that is
+    handed to someone else. It needs no table and no Redis.
+
+    A no-op on SQLite (local dev and tests: one process). If the lock cannot
+    be taken or released, boot carries on unserialised, exactly as before this
+    existed -- a startup that cannot coordinate must still start.
+    """
+    if not _db_url.startswith("postgresql"):
+        yield
+        return
+    conn = None
+    try:
+        conn = await engine.connect()
+        await conn.begin()
+        await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _STARTUP_LOCK_KEY})
+    except Exception as e:
+        _log.error(f"startup lock unavailable ({type(e).__name__}: {e}); booting unserialised")
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        conn = None
+    try:
+        yield
+    finally:
+        if conn is not None:
+            try:
+                await conn.commit()     # ends the transaction, releasing the lock
+            except Exception as e:
+                _log.warning(f"startup lock release: {type(e).__name__}: {e}")
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
 
 class Base(DeclarativeBase):
