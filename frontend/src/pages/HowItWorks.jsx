@@ -39,6 +39,21 @@ const STYLES = `
     .hiw-pi { width: 100%; }
   }
 
+  /* Phones: wide-screen rows stack, gutters shrink. Inline styles set the
+     desktop layout, so these overrides need !important. */
+  @media (max-width: 640px) {
+    .hiw-nav { padding: 0 16px !important; }
+    .hiw-pipe { padding: 24px 18px !important; }
+    .hiw-pipe-row { flex-direction: column; align-items: stretch !important; }
+    .hiw-pipe-arrow { transform: rotate(90deg); align-self: center; }
+    .hiw-bands { grid-template-columns: 1fr !important; }
+    .hiw-dim-card { padding: 22px 18px !important; }
+    .hiw-dim-row { flex-direction: column; gap: 14px !important; }
+  }
+  @media (max-width: 420px) {
+    .hiw-back { display: none !important; }
+  }
+
   .hiw-reveal {
     opacity: 0;
     transform: translateY(20px);
@@ -190,7 +205,7 @@ export default function HowItWorks() {
 
       {!isLoggedIn && (
         /* ── Navbar (public only) ── */
-        <nav style={{
+        <nav className="hiw-nav" style={{
           position: 'sticky', top: 0, zIndex: 100,
           background: 'rgba(253,252,251,0.92)', backdropFilter: 'blur(12px)',
           borderBottom: '1.5px solid var(--border)',
@@ -328,12 +343,12 @@ export default function HowItWorks() {
         </div>
 
         {/* Pipeline diagram */}
-        <div className="hiw-reveal" style={{
+        <div className="hiw-reveal hiw-pipe" style={{
           background: 'var(--ink)', borderRadius: 20, padding: '36px 32px',
           display: 'flex', flexDirection: 'column', gap: 0,
         }}>
           {/* Row: User message */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 20 }}>
+          <div className="hiw-pipe-row" style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 20 }}>
             <div style={{
               background: '#2A2420', border: '1px solid #3A3430',
               borderRadius: 12, padding: '12px 20px', flex: 1,
@@ -341,7 +356,7 @@ export default function HowItWorks() {
               <div style={{ fontSize: 10, fontWeight: 700, color: '#9A8E88', letterSpacing: '0.08em', marginBottom: 4 }}>STUDENT</div>
               <div style={{ fontSize: 13, color: '#F7F3EE', fontFamily: 'monospace' }}>"Debug this auth middleware - JWT token expires but session persists..."</div>
             </div>
-            <div style={{ color: '#C8102E', fontSize: 22 }}>→</div>
+            <div className="hiw-pipe-arrow" style={{ color: '#C8102E', fontSize: 22 }}>→</div>
             <div style={{
               background: '#C8102E', borderRadius: 12, padding: '12px 20px',
               fontSize: 13, fontWeight: 600, color: '#fff', whiteSpace: 'nowrap',
@@ -423,7 +438,7 @@ export default function HowItWorks() {
           </p>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(260px, 100%), 1fr))', gap: 14 }}>
           {[
             { domain: 'coding', color: '#7C3AED', bg: '#EDE9FE', signal: 'User is creating something new in code', eg: 'Features, architecture, code review' },
             { domain: 'debugging', color: '#C8102E', bg: '#FDE8EC', signal: 'Something exists and is not working', eg: 'Error messages, stack traces, broken behavior' },
@@ -556,7 +571,7 @@ export default function HowItWorks() {
           </div>
 
           {/* Classification bands */}
-          <div className="hiw-reveal" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 48 }}>
+          <div className="hiw-reveal hiw-bands" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 48 }}>
             {[
               { label: 'Novice', range: 'PEI < 40', color: '#F97316', desc: 'Predominantly led-by AI. Low structure, minimal verification. Student accepts first output.' },
               { label: 'Intermediate', range: 'PEI 40–70', color: '#EAB308', desc: 'Mixed control. Improving structure, occasional verification, inconsistent self-direction.' },
@@ -597,7 +612,7 @@ export default function HowItWorks() {
               boxShadow: '0 2px 8px rgba(22,18,14,0.04)',
               transition: 'transform 0.2s, box-shadow 0.2s',
             }}>
-              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 20 }}>
+              <div className="hiw-dim-row" style={{ display: 'flex', alignItems: 'flex-start', gap: 20 }}>
                 {/* Badge */}
                 <div style={{
                   background: bg, border: `2px solid ${color}20`,
@@ -611,7 +626,7 @@ export default function HowItWorks() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 17, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>{name}</div>
                   <p style={{ fontSize: 14, color: 'var(--ink-2)', lineHeight: 1.65, marginBottom: 16, margin: '0 0 16px' }}>{desc}</p>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(220px, 100%), 1fr))', gap: 8 }}>
                     {sub.map(({ label, eg }) => (
                       <div key={label} style={{
                         display: 'flex', gap: 8, alignItems: 'flex-start',
@@ -645,7 +660,7 @@ export default function HowItWorks() {
             </p>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: 16 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(340px, 100%), 1fr))', gap: 16 }}>
             {KB_FILES.map(({ path, color, items }) => (
               <div key={path} className="hiw-reveal" style={{
                 background: 'var(--white)', border: '1.5px solid var(--border)',
@@ -707,7 +722,7 @@ export default function HowItWorks() {
           </p>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(280px, 100%), 1fr))', gap: 14 }}>
           {[
             { title: 'Persistent Over-Reliance', trigger: 'RAS < 0.3 across 3+ consecutive turns', risk: 'Student accepts AI output without any critical evaluation' },
             { title: 'Multi-Turn Degradation', trigger: 'PEI drops >50% from turn 1 to turn 5', risk: 'Student loses focus or structure as conversation deepens' },
