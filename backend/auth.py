@@ -14,7 +14,8 @@ from sqlalchemy import select, update
 
 from database import PasswordResetToken, User, AsyncSessionLocal
 from emailer import send_password_reset
-from rate_limit import check_auth_rate_limit, check_reset_rate_limit
+from rate_limit import (check_auth_rate_limit, check_login_paused, check_reset_rate_limit,
+                        record_login_failure)
 
 log = logging.getLogger(__name__)
 
@@ -251,11 +252,15 @@ async def register(req: RegisterRequest):
 
 
 @router.post("/login", response_model=TokenResponse, dependencies=[Depends(check_auth_rate_limit)])
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    # Checked before the password, so a paused account refuses a correct
+    # guess too (see rate_limit.check_login_paused).
+    await check_login_paused(request, req.email)
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(User).where(User.email == req.email))
         user = result.scalar_one_or_none()
     if not user or not pwd_context.verify(req.password, user.password_hash):
+        await record_login_failure(request, req.email)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     return TokenResponse(
         access_token=create_token(user.id, getattr(user, "token_version", 0)),

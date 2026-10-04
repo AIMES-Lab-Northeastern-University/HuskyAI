@@ -15,7 +15,8 @@
  *
  * This module deliberately does NOT define what counts as a read, or when an
  * event fires. Those are the event vocabulary in docs/event-schema.md
- * (`open`, `section_expand`, `dwell`, `close`) and the emit points in
+ * (`open`, `section_expand`, `dwell`, `close`, and contested `option_expand` /
+ * `option_dwell`) and the emit points in
  * CoachWorkspace. This is only the part that makes sure what fired arrives.
  */
 

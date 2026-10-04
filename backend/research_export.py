@@ -201,6 +201,11 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
                 "classification": ev.classification,
                 "leading_status": ev.leading_status,
                 "is_graded_revision": bool(ev.is_graded_revision),
+                # "scored" (on time), "scored_late" (a background retry filled
+                # it in: the student saw it later, or never), "pending" or
+                # "failed" (no score; excluded from every average).
+                "score_status": ev.score_status or "scored",
+                "scored_at": ev.scored_at.isoformat() if ev.scored_at else None,
             })
 
     # ── Verification ────────────────────────────────────────────────────────

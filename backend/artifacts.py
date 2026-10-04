@@ -29,7 +29,7 @@ import logging
 from datetime import datetime
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import (
     Artifact,
@@ -40,7 +40,7 @@ from database import (
     GroupSession,
     User,
 )
-from events import log_event
+from events import EventResult, add_event_in, record_event
 
 log = logging.getLogger("artifacts")
 
@@ -51,7 +51,16 @@ IMPLICIT_SECTION_KEY = "body"
 
 # Where a section's new text came from. The difference between text a student
 # typed and text they lifted out of their coach is a finding, not bookkeeping.
-ORIGINS = {"student_typed", "coach_copied", "verification_edit"}
+# coach_copied: inserted with the "Copy to document" action on a coach reply.
+# coach_pasted: pasted by hand, and the pasted text matches one of this
+# student's own coach replies (the client checks; see CoachWorkspace Section).
+ORIGINS = {"student_typed", "coach_copied", "coach_pasted", "verification_edit"}
+COACH_ORIGINS = {"coach_copied", "coach_pasted"}
+
+# What the writing client could detect. Stored on each write event so the
+# reliance metric can tell "no coach text was adopted" from "this session's
+# client could not have told us" (every write made before detection existed).
+ORIGIN_TRACKING = {"copy+paste"}
 
 MAX_SECTION_KEY_LEN = 64
 
@@ -256,6 +265,7 @@ async def write_section(
     expected_version: int,
     origin: str = "student_typed",
     role_label: str | None = None,
+    origin_tracking: str | None = None,
 ) -> dict:
     """Apply one section write under optimistic concurrency.
 
@@ -273,6 +283,8 @@ async def write_section(
     """
     if origin not in ORIGINS:
         return {"ok": False, "error": f"unknown origin {origin!r}"}
+    if origin_tracking not in ORIGIN_TRACKING:
+        origin_tracking = None
 
     # Deliberately does NOT create the artifact. Creating one here would use the
     # default shape, and because sections are never restructured afterwards a
@@ -291,111 +303,160 @@ async def write_section(
     lock = await _lock_for(artifact_id)
 
     async with lock:
-        async with AsyncSessionLocal() as db:
-            section = (
-                await db.execute(
-                    select(ArtifactSection).where(
-                        ArtifactSection.artifact_id == artifact_id,
-                        ArtifactSection.key == section_key,
-                    )
-                )
-            ).scalar_one_or_none()
-            if section is None:
-                return {"ok": False, "error": f"no section {section_key!r}"}
-
-            if section.version != expected_version:
-                return {
-                    "ok": False,
-                    "conflict": True,
-                    "version": section.version,
-                    "content": section.content,
-                }
-
-            old = section.content or ""
-            if content == old:
-                return {
-                    "ok": True, "unchanged": True, "version": section.version,
-                    "bytes_added": 0, "bytes_removed": 0, "revision_id": None,
-                }
-            added, removed = _diff_bytes(old, content)
-            new_version = section.version + 1
-            now = datetime.utcnow()
-
-            section.content = content
-            section.version = new_version
-            section.updated_at = now
-            section.updated_by_user_id = author_user_id
-
-            author = await db.get(User, author_user_id)
-            revision = ArtifactRevision(
-                artifact_id=artifact_id,
-                section_id=section.id,
-                section_key=section.key,
-                version=new_version,
-                content=content,
-                author_user_id=author_user_id,
-                origin=origin,
-                bytes_added=added,
-                bytes_removed=removed,
-                consent_research=bool(author.consent_research) if author else False,
+        for attempt in range(_MAX_WRITE_ATTEMPTS):
+            outcome = await _write_once(
+                artifact_id=artifact_id, group_session_id=group_session_id,
+                section_key=section_key, content=content, author_user_id=author_user_id,
+                expected_version=expected_version, origin=origin, role_label=role_label,
+                origin_tracking=origin_tracking,
             )
-            db.add(revision)
-            section_id = section.id
-            # UNIQUE(section_id, version) is checked at the flush, not the
-            # commit, because the revision id is read back below. Both are
-            # inside this guard: another worker may have committed this version
-            # between our check above and either statement. The in-process lock
-            # orders writers inside ONE Uvicorn worker and cannot see that one,
-            # so the constraint is what makes the case survivable — reported as
-            # the ordinary stale-write conflict, with the current text, so the
-            # client rebases instead of silently losing the teammate's edit.
-            try:
-                await db.flush()
-                revision_id = revision.id
+            if outcome is not _RETRY:
+                return outcome
+            log.debug("artifact write retry %d on %s/%s (event seq taken)",
+                      attempt + 1, group_session_id, section_key)
+    log.error("artifact write NOT saved after %d attempts on %s/%s",
+              _MAX_WRITE_ATTEMPTS, group_session_id, section_key)
+    return {"ok": False, "error": "could not save right now, please try again"}
 
-                artifact = await db.get(Artifact, artifact_id)
-                if artifact is not None:
-                    artifact.updated_at = now
-                    artifact.updated_by_user_id = author_user_id
 
-                scope = await _scope(db, group_session_id)
-                await db.commit()
-            except IntegrityError:
-                await db.rollback()
-                log.warning(
-                    "artifact write lost the version race on %s/%s (wanted v%s)",
-                    group_session_id, section_key, new_version,
+# Retries for losing the event-seq race inside a write transaction. Same budget
+# as the event log's own allocator, for the same reason (see events.py).
+_MAX_WRITE_ATTEMPTS = 8
+_RETRY = object()
+
+
+async def _write_once(
+    *,
+    artifact_id: str,
+    group_session_id: str,
+    section_key: str,
+    content: str,
+    author_user_id: str,
+    expected_version: int,
+    origin: str,
+    role_label: str | None,
+    origin_tracking: str | None = None,
+):
+    """One attempt at a section write. Returns the result dict, or _RETRY when
+    only the study event's seq was taken by a concurrent writer.
+
+    The section update, the revision AND its `write` event are one transaction.
+    Before, the event was logged after the revision committed, so a logging
+    failure left a revision the event log never mentions: contribution share,
+    alternation and read-before-write are all computed from the log, so that
+    write silently did not happen as far as the analysis was concerned."""
+    async with AsyncSessionLocal() as db:
+        section = (
+            await db.execute(
+                select(ArtifactSection).where(
+                    ArtifactSection.artifact_id == artifact_id,
+                    ArtifactSection.key == section_key,
                 )
-                async with AsyncSessionLocal() as fresh:
-                    current = (
-                        await fresh.execute(
-                            select(ArtifactSection).where(ArtifactSection.id == section_id)
-                        )
-                    ).scalar_one_or_none()
-                    return {
-                        "ok": False,
-                        "conflict": True,
-                        "version": current.version if current else expected_version,
-                        "content": (current.content or "") if current else "",
-                    }
+            )
+        ).scalar_one_or_none()
+        if section is None:
+            return {"ok": False, "error": f"no section {section_key!r}"}
 
-    await log_event(
-        action="write",
-        target="artifact",
-        actor_kind="student",
-        group_session_id=group_session_id,
-        actor_user_id=author_user_id,
-        role_label=role_label,
-        ref_id=section_id,
-        payload={
-            "section_key": section_key,
-            "version": new_version,
-            "origin": origin,
-            "bytes_added": added,
-            "bytes_removed": removed,
-        },
-        **scope,
-    )
+        if section.version != expected_version:
+            return {
+                "ok": False,
+                "conflict": True,
+                "version": section.version,
+                "content": section.content,
+            }
+
+        old = section.content or ""
+        if content == old:
+            return {
+                "ok": True, "unchanged": True, "version": section.version,
+                "bytes_added": 0, "bytes_removed": 0, "revision_id": None,
+            }
+        added, removed = _diff_bytes(old, content)
+        new_version = section.version + 1
+        now = datetime.utcnow()
+
+        section.content = content
+        section.version = new_version
+        section.updated_at = now
+        section.updated_by_user_id = author_user_id
+
+        author = await db.get(User, author_user_id)
+        consent = bool(author.consent_research) if author else False
+        revision = ArtifactRevision(
+            artifact_id=artifact_id,
+            section_id=section.id,
+            section_key=section.key,
+            version=new_version,
+            content=content,
+            author_user_id=author_user_id,
+            origin=origin,
+            bytes_added=added,
+            bytes_removed=removed,
+            consent_research=consent,
+        )
+        db.add(revision)
+        section_id = section.id
+        # UNIQUE(section_id, version) is checked at this flush, before the
+        # event is added, so a failure here can only be the version race:
+        # another worker committed this version between our check above and
+        # now. The in-process lock orders writers inside ONE Uvicorn worker and
+        # cannot see that one, so the constraint is what makes the case
+        # survivable — reported as the ordinary stale-write conflict, with the
+        # current text, so the client rebases instead of losing the edit.
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            log.warning(
+                "artifact write lost the version race on %s/%s (wanted v%s)",
+                group_session_id, section_key, new_version,
+            )
+            return await _current_as_conflict(section_id, expected_version)
+        revision_id = revision.id
+
+        artifact = await db.get(Artifact, artifact_id)
+        if artifact is not None:
+            artifact.updated_at = now
+            artifact.updated_by_user_id = author_user_id
+
+        try:
+            scope = await _scope(db, group_session_id)
+            await add_event_in(
+                db,
+                action="write",
+                target="artifact",
+                actor_kind="student",
+                group_session_id=group_session_id,
+                actor_user_id=author_user_id,
+                role_label=role_label,
+                ref_id=section_id,
+                payload={
+                    "section_key": section_key,
+                    "version": new_version,
+                    "origin": origin,
+                    "bytes_added": added,
+                    "bytes_removed": removed,
+                    **({"origin_tracking": origin_tracking} if origin_tracking else {}),
+                },
+                consent_research=consent,
+                **scope,
+            )
+            await db.commit()
+        except (IntegrityError, OperationalError):
+            # The revision was already accepted at flush, so this is the event
+            # seq (or, on SQLite, the write lock). Nothing was kept; go again
+            # from a fresh read. If a teammate's write landed meanwhile, the
+            # next attempt sees the new version and reports a conflict.
+            await db.rollback()
+            return _RETRY
+        except Exception as e:
+            # Anything else: keep neither, and say so. A write the log cannot
+            # record is refused rather than kept unrecorded.
+            await db.rollback()
+            log.error("artifact write NOT saved on %s/%s: %s: %s",
+                      group_session_id, section_key, type(e).__name__, e)
+            return {"ok": False, "error": "could not save right now, please try again"}
+
     return {
         "ok": True, "version": new_version,
         "bytes_added": added, "bytes_removed": removed,
@@ -403,6 +464,19 @@ async def write_section(
         # without re-querying for the revision it just created.
         "revision_id": revision_id,
     }
+
+
+async def _current_as_conflict(section_id: str, expected_version: int) -> dict:
+    async with AsyncSessionLocal() as fresh:
+        current = (
+            await fresh.execute(select(ArtifactSection).where(ArtifactSection.id == section_id))
+        ).scalar_one_or_none()
+        return {
+            "ok": False,
+            "conflict": True,
+            "version": current.version if current else expected_version,
+            "content": (current.content or "") if current else "",
+        }
 
 
 async def revisions(group_session_id: str, section_key: str | None = None) -> list[dict]:
@@ -453,10 +527,14 @@ async def _log_read(
     role_label: str | None,
     idempotency_key: str | None,
     client_ts: datetime | None,
-) -> None:
-    async with AsyncSessionLocal() as db:
-        scope = await _scope(db, group_session_id)
-    await log_event(
+) -> EventResult:
+    try:
+        async with AsyncSessionLocal() as db:
+            scope = await _scope(db, group_session_id)
+    except Exception as e:
+        log.error("read NOT recorded (%s on %s): scope lookup failed: %s", action, group_session_id, e)
+        return EventResult("failed")
+    return await record_event(
         action=action,
         target="artifact",
         actor_kind=actor_kind,
@@ -477,9 +555,9 @@ async def log_open(
     role_label: str | None = None,
     idempotency_key: str | None = None,
     client_ts: datetime | None = None,
-) -> None:
+) -> EventResult:
     """A person actually opened the artifact panel."""
-    await _log_read(
+    return await _log_read(
         group_session_id, "open", user_id, "student", {}, role_label, idempotency_key, client_ts
     )
 
@@ -492,10 +570,10 @@ async def log_section_expand(
     role_label: str | None = None,
     idempotency_key: str | None = None,
     client_ts: datetime | None = None,
-) -> None:
+) -> EventResult:
     """A person expanded one section — the finest-grained read, and the one that
     makes "did they look at Sam's step 2?" answerable."""
-    await _log_read(
+    return await _log_read(
         group_session_id, "section_expand", user_id, "student",
         {"section_key": section_key}, role_label, idempotency_key, client_ts,
     )
@@ -508,13 +586,16 @@ async def log_close(
     role_label: str | None = None,
     idempotency_key: str | None = None,
     client_ts: datetime | None = None,
-) -> None:
+) -> EventResult:
     """A person closed the artifact panel. Paired with `open`, this bounds how
     long the artifact was actually on screen, which is what makes a missing or
     downsampled dwell heartbeat recoverable rather than fatal."""
-    await _log_read(
+    return await _log_read(
         group_session_id, "close", user_id, "student", {}, role_label, idempotency_key, client_ts
     )
+
+
+DWELL_FLUSH_REASONS = {"collapse", "panel_close", "pagehide", "unmount", "session_end"}
 
 
 async def log_dwell(
@@ -526,12 +607,19 @@ async def log_dwell(
     role_label: str | None = None,
     idempotency_key: str | None = None,
     client_ts: datetime | None = None,
-) -> None:
-    """Heartbeat with time-on-section. The one read event class that may be
-    downsampled or expired later; open/expand/read_by_coach are permanent."""
-    await _log_read(
-        group_session_id, "dwell", user_id, "student",
-        {"section_key": section_key, "duration_ms": duration_ms},
+    flush: str | None = None,
+) -> EventResult:
+    """Time-on-section. The one read event class that may be downsampled or
+    expired later; open/expand/read_by_coach are permanent.
+
+    `flush` says what closed the interval: the student collapsing the section,
+    or the page going away / the session ending with it still open (#17).
+    Time the tab was hidden is not included (the client pauses the clock)."""
+    payload = {"section_key": section_key, "duration_ms": duration_ms}
+    if flush in DWELL_FLUSH_REASONS:
+        payload["flush"] = flush
+    return await _log_read(
+        group_session_id, "dwell", user_id, "student", payload,
         role_label, idempotency_key, client_ts,
     )
 
@@ -542,14 +630,14 @@ async def log_read_by_coach(
     section_keys: list[str],
     *,
     role_label: str | None = None,
-) -> None:
+) -> EventResult:
     """The artifact was injected into a student's coach prompt.
 
     Attributed to that student but recorded with actor_kind="coach" and never
     merged into their human opens: whether a coach-mediated read counts as the
     student having read their teammate's work is open question 4, and that
     question stays answerable only if the two are kept apart in the data."""
-    await _log_read(
+    return await _log_read(
         group_session_id, "read_by_coach", on_behalf_of_user_id, "coach",
         {"section_keys": section_keys}, role_label, None, None,
     )

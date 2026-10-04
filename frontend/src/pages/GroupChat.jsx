@@ -4,7 +4,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Sidebar from '../components/Sidebar'
 import InfoIcon from '../components/InfoIcon'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
+import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 import { DIM_META, PEI_INFO } from '../lib/metricInfo'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
@@ -68,7 +69,7 @@ function DimBar({ code, value = 0 }) {
   )
 }
 
-function EvalSidebar({ evalData, isEvaluating, turnCount, collapsed, onToggle }) {
+function EvalSidebar({ evalData, isEvaluating, turnCount, collapsed, onToggle, scoreNotice }) {
   const pei = evalData?.scores?.PEI ?? 0
   const scores = evalData?.scores || {}
   const suggestions = evalData?.suggestions || []
@@ -128,6 +129,7 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, collapsed, onToggle })
         )}
       </div>
       <div className="p-5 flex flex-col gap-4 flex-1">
+        <ScoreNotice message={scoreNotice} />
         <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] p-5 text-center" style={{ borderWidth: '1.5px' }}>
           <PeiRing pei={pei} />
           <div className="flex items-center justify-center gap-2 mb-1.5">
@@ -231,7 +233,10 @@ export default function GroupChat() {
   const [isTyping, setIsTyping]          = useState(false)
   const [isEvaluating, setIsEvaluating]  = useState(false)
   const [evalData, setEvalData]          = useState(null)
+  const [scoreNotice, setScoreNotice]    = useState(null)
   const [turnCount, setTurnCount]        = useState(0)
+  const turnCountRef = useRef(0)
+  useEffect(() => { turnCountRef.current = turnCount }, [turnCount])
   const [evalCollapsed, setEvalCollapsed] = useState(false)
   // Width of the left "Team chat" column; the coach column flexes to fill the rest.
   const [teamWidth, setTeamWidth]        = useState(300)
@@ -273,6 +278,7 @@ export default function GroupChat() {
   const [challengeContext, setChallengeContext] = useState(null)
   const [sessionEnded, setSessionEnded]  = useState(false)
   const [ending, setEnding]              = useState(false)
+  const [endError, setEndError]          = useState('')
   const [sessionScore, setSessionScore]  = useState(null)
   const [teamChat, setTeamChat]          = useState([])
   const [teamInput, setTeamInput]        = useState('')
@@ -302,7 +308,7 @@ export default function GroupChat() {
   }, [])
 
   const handleLogout = () => {
-    localStorage.removeItem('token'); localStorage.removeItem('user')
+    clearSession()
     wsRef.current?.close(); navigate('/login', { replace: true })
   }
 
@@ -349,9 +355,20 @@ export default function GroupChat() {
         break
       case 'eval_start': setIsEvaluating(true); break
       case 'eval':
-        setIsEvaluating(false); setEvalData(data.data); setTurnCount(t => t + 1)
+        setIsEvaluating(false); setEvalData(data.data); setScoreNotice(null)
+        setTurnCount(t => t + 1)
         break
       case 'eval_error': setIsEvaluating(false); break
+      case 'eval_pending':
+      case 'eval_late':
+      case 'eval_rescore_failed': {
+        const a = lateScoreAction(data, turnCountRef.current)
+        setIsEvaluating(false)
+        if (a.countTurn) setTurnCount(t => t + 1)
+        if (a.show) setEvalData(a.show)
+        setScoreNotice(a.notice)
+        break
+      }
       case 'busy':
         // Another teammate's turn is in flight; flash a brief notice.
         setBusyNotice(true)
@@ -475,17 +492,24 @@ export default function GroupChat() {
 
   const endSession = async () => {
     if (ending) return
+    // Ends it for every teammate, not just this tab, and cannot be undone.
+    if (!window.confirm('End this session for the whole team? Everyone will be disconnected.')) return
     setEnding(true)
+    setEndError('')
     try {
       const res = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/end`, {
         method: 'POST', headers: { ...authHeaders() },
       })
-      const data = await res.json()
       if (res.ok) {
-        setSessionScore(data.session_avg_pei)
+        const data = await res.json().catch(() => ({}))
+        setSessionScore(data.session_avg_pei ?? null)
         sessionEndedRef.current = true
         setSessionEnded(true)
+      } else {
+        setEndError(await readApiError(res, 'Could not end the session'))
       }
+    } catch {
+      setEndError('Could not reach the server, so the session is still open. Try again.')
     } finally {
       setEnding(false)
     }
@@ -663,9 +687,12 @@ export default function GroupChat() {
                   </div>
                   <div className="flex items-center justify-between mt-2">
                     <span className="text-[11px] text-[#9A948E]">Powered by Gemini 2.5 Pro · One shared Husky Score</span>
-                    <button onClick={endSession} disabled={ending} className="text-[12px] text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer disabled:opacity-50">
-                      {ending ? 'Ending…' : 'End session'}
-                    </button>
+                    <span className="flex items-center gap-2">
+                      {endError && <span role="alert" className="text-[12px] text-[#C8102E]">{endError}</span>}
+                      <button onClick={endSession} disabled={ending} className="text-[12px] text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer disabled:opacity-50">
+                        {ending ? 'Ending…' : 'End session'}
+                      </button>
+                    </span>
                   </div>
                 </>
               )}

@@ -4,7 +4,7 @@ import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
 import CorpusManager from '../components/CorpusManager'
 import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
-import { API_URL, authHeaders, formatApiErrorDetail } from '../lib/api'
+import { API_URL, authHeaders, formatApiErrorDetail, readApiError, clearSession } from '../lib/api'
 
 const STUDENTS = [
   { initials: 'AJ', name: 'Alex Johnson',   score: 7.4, trend: '+0.6', sessions: 12, bar: 74, trendUp: true },
@@ -95,7 +95,7 @@ function StudySettings({ cc, onSaved }) {
                                require_revision_on_turn: revisionTurn === '' ? null : Number(revisionTurn) }),
       })
       if (r.ok) { setMsg('Saved.'); onSaved?.(await r.json()) }
-      else setMsg((await r.json()).detail || 'Could not save')
+      else setMsg(await readApiError(r, 'Could not save'))
     } catch (e) { setMsg(String(e)) } finally { setSaving(false) }
   }
 
@@ -175,7 +175,12 @@ function StudySettings({ cc, onSaved }) {
             </label>
             <input type="number" min={1} max={50} aria-label="Revision turn"
                    value={revisionTurn} disabled={revisionTurn === ''}
-                   onChange={e => setRevisionTurn(e.target.value === '' ? 1 : Math.max(1, Math.min(50, Number(e.target.value))))}
+                   onChange={e => {
+                     // Whole turns only: the server rejects 1.5, and a NaN from
+                     // a stray character must not reach the request.
+                     const n = Math.round(Number(e.target.value))
+                     setRevisionTurn(e.target.value === '' || !Number.isFinite(n) ? 1 : Math.max(1, Math.min(50, n)))
+                   }}
                    style={{ ...sel, width: '60px' }} />
           </div>
           {revisionTurn !== '' && (
@@ -272,8 +277,7 @@ export default function Instructor() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 
@@ -1746,6 +1750,9 @@ export default function Instructor() {
                                     <CorpusManager
                                       classroomChallengeId={c.classroom_challenge_id}
                                       corpusId={c.reference_corpus_id}
+                                      onChange={(corpusId) => setChallenges(prev => prev.map(x =>
+                                        x.classroom_challenge_id === c.classroom_challenge_id
+                                          ? { ...x, reference_corpus_id: corpusId } : x))}
                                     />
                                   </div>
                                 )}

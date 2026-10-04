@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header
@@ -1341,12 +1342,10 @@ async def get_challenge(
             "started_at": us.started_at.isoformat() if us and us.started_at else None,
             "completed_at": us.completed_at.isoformat() if us and us.completed_at else None,
             "end_reason": us.end_reason if us else None,
-            # The turn whose feedback still needs a revision, so the page can
-            # disable "Mark as complete" instead of letting the server refuse.
-            "revision_owed_after_turn": (
-                await revision_owed(db, user_id, challenge_id, us)
-                if us and us.status == "in_progress" else None
-            ),
+            # What still stands between the student and finishing, so the
+            # page can disable "Mark as complete" and say why instead of
+            # letting the server refuse. Same check the server enforces.
+            **(await _finish_hints(db, user_id, challenge_id, us)),
         })
 
     group_mode, group = await _student_group_info(db, user_id, challenge_id)
@@ -1365,6 +1364,19 @@ async def get_challenge(
         "group_mode": group_mode,
         "group": group,
         "sections": _sections_of(ch),
+    }
+
+
+async def _finish_hints(db: AsyncSession, user_id: str, challenge_id: str, us) -> dict:
+    if not us or us.status != "in_progress":
+        return {"revision_owed_after_turn": None, "min_turns": us.min_turns if us else None,
+                "scored_turns": None, "turns_left": 0}
+    check = await finish_check(db, user_id, challenge_id, us)
+    return {
+        "revision_owed_after_turn": None if check.past_deadline else check.revision_owed_turn,
+        "min_turns": check.min_turns,
+        "scored_turns": check.scored_turns,
+        "turns_left": check.turns_left,
     }
 
 
@@ -1500,14 +1512,88 @@ async def revision_owed(
     return required if has_revision is None else None
 
 
-async def _assert_revision_submitted(
-    db: AsyncSession, user_id: str, challenge_id: str, session_record
-) -> None:
-    """Raise 409 if a graded revision is still owed. The server-side backstop:
-    the UI disables the finish buttons first, so a student normally never
-    reaches this; a stale tab or a direct request does."""
-    if await revision_owed(db, user_id, challenge_id, session_record) is not None:
-        raise HTTPException(status_code=409, detail=REVISION_OWED_DETAIL)
+async def scored_turn_count(db: AsyncSession, conversation_id: str | None) -> int:
+    """Turns that actually got a score. A turn whose scoring failed (or is
+    still pending) does not count toward the minimum: the minimum exists so a
+    session has enough scored work to mean something."""
+    if not conversation_id:
+        return 0
+    return int((await db.execute(
+        select(func.count(EvalResult.id)).where(
+            EvalResult.conversation_id == conversation_id,
+            EvalResult.pei.is_not(None),
+        )
+    )).scalar() or 0)
+
+
+def session_past_deadline(session_record) -> bool:
+    return bool(
+        session_record
+        and session_record.time_limit_minutes
+        and session_record.started_at
+        and datetime.utcnow() >= session_record.started_at
+        + timedelta(minutes=session_record.time_limit_minutes)
+    )
+
+
+@dataclass
+class FinishCheck:
+    past_deadline: bool
+    scored_turns: int
+    min_turns: int | None
+    revision_owed_turn: int | None
+
+    @property
+    def turns_left(self) -> int:
+        if not self.min_turns or self.past_deadline:
+            return 0
+        return max(0, self.min_turns - self.scored_turns)
+
+    @property
+    def block(self) -> tuple[int, str] | None:
+        """(status, detail) that stops a manual finish, or None.
+
+        The timer is a hard cap and wins over both rules: a session that ran
+        out is finished whatever state it is in, and a revision still owed is
+        recorded as missed rather than blocking."""
+        if self.past_deadline:
+            return None
+        if self.turns_left:
+            return (400, f"Send at least {self.min_turns} scored turns before ending "
+                         f"(you have {self.scored_turns}).")
+        if self.revision_owed_turn is not None:
+            return (409, REVISION_OWED_DETAIL)
+        return None
+
+
+async def finish_check(
+    db: AsyncSession, user_id: str, challenge_id: str | None, session_record
+) -> FinishCheck:
+    """The single rule for whether a challenge session may be finished by hand.
+
+    Used by both ways of finishing: "Mark as complete" on the challenge page
+    (/challenges/.../complete) and End Session in the chat
+    (/conversations/{id}/end). They used to apply different rules — the page
+    button skipped the minimum-turns check entirely — so the stricter one was
+    only as strong as the weaker path."""
+    revision = None
+    if session_record is not None and session_record.status != "completed" and challenge_id:
+        revision = await revision_owed(db, user_id, challenge_id, session_record)
+    return FinishCheck(
+        past_deadline=session_past_deadline(session_record),
+        scored_turns=await scored_turn_count(
+            db, session_record.conversation_id if session_record else None),
+        min_turns=session_record.min_turns if session_record else None,
+        revision_owed_turn=revision,
+    )
+
+
+def raise_if_blocked(check: FinishCheck) -> None:
+    """The server-side backstop: the UI disables the finish buttons first, so
+    a student normally never reaches this; a stale tab or a direct request does."""
+    if check.block is not None:
+        status, detail = check.block
+        raise HTTPException(status_code=status, detail=detail)
 
 
 @router.post("/{challenge_id}/sessions/{session_number}/complete")
@@ -1535,17 +1621,31 @@ async def complete_session(
     if not session_record:
         raise HTTPException(status_code=404, detail="Session not found — start it first")
 
-    # Consequential revision: when the assignment requires one, the session
-    # cannot be completed until it exists. Enforced here rather than only in the
-    # UI, because "the student must submit one revision that counts" is a
-    # property of the study design — a client that skips the step, or a stale
-    # tab, must not be able to close the session without it.
-    await _assert_revision_submitted(db, user_id, challenge_id, session_record)
+    if session_record.status == "completed":
+        return {"status": "completed"}
+
+    # Minimum scored turns, the timer, and the consequential revision: the
+    # same check End Session in the chat uses (see finish_check). Enforced here
+    # rather than only in the UI, because these are properties of the study
+    # design — a client that skips a step, or a stale tab, must not be able to
+    # close the session without them.
+    check = await finish_check(db, user_id, challenge_id, session_record)
+    raise_if_blocked(check)
 
     session_record.status = "completed"
     session_record.completed_at = datetime.utcnow()
-    # User-initiated completion from the challenge detail page.
+    # User-initiated completion from the challenge detail page, unless the
+    # timer had already run out.
     if session_record.end_reason is None:
-        session_record.end_reason = "manual"
+        session_record.end_reason = "timer_expired" if check.past_deadline else "manual"
     await db.commit()
+
+    if check.revision_owed_turn is not None:
+        # Only reachable past the deadline (otherwise the check refused).
+        from events import log_event
+        await log_event(
+            action="revision.missed", target="feed", actor_kind="system",
+            user_challenge_session_id=session_record.id, actor_user_id=user_id,
+            payload={"after_turn": check.revision_owed_turn, "end_reason": "timer_expired"},
+        )
     return {"status": "completed"}

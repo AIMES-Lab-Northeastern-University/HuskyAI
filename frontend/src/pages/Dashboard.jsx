@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
-import { API_URL, authHeaders } from '../lib/api'
+import { API_URL, authHeaders, clearSession } from '../lib/api'
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -65,8 +65,7 @@ export default function Dashboard() {
       navigate('/', { replace: true })
       return
     }
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    clearSession()
     navigate('/login', { replace: true })
   }
 

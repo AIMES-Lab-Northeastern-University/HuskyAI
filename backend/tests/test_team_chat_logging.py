@@ -152,6 +152,28 @@ def test_metadata_logs_who_when_and_length_but_never_text(app_ready):
     assert "step two" not in json.dumps(bundle)
 
 
+def test_chat_after_the_session_ends_is_not_logged(app_ready):
+    """The measurement window is the session: chat still reaches the team after
+    the end, but no study event is recorded for it."""
+    from database import AsyncSessionLocal, GroupSession
+
+    t = asyncio.run(_team("metadata"))
+    client = TestClient(app_ready)
+    _chat(client, t["gid"], t["users"][0], "during")
+    gs = asyncio.run(_gs_id(t["gid"]))
+
+    async def end():
+        async with AsyncSessionLocal() as db:
+            (await db.get(GroupSession, gs)).status = "completed"
+            await db.commit()
+    asyncio.run(end())
+
+    _chat(client, t["gid"], t["users"][1], "after")
+    events = asyncio.run(_chat_events(gs))
+    assert [e.actor_user_id for e in events] == [t["users"][0]]
+    assert sorted(m.content for m in asyncio.run(_stored_messages(t["gid"]))) == ["after", "during"]
+
+
 def test_content_exports_scrubbed_text_including_teammates_names(app_ready):
     t = asyncio.run(_team("content"))
     client = TestClient(app_ready)

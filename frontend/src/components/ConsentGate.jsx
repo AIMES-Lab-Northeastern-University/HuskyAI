@@ -17,7 +17,7 @@ const ACK_KEY = 'research_ack'
 let verifiedThisLoad = false
 
 export default function ConsentGate({ children }) {
-  // 'loading' | 'gate' | 'ok'
+  // 'loading' | 'gate' | 'ok' | 'error'
   const [state, setState] = useState(
     localStorage.getItem(ACK_KEY) === 'true' ? 'ok' : 'loading',
   )
@@ -25,6 +25,8 @@ export default function ConsentGate({ children }) {
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
   const [allowDecline, setAllowDecline] = useState(false)
+  // Bumped by "Try again" so the check below actually re-runs.
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     if (state === 'ok' && verifiedThisLoad) return
@@ -43,15 +45,21 @@ export default function ConsentGate({ children }) {
           setAllowDecline(!!d.research_notice_allow_decline)
           setState('gate')
         } else {
-          // If we can't confirm, don't hard-block the app on a transient error.
-          setState('ok')
+          // Not confirmed is not the same as acknowledged. Letting a failed
+          // check through meant someone could use the platform, and have their
+          // work recorded, without ever seeing the notice. (An expired token
+          // is a 401, which the shared fetch handler turns into a login.)
+          // A cached acknowledgement stays in the app on a failed re-check
+          // (they did see a notice); verifiedThisLoad stays false so the next
+          // mount tries again.
+          setState((s) => (s === 'ok' ? 'ok' : 'error'))
         }
       } catch {
-        if (!cancelled) setState('ok')
+        if (!cancelled) setState((s) => (s === 'ok' ? 'ok' : 'error'))
       }
     })()
     return () => { cancelled = true }
-  }, [])
+  }, [attempt])
 
   const respond = async (accept) => {
     if ((accept && !checked) || saving) return
@@ -82,6 +90,18 @@ export default function ConsentGate({ children }) {
     return (
       <div className="flex h-screen items-center justify-center bg-[#F7F3EE] text-[#9A948E] text-sm">
         Loading…
+      </div>
+    )
+  }
+
+  if (state === 'error') {
+    return (
+      <div className="flex h-screen flex-col items-center justify-center gap-3 bg-[#F7F3EE] text-sm text-[#4A4440]">
+        <div>We could not reach the server to load your account.</div>
+        <button type="button" onClick={() => { setState('loading'); setAttempt((n) => n + 1) }}
+                className="px-4 py-2 rounded-[10px] bg-[#C8102E] text-white font-bold cursor-pointer">
+          Try again
+        </button>
       </div>
     )
   }

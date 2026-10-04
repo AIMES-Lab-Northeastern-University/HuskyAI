@@ -642,7 +642,9 @@ async def classroom_instructor_analytics(
             select(func.count())
             .select_from(EvalResult)
             .join(Conversation, EvalResult.conversation_id == Conversation.id)
-            .where(*conv_scope)
+            # Scored turns only: a turn whose scoring failed or is still
+            # pending has a row but no score.
+            .where(*conv_scope, EvalResult.pei.is_not(None))
         )
         out["eval_turns_count"] = int(ne or 0)
         ae = await db.scalar(

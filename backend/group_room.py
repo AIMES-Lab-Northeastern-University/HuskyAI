@@ -46,6 +46,19 @@ MEMBER_TTL_SEC = 45
 # their own coach. Released in a finally; the TTL is the crash net.
 COACH_LOCK_TTL_SEC = 300
 
+# The legacy shared-coach room (/ws/group) runs one AI turn at a time for the
+# whole team. Same reasoning as the coach lock: a stream plus the inline
+# evaluation fits well inside it, and a dead worker frees it on expiry.
+TURN_LOCK_TTL_SEC = 300
+
+# Bound every Redis command, so a Redis that hangs (rather than refusing)
+# surfaces as RedisUnavailable instead of hanging the socket behind it. Not
+# applied to the pub/sub connection, which is idle-blocking by design.
+REDIS_TIMEOUT_SEC = 5
+
+# Backoff between attempts to re-subscribe after the pub/sub connection drops.
+RESUBSCRIBE_BACKOFF_SEC = (0.5, 1, 2, 5, 10)
+
 # How often a worker refreshes its presence entries. Comfortably inside
 # MEMBER_TTL_SEC: a student reading quietly for a minute is still present, and
 # only a worker that has actually stopped running lets its entries lapse.
@@ -95,10 +108,20 @@ class RedisFanout:
         self._url = url
         if client is not None:
             self._redis = client
+            self._sub_redis = client
         else:
             from redis.asyncio import Redis  # imported here so redis stays optional
 
-            self._redis = Redis.from_url(url, decode_responses=True)
+            self._redis = Redis.from_url(
+                url, decode_responses=True,
+                socket_timeout=REDIS_TIMEOUT_SEC, socket_connect_timeout=REDIS_TIMEOUT_SEC,
+            )
+            # Subscriptions get their own client: a read timeout would fire on
+            # every quiet room, so this one relies on TCP keepalive instead.
+            self._sub_redis = Redis.from_url(
+                url, decode_responses=True,
+                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_keepalive=True,
+            )
         # Per-instance identity, used to drop our own pub/sub echoes.
         # Deliberately not the pid: one process may hold more than one instance.
         self._origin = f"{WORKER_ID}-{uuid.uuid4().hex[:8]}"
@@ -206,83 +229,136 @@ class RedisFanout:
             return
         channel = _key(gsid, "events")
         try:
-            pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
-            await pubsub.subscribe(channel)
+            pubsub = await self._open_subscription(channel)
         except Exception as e:
             raise RedisUnavailable(f"subscribe failed: {e}") from e
 
-        async def _listen():
-            try:
-                async for msg in pubsub.listen():
-                    if msg.get("type") != "message":
-                        continue
-                    try:
-                        envelope = json.loads(msg["data"])
-                    except Exception:
-                        continue
-                    # Skip what this worker published: it already delivered
-                    # those payloads to its own sockets directly.
-                    if envelope.get("origin") == self._origin:
-                        continue
-                    try:
-                        await handler(envelope.get("payload") or {})
-                    except Exception as e:
-                        log.error(f"[room] subscriber handler failed: {type(e).__name__}: {e}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.critical(
-                    f"[room] pub/sub listener for {gsid} died: {type(e).__name__}: {e}. "
-                    "Members on this worker will stop receiving remote events."
-                )
+        entry = {"pubsub": pubsub, "task": None}
 
-        self._subs[gsid] = (pubsub, asyncio.create_task(_listen()))
+        async def _listen():
+            attempt = 0
+            while True:
+                try:
+                    async for msg in entry["pubsub"].listen():
+                        attempt = 0
+                        if msg.get("type") != "message":
+                            continue
+                        try:
+                            envelope = json.loads(msg["data"])
+                        except Exception:
+                            continue
+                        # Skip what this worker published: it already delivered
+                        # those payloads to its own sockets directly.
+                        if envelope.get("origin") == self._origin:
+                            continue
+                        try:
+                            await handler(envelope.get("payload") or {})
+                        except Exception as e:
+                            log.error(f"[room] subscriber handler failed: {type(e).__name__}: {e}")
+                    raise ConnectionError("pub/sub stream ended")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Re-subscribe rather than die: a dead listener leaves this
+                    # worker's members silently deaf to their teammates for as
+                    # long as the room lives. Payloads published while it is
+                    # down are lost (pub/sub has no replay); everything they
+                    # carry is in the database, and a reconnect reloads it.
+                    log.error(
+                        f"[room] pub/sub listener for {gsid} dropped: {type(e).__name__}: {e}. "
+                        "Re-subscribing; remote events in the gap are not replayed."
+                    )
+                    await self._close_subscription(entry["pubsub"])
+                    while True:
+                        delay = RESUBSCRIBE_BACKOFF_SEC[min(attempt, len(RESUBSCRIBE_BACKOFF_SEC) - 1)]
+                        attempt += 1
+                        await asyncio.sleep(delay)
+                        try:
+                            entry["pubsub"] = await self._open_subscription(channel)
+                            log.info(f"[room] pub/sub listener for {gsid} re-subscribed")
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e2:
+                            log.error(f"[room] re-subscribe for {gsid} failed: {type(e2).__name__}: {e2}")
+
+        entry["task"] = asyncio.create_task(_listen())
+        self._subs[gsid] = entry
+
+    async def _open_subscription(self, channel: str):
+        pubsub = self._sub_redis.pubsub(ignore_subscribe_messages=True)
+        try:
+            await pubsub.subscribe(channel)
+        except BaseException:
+            await self._close_subscription(pubsub)
+            raise
+        return pubsub
+
+    @staticmethod
+    async def _close_subscription(pubsub) -> None:
+        try:
+            await pubsub.unsubscribe()
+        except Exception:
+            pass
+        try:
+            await pubsub.close()
+        except Exception:
+            pass
 
     async def unsubscribe(self, gsid: str) -> None:
         entry = self._subs.pop(gsid, None)
         if not entry:
             return
-        pubsub, task = entry
+        task = entry["task"]
         task.cancel()
         try:
             await task
         except (asyncio.CancelledError, Exception):
             pass
-        try:
-            await pubsub.unsubscribe()
-            await pubsub.close()
-        except Exception:
-            pass
+        await self._close_subscription(entry["pubsub"])
 
     # -- per-student coach lock -------------------------------------------
+
+    async def _try_lock(self, key: str, ttl: int, what: str) -> str | None:
+        nonce = uuid.uuid4().hex
+        try:
+            ok = await self._redis.set(key, nonce, nx=True, ex=ttl)
+        except Exception as e:
+            raise RedisUnavailable(f"{what} lock failed: {e}") from e
+        return nonce if ok else None
+
+    async def _release_lock(self, key: str, nonce: str, what: str) -> None:
+        try:
+            await self._redis.eval(self._RELEASE_LUA, 1, key, nonce)
+        except Exception as e:
+            log.error(f"[room] {what} lock release failed for {key}: {e}")
 
     async def try_acquire_user(self, gsid: str, user_id: str) -> str | None:
         """One in-flight coach turn per student, across every worker. Returns a
         nonce to release with, or None if the student already has a turn
         running (a second tab, or a double-submit)."""
-        nonce = uuid.uuid4().hex
-        try:
-            ok = await self._redis.set(
-                _key(gsid, f"coach:{user_id}"), nonce,
-                nx=True, ex=COACH_LOCK_TTL_SEC,
-            )
-        except Exception as e:
-            raise RedisUnavailable(f"coach lock failed: {e}") from e
-        return nonce if ok else None
+        return await self._try_lock(_key(gsid, f"coach:{user_id}"), COACH_LOCK_TTL_SEC, "coach")
 
     async def release_user(self, gsid: str, user_id: str, nonce: str) -> None:
-        try:
-            await self._redis.eval(self._RELEASE_LUA, 1, _key(gsid, f"coach:{user_id}"), nonce)
-        except Exception as e:
-            log.error(f"[room] coach lock release failed for {gsid}/{user_id[:8]}: {e}")
+        await self._release_lock(_key(gsid, f"coach:{user_id}"), nonce, "coach")
+
+    async def try_acquire_turn(self, gsid: str) -> str | None:
+        """One in-flight shared-coach turn per team (/ws/group), across every
+        worker. Without it, teammates on two workers could each start a turn
+        and both would be saved under the same turn number."""
+        return await self._try_lock(_key(gsid, "turn"), TURN_LOCK_TTL_SEC, "turn")
+
+    async def release_turn(self, gsid: str, nonce: str) -> None:
+        await self._release_lock(_key(gsid, "turn"), nonce, "turn")
 
     async def close(self) -> None:
         for gsid in list(self._subs):
             await self.unsubscribe(gsid)
-        try:
-            await self._redis.close()
-        except Exception:
-            pass
+        for client in {id(self._redis): self._redis, id(self._sub_redis): self._sub_redis}.values():
+            try:
+                await client.close()
+            except Exception:
+                pass
 
 
 class GroupRoom:
@@ -323,6 +399,9 @@ class GroupRoom:
         # Refreshes this worker's presence entries while anyone is connected.
         # Started on the first add, stopped when the last socket goes.
         self._heartbeat_task: asyncio.Task | None = None
+        # Set while cross-worker publishing is failing, so an outage is logged
+        # once rather than once per streamed chunk.
+        self._publish_failing = False
 
     # -- coach turn locking ------------------------------------------------
 
@@ -371,6 +450,37 @@ class GroupRoom:
         lock = self._user_locks.get(user_id)
         if lock is not None and lock.locked():
             lock.release()
+
+    async def acquire_group_turn(self) -> str | None:
+        """Claim the team's shared-coach turn (/ws/group) across every worker.
+
+        The same two-step shape as `acquire_user_turn`: the local lock excludes
+        this worker's sockets without a round trip, the Redis key excludes
+        every other worker's. Returns a token for `release_group_turn`, or None
+        if a turn is already running anywhere.
+        """
+        if self.turn_lock.locked():
+            return None
+        await self.turn_lock.acquire()
+        if self._fanout is None:
+            return "local"
+        try:
+            nonce = await self._fanout.try_acquire_turn(self.group_session_id)
+        except Exception:
+            self.turn_lock.release()
+            raise
+        if nonce is None:
+            self.turn_lock.release()
+            return None
+        return nonce
+
+    async def release_group_turn(self, token: str | None) -> None:
+        if token is None:
+            return
+        if self._fanout is not None and token != "local":
+            await self._fanout.release_turn(self.group_session_id, token)
+        if self.turn_lock.locked():
+            self.turn_lock.release()
 
     def private_state(self, user_id: str, conversation_id: str) -> dict:
         """This student's private coach history, created empty on first use."""
@@ -440,7 +550,22 @@ class GroupRoom:
             # `exclude` is a local socket object and cannot be expressed
             # remotely; it is only ever used to skip the sender's own echo of
             # something they already rendered, which no other worker holds.
-            await self._fanout.publish(self.group_session_id, payload)
+            try:
+                await self._fanout.publish(self.group_session_id, payload)
+                if self._publish_failing:
+                    self._publish_failing = False
+                    log.info(f"[room] publishing to {self.group_session_id} recovered")
+            except RedisUnavailable as e:
+                # Not raised mid-session. The local sockets already have the
+                # payload, and raising would tear down the sender's socket in
+                # the middle of a turn -- losing the turn itself, which is in
+                # no one's interest. Teammates on other workers miss the live
+                # update; it is persisted, and their next reconnect reloads it.
+                # Logged once per outage, not once per streamed chunk.
+                if not self._publish_failing:
+                    self._publish_failing = True
+                    log.critical(f"[room] cross-worker publish failing for "
+                                 f"{self.group_session_id}: {e}")
 
     # -- presence ----------------------------------------------------------
 

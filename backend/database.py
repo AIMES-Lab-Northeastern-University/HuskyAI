@@ -1,4 +1,6 @@
+import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import uuid4
 from sqlalchemy import (
@@ -20,6 +22,8 @@ from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
 from sqlalchemy.pool import NullPool
 
 from db_config import resolve_database_url, engine_connect_args, is_transaction_pooler
+
+_log = logging.getLogger("database")
 
 _db_url = resolve_database_url()
 _engine_kw: dict = {"echo": os.getenv("SQL_ECHO", "").lower() in ("1", "true", "yes")}
@@ -57,6 +61,68 @@ elif _db_url.startswith("postgresql"):
 
 engine = create_async_engine(_db_url, **_engine_kw)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def lock_for_create(db: AsyncSession, key: str) -> None:
+    """Serialise a get-or-create on `key` until `db`'s transaction ends.
+
+    For rows with no unique constraint to arbitrate a race (adding one to a
+    populated production table is a migration of its own). A Postgres
+    transaction-scoped advisory lock, so it works through the transaction
+    pooler and is released by the commit. A no-op on SQLite (one process)."""
+    if _db_url.startswith("postgresql"):
+        await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": key})
+
+
+# Arbitrary, fixed key for the boot-time advisory lock below.
+_STARTUP_LOCK_KEY = 0x48555348  # "HUSH"
+
+
+@asynccontextmanager
+async def startup_lock():
+    """Serialise schema setup and seeding across workers booting together.
+
+    Every Uvicorn worker runs the same startup. On Postgres, workers racing
+    through create_all, the defensive ALTERs and the insert-if-missing seeders
+    can collide (a duplicate seeded challenge, or a unique violation that
+    kills the worker's boot). A transaction-scoped advisory lock makes them
+    take turns: the second waits, then finds everything already there.
+
+    Transaction-scoped on purpose: it works through the transaction pooler
+    (:6543), where a session-level lock could be held by a connection that is
+    handed to someone else. It needs no table and no Redis.
+
+    A no-op on SQLite (local dev and tests: one process). If the lock cannot
+    be taken or released, boot carries on unserialised, exactly as before this
+    existed -- a startup that cannot coordinate must still start.
+    """
+    if not _db_url.startswith("postgresql"):
+        yield
+        return
+    conn = None
+    try:
+        conn = await engine.connect()
+        await conn.begin()
+        await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _STARTUP_LOCK_KEY})
+    except Exception as e:
+        _log.error(f"startup lock unavailable ({type(e).__name__}: {e}); booting unserialised")
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        conn = None
+    try:
+        yield
+    finally:
+        if conn is not None:
+            try:
+                await conn.commit()     # ends the transaction, releasing the lock
+            except Exception as e:
+                _log.warning(f"startup lock release: {type(e).__name__}: {e}")
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
 
 class Base(DeclarativeBase):
@@ -222,6 +288,15 @@ class EvalResult(Base):
     # for that session. The pre-revision score is retained as its own row, so
     # the delta between seeing the feed and acting on it stays measurable.
     is_graded_revision: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Whether this turn has its score yet. NULL: scored when the turn was
+    # taken (every row that predates this column). "pending": the evaluator
+    # failed and a background retry is due. "scored_late": a retry succeeded;
+    # scored_at says when, which analysis needs because the student saw this
+    # score later than the turn (or not at all, if they had left). "failed":
+    # every retry failed; the scores stay NULL. Unscored turns never count
+    # toward the minimum turns and are skipped by every average.
+    score_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -674,7 +749,7 @@ class CorpusDocument(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     openai_file_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    # pending | ready | failed
+    # pending | indexing (claimed by an ingest) | ready | failed
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     uploaded_by_user_id: Mapped[str] = mapped_column(
         String, ForeignKey("users.id"), nullable=False, index=True
@@ -852,7 +927,7 @@ class ArtifactRevision(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     author_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
-    # student_typed | coach_copied | verification_edit
+    # student_typed | coach_copied | coach_pasted | verification_edit
     origin: Mapped[str] = mapped_column(String(32), nullable=False)
     bytes_added: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     bytes_removed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -885,6 +960,8 @@ _SQLITE_ADDED_COLUMNS = [
     ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
     ("classroom_challenges", "team_chat_logging", "VARCHAR(16) NOT NULL DEFAULT 'off'"),
     ("users", "research_ack_version", "INTEGER"),
+    ("eval_results", "score_status", "VARCHAR(16)"),
+    ("eval_results", "scored_at", "DATETIME"),
 ]
 
 
@@ -981,6 +1058,13 @@ async def init_db():
                 "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
                 "team_chat_logging VARCHAR(16) NOT NULL DEFAULT 'off'",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS research_ack_version INTEGER",
+                # Scoring-pending turns (see EvalResult.score_status). NULL for
+                # every existing row, which reads as "scored at the time".
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS score_status VARCHAR(16)",
+                "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS "
+                "scored_at TIMESTAMP WITHOUT TIME ZONE",
+                "CREATE INDEX IF NOT EXISTS ix_eval_results_score_status "
+                "ON eval_results (score_status)",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens
