@@ -5,10 +5,10 @@ import Sidebar from '../components/Sidebar'
 const RESEARCH_ASSISTANTS = [
   { name: 'Yash Phalle', initials: 'YP', bg: '#EDE9FE', color: '#7C3AED',
     degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
-  { name: 'Bernice Mercy Sharon Malaiarasu', initials: 'BM', bg: '#D1FAE5', color: '#059669',
-    degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
   { name: 'Shashank Kadiyala', initials: 'SK', bg: '#E0F2FE', color: '#0891B2',
     degree: 'MS Computer Science', degreeShort: 'MS CS' },
+  { name: 'Bernice Mercy Sharon Malaiarasu', initials: 'BM', bg: '#D1FAE5', color: '#059669',
+    degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
   { name: 'Siddhi Sandip Kakani', initials: 'SK', bg: '#FEF3C7', color: '#D97706',
     degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
 ]
@@ -29,6 +29,15 @@ const STYLES = `
   }
 
   body { font-family: 'DM Sans', sans-serif; }
+
+  /* Research team: two equal columns; the PI card is centred on its own row,
+     exactly one column wide. One column on phones. */
+  .hiw-team { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .hiw-pi { grid-column: 1 / -1; justify-self: center; width: calc(50% - 8px); margin-bottom: 4px; }
+  @media (max-width: 600px) {
+    .hiw-team { grid-template-columns: 1fr; }
+    .hiw-pi { width: 100%; }
+  }
 
   .hiw-reveal {
     opacity: 0;
@@ -240,27 +249,27 @@ export default function HowItWorks() {
         {/* Attribution card */}
         <div className="hiw-reveal" style={{
           background: 'var(--white)', border: '1.5px solid var(--border)',
-          borderRadius: 16, padding: '24px 28px', display: 'inline-block', textAlign: 'left',
-          boxShadow: '0 2px 12px rgba(22,18,14,0.06)', maxWidth: 620,
+          borderRadius: 16, padding: '24px 28px', display: 'inline-block', textAlign: 'center',
+          boxShadow: '0 2px 12px rgba(22,18,14,0.06)', maxWidth: 700,
         }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--ink-3)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 14 }}>
             Research Team
           </div>
-          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+          <div className="hiw-team">
 
             {/* Prof. Wihbey */}
             <a href="https://aimeslab.org/" target="_blank" rel="noopener noreferrer"
-              style={{ textDecoration: 'none', flex: '1 1 100%', minWidth: 200 }}>
+              className="hiw-pi" style={{ textDecoration: 'none' }}>
               <div style={{
-                border: '1.5px solid var(--border)', borderRadius: 12, padding: '14px 16px',
+                background: '#FFF5F5', border: '1.5px solid #FED7D7', borderRadius: 12, padding: '18px 16px',
                 transition: 'border-color 0.15s, box-shadow 0.15s', cursor: 'pointer',
               }}
                 onMouseEnter={e => { e.currentTarget.style.borderColor = '#C8102E'; e.currentTarget.style.boxShadow = '0 4px 14px rgba(200,16,46,0.1)' }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(22,18,14,0.1)'; e.currentTarget.style.boxShadow = 'none' }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = '#FED7D7'; e.currentTarget.style.boxShadow = 'none' }}
               >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 34, height: 34, borderRadius: '50%', background: '#FDE8EC', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: '#C8102E' }}>JW</span>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'var(--white)', border: '1.5px solid #FED7D7', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: '#C8102E' }}>JW</span>
                   </div>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink)' }}>Prof. John P. Wihbey</div>
@@ -271,7 +280,7 @@ export default function HowItWorks() {
                   Professor &amp; Director, AIMES Lab<br />
                   Northeastern University
                 </div>
-                <div style={{ marginTop: 8, fontSize: 10, color: '#C8102E', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <div style={{ marginTop: 8, fontSize: 10, color: '#C8102E', fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
                   aimeslab.org
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#C8102E" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
@@ -282,10 +291,10 @@ export default function HowItWorks() {
 
             {/* Research assistants */}
             {RESEARCH_ASSISTANTS.map(ra => (
-              <div key={ra.name} style={{ flex: '1 1 220px', minWidth: 180, border: '1.5px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 34, height: 34, borderRadius: '50%', background: ra.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: ra.color }}>{ra.initials}</span>
+              <div key={ra.name} style={{ border: '1.5px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <div style={{ width: 40, height: 40, borderRadius: '50%', background: ra.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: ra.color }}>{ra.initials}</span>
                   </div>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink)' }}>{ra.name}</div>
@@ -301,8 +310,8 @@ export default function HowItWorks() {
             ))}
 
           </div>
-          <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--ink-3)', fontStyle: 'italic' }}>
-            A research initiative building AI-ready professionals through real-time prompting feedback and evidence-based skill evaluation
+          <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--ink-3)', fontStyle: 'italic', textWrap: 'balance' }}>
+            A research initiative building AI-ready professionals through real‑time prompting feedback and evidence-based skill evaluation
           </div>
         </div>
       </section>
