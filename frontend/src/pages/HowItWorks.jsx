@@ -1,6 +1,18 @@
 import { useNavigate } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 
+// Research assistants, shown as cards in the hero and as lines in the footer.
+const RESEARCH_ASSISTANTS = [
+  { name: 'Yash Phalle', initials: 'YP', bg: '#EDE9FE', color: '#7C3AED',
+    degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
+  { name: 'Bernice Mercy Sharon Malaiarasu', initials: 'BM', bg: '#D1FAE5', color: '#059669',
+    degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
+  { name: 'Shashank Kadiyala', initials: 'SK', bg: '#E0F2FE', color: '#0891B2',
+    degree: 'MS Computer Science', degreeShort: 'MS CS' },
+  { name: 'Siddhi Sandip Kakani', initials: 'SK', bg: '#FEF3C7', color: '#D97706',
+    degree: 'MS Artificial Intelligence', degreeShort: 'MS AI' },
+]
+
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap');
 
@@ -238,7 +250,7 @@ export default function HowItWorks() {
 
             {/* Prof. Wihbey */}
             <a href="https://aimeslab.org/" target="_blank" rel="noopener noreferrer"
-              style={{ textDecoration: 'none', flex: 1, minWidth: 200 }}>
+              style={{ textDecoration: 'none', flex: '1 1 100%', minWidth: 200 }}>
               <div style={{
                 border: '1.5px solid var(--border)', borderRadius: 12, padding: '14px 16px',
                 transition: 'border-color 0.15s, box-shadow 0.15s', cursor: 'pointer',
@@ -268,23 +280,25 @@ export default function HowItWorks() {
               </div>
             </a>
 
-            {/* Yash Phalle */}
-            <div style={{ flex: 1, minWidth: 180, border: '1.5px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                <div style={{ width: 34, height: 34, borderRadius: '50%', background: '#EDE9FE', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: '#7C3AED' }}>YP</span>
+            {/* Research assistants */}
+            {RESEARCH_ASSISTANTS.map(ra => (
+              <div key={ra.name} style={{ flex: '1 1 220px', minWidth: 180, border: '1.5px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <div style={{ width: 34, height: 34, borderRadius: '50%', background: ra.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: ra.color }}>{ra.initials}</span>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink)' }}>{ra.name}</div>
+                    <div style={{ fontSize: 11, color: ra.color, fontWeight: 600 }}>Research Assistant</div>
+                  </div>
                 </div>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink)' }}>Yash Phalle</div>
-                  <div style={{ fontSize: 11, color: '#7C3AED', fontWeight: 600 }}>Research Assistant</div>
+                <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.55 }}>
+                  AIMES Lab, Northeastern University<br />
+                  {ra.degree}<br />
+                  Khoury College of Computer Sciences
                 </div>
               </div>
-              <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.55 }}>
-                AIMES Lab, Northeastern University<br />
-                MS Artificial Intelligence<br />
-                Khoury College of Computer Sciences
-              </div>
-            </div>
+            ))}
 
           </div>
           <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--ink-3)', fontStyle: 'italic' }}>
@@ -750,8 +764,12 @@ export default function HowItWorks() {
             {' '}at Northeastern University<br />
             <strong style={{ color: '#C8C0B8' }}>Prof. John P. Wihbey</strong>
             <span style={{ color: '#6A6460' }}> - Associate Professor &amp; Director, AIMES Lab · Special Advisor for Strategic AI Initiatives</span><br />
-            <strong style={{ color: '#C8C0B8' }}>Yash Phalle</strong>
-            <span style={{ color: '#6A6460' }}> - Research Assistant, AIMES Lab · MS AI, Khoury College of Computer Sciences</span><br />
+            {RESEARCH_ASSISTANTS.map(ra => (
+              <span key={ra.name}>
+                <strong style={{ color: '#C8C0B8' }}>{ra.name}</strong>
+                <span style={{ color: '#6A6460' }}> - Research Assistant, AIMES Lab · {ra.degreeShort}, Khoury College of Computer Sciences</span><br />
+              </span>
+            ))}
             <span style={{ fontStyle: 'italic' }}>A research initiative building AI-ready professionals through real-time prompting feedback and evidence-based skill evaluation</span>
           </div>
         </div>
