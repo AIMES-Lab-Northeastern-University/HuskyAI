@@ -438,6 +438,37 @@ def test_presence_is_refreshed_while_a_socket_stays_connected():
     assert [m["user_id"] for m in still_there] == ["user-a"]
 
 
+def test_a_crashed_worker_s_member_ageing_out_is_pushed_to_teammates():
+    """A worker that dies sends no leave. Its members age out of the shared
+    set, and the heartbeat must tell the survivors, or their roster shows a
+    ghost until the next join."""
+    import group_room
+
+    async def run():
+        a, b = two_workers()
+        room = GroupRoom("gs-ghost", fanout=a)
+        ws = FakeWS()
+        await b.register("gs-ghost", "sock-dead", "user-gone", "Ghost")  # the worker that dies
+        original = group_room.HEARTBEAT_SEC
+        group_room.HEARTBEAT_SEC = 0.01
+        try:
+            await room.add(ws, "user-a", "Ana")
+            await asyncio.sleep(0.05)
+            quiet = [m for m in ws.sent if m["type"] == "presence"]  # nothing changed yet
+            a._redis.z["husky:room:gs-ghost:members"]["sock-dead"] = time.time() - (MEMBER_TTL_SEC + 5)
+            await asyncio.sleep(0.05)
+            pushed = [m for m in ws.sent if m["type"] == "presence"]
+        finally:
+            group_room.HEARTBEAT_SEC = original
+            await room.remove(ws)
+        return quiet, pushed
+
+    quiet, pushed = asyncio.run(run())
+    assert quiet == [], "an unchanged roster must not be re-sent every heartbeat"
+    assert len(pushed) == 1, pushed
+    assert [m["user_id"] for m in pushed[0]["members"]] == ["user-a"]
+
+
 def test_the_heartbeat_stops_when_the_last_socket_leaves():
     """A room nobody is in must not keep a task alive for the life of the worker."""
     async def run():
