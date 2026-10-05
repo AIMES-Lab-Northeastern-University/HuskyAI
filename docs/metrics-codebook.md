@@ -1,11 +1,23 @@
 # Turn-taking metrics codebook
 
-**Metrics version: 1.1.0** (`METRICS_VERSION` in `backend/analysis/turn_taking.py`,
+**Metrics version: 1.2.0** (`METRICS_VERSION` in `backend/analysis/turn_taking.py`,
 echoed as `metrics_version` in every response.)
 
-Changes since 1.0.0: `coach_reliance.ratio` now draws both of its terms from
-eligible writes only (see below). No other definition changed, so every other
-number is comparable across the two versions.
+Changes in 1.2.0:
+- `read_before_write`: a read only qualifies if a teammate's text was in that
+  section **when it was read**. Before, any earlier expand of a section that was
+  teammate-authored at write time counted, including expanding it while it was
+  still empty or held only the reader's own text. 1.2.0 ratios can only be
+  lower than or equal to 1.1.0 ratios on the same log.
+- `coach_reliance`: writes with `origin` `coach_pasted` (coach text pasted
+  into the editor) now count as coach adoption alongside `coach_copied`
+  ("Copy to document"). Before, a paste counted as `student_typed`.
+
+Changes in 1.1.0: `coach_reliance.ratio` draws both of its terms from eligible
+writes only (see below).
+
+Every other definition is unchanged since 1.0.0. Compare a metric across
+versions only if its definition did not change between them.
 
 Changing any definition here is a **version bump plus a codebook edit**, never a
 silent fix. A number in a paper must be traceable to the definition that
@@ -61,8 +73,10 @@ contributions were never opened can show a perfectly healthy latency.
 
 ### `read_before_write.ratio`
 **The study's central measure.** Of writes that were *eligible*, the proportion
-where the author had already expanded a teammate-authored section earlier in the
-session.
+where the author had already expanded a section **while it held a teammate's
+text**, earlier in the session. Reading an earlier version of a teammate's text
+still counts; expanding a section that was empty, or held only the reader's own
+text, does not (since 1.2.0).
 
 `eligible_writes` counts only writes made when a teammate-authored section
 actually existed to be read. A write cannot be "informed by a teammate" if no
@@ -74,8 +88,10 @@ turns look like students ignoring each other. `null` when nothing was eligible.
 `coach_copied_eligible_writes ÷ (coach_copied_eligible_writes + teammate_informed_writes)`.
 
 Both terms are adoption; the question is adoption of *whose* work. `origin` on
-each write distinguishes text a student typed from text they copied out of their
-coach. `null` when neither occurred.
+each write distinguishes text a student typed from text they took from their
+coach: `coach_copied` (the "Copy to document" button) and, since 1.2.0,
+`coach_pasted` (coach text pasted into the editor) both count as the coach's.
+`null` when neither occurred.
 
 **Both terms are restricted to eligible writes** — writes made when a
 teammate-authored section already existed — so the ratio answers "when a
