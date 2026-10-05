@@ -924,16 +924,34 @@ async def _student_group_mode_challenge_ids(db: AsyncSession, user_id: str) -> s
     return {row[0] for row in r.all()}
 
 
+def _group_settings(row) -> dict:
+    """The assignment settings a student's group-challenge page states as fact:
+    which arm, how big a team is, and whether team chat enters the research
+    record. They come from the row, not from copy that assumes one setup."""
+    _, arm, team_min, team_max, logging = row
+    return {
+        "study_arm": arm or "control_solo_feed",
+        "team_min": team_min or 2,
+        "team_max": team_max or 4,
+        "team_chat_logging": logging if logging in ("off", "metadata", "content") else "off",
+    }
+
+
 async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str):
-    """For a student: (is_group_mode, team_or_None). The team is their prof-assigned
-    GroupChallenge for this challenge in one of their sections, with teammate names.
-    Returns team=None when the challenge is group mode but they aren't assigned yet."""
+    """For a student: (is_group_mode, team_or_None, settings_or_None). The team is
+    their prof-assigned GroupChallenge for this challenge in one of their
+    sections, with teammate names. Returns team=None when the challenge is group
+    mode but they aren't assigned yet. settings are the assignment's group
+    settings (see _group_settings) for the team's section when assigned, else
+    for the first group-mode section the student is in."""
     cids = await _student_classroom_ids(db, user_id)
     if not cids:
-        return False, None
+        return False, None, None
     rows = (
         await db.execute(
-            select(ClassroomChallenge.classroom_id, ClassroomChallenge.study_arm).where(
+            select(ClassroomChallenge.classroom_id, ClassroomChallenge.study_arm,
+                   ClassroomChallenge.team_min, ClassroomChallenge.team_max,
+                   ClassroomChallenge.team_chat_logging).where(
                 ClassroomChallenge.challenge_id == challenge_id,
                 ClassroomChallenge.classroom_id.in_(cids),
                 ClassroomChallenge.mode == "group",
@@ -946,11 +964,12 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
     # point follows configuration rather than offering both and hoping.
     study_arm = next((r[1] for r in rows if r[1]), "control_solo_feed")
     if not group_cids:
-        return False, None
+        return False, None, None
+    settings = _group_settings(rows[0])
 
-    gid = (
+    team = (
         await db.execute(
-            select(GroupChallenge.id)
+            select(GroupChallenge.id, GroupChallenge.classroom_id)
             .join(GroupMember, GroupMember.group_id == GroupChallenge.id)
             .where(
                 GroupChallenge.challenge_id == challenge_id,
@@ -959,9 +978,13 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
             )
             .limit(1)
         )
-    ).scalar_one_or_none()
-    if not gid:
-        return True, None
+    ).first()
+    if not team:
+        return True, None, settings
+    gid, team_cid = team
+    team_row = next((r for r in rows if r[0] == team_cid), None)
+    if team_row is not None:
+        settings = _group_settings(team_row)
 
     names = [
         n
@@ -974,7 +997,7 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
             )
         ).all()
     ]
-    return True, {"group_id": gid, "member_names": names, "study_arm": study_arm}
+    return True, {"group_id": gid, "member_names": names, "study_arm": study_arm}, settings
 
 
 async def _test_enrollment_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
@@ -1348,7 +1371,7 @@ async def get_challenge(
             **(await _finish_hints(db, user_id, challenge_id, us)),
         })
 
-    group_mode, group = await _student_group_info(db, user_id, challenge_id)
+    group_mode, group, group_settings = await _student_group_info(db, user_id, challenge_id)
 
     return {
         "id": ch.id,
@@ -1363,6 +1386,10 @@ async def get_challenge(
         "sessions": sessions_out,
         "group_mode": group_mode,
         "group": group,
+        # Arm, team size and team-chat logging for this student's section, so
+        # the page can describe the setup that will actually run (None when
+        # not a group challenge for this student).
+        "group_settings": group_settings,
         "sections": _sections_of(ch),
     }
 

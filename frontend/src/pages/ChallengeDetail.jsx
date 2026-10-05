@@ -35,6 +35,104 @@ function endReasonBadge(r) {
   return null
 }
 
+const ICONS = {
+  team: <><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></>,
+  chats: <><path d="M14 9a2 2 0 0 1-2 2H6l-3 3V5a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2z"/><path d="M18 9h1a2 2 0 0 1 2 2v8l-3-3h-5a2 2 0 0 1-2-2"/></>,
+  turns: <><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></>,
+  doc: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></>,
+  score: <><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></>,
+  lock: <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></>,
+  wifi: <><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></>,
+}
+
+// What the team-chat logging setting puts in the research record, said plainly.
+// Mirrors docs/event-schema.md (target = group_chat): off emits nothing,
+// metadata records who/when/length, content also exports the (scrubbed) text.
+const TEAM_CHAT_RECORD = {
+  off: "Team chat is saved so your team can scroll back, but it isn't part of the research record.",
+  metadata: 'Team chat is logged for research as who sent a message, when and how long it was — not what it said.',
+  content: 'Team chat is part of the research record, including what each message says.',
+}
+
+/* The "How group challenges work" rows, built from the assignment's real
+ * settings. Each row is a statement of fact to the student, so it follows the
+ * section's arm, team size and team-chat logging rather than assuming one setup. */
+function groupHowItWorks(challenge) {
+  const s = challenge.group_settings || {}
+  const arm = s.study_arm || challenge.group?.study_arm
+  const min = s.team_min, max = s.team_max
+  const size = min && max
+    ? (min === max ? `a team of ${min}` : `a team of ${min}–${max}`)
+    : 'a small team'
+  const built = {
+    title: 'Your instructor builds the team',
+    desc: `You're placed in ${size} — you can't form your own.`,
+    icon: ICONS.team,
+  }
+
+  if (arm === 'collab_coach_artifact') {
+    return [
+      built,
+      {
+        title: 'Your own private coach',
+        desc: 'Each of you has a coach chat only you can see. Ask it anything while you work.',
+        icon: ICONS.chats,
+      },
+      {
+        title: 'One shared document',
+        desc: 'Your team writes a single document split into sections. Anyone can edit any section, and each edit shows who made it.',
+        icon: ICONS.doc,
+      },
+      {
+        title: 'Team chat to coordinate',
+        desc: 'A chat with just your teammates, for planning who writes what. No coach sees it.',
+        icon: ICONS.turns,
+      },
+      {
+        title: 'Your own Husky Score',
+        desc: 'Each prompt you send your coach is scored for you, and the score updates every turn.',
+        icon: ICONS.score,
+      },
+      {
+        title: 'Who sees what',
+        desc: 'Your instructor sees participation and scores. If you agreed to research use, your coach turns and the shared document are part of the research record. '
+          + (TEAM_CHAT_RECORD[s.team_chat_logging] || TEAM_CHAT_RECORD.off),
+        icon: ICONS.lock,
+      },
+    ]
+  }
+
+  const needed = min || 2
+  return [
+    built,
+    {
+      title: 'Two chats, side by side',
+      desc: 'A private Team chat to plan together, plus the shared coach chat where your prompts go to the AI.',
+      icon: ICONS.chats,
+    },
+    {
+      title: 'Take turns with the coach',
+      desc: 'Anyone can send a prompt and each one is labeled with who wrote it, but only one runs at a time — so coordinate.',
+      icon: ICONS.turns,
+    },
+    {
+      title: 'One shared Husky Score',
+      desc: 'The whole team shares a single score that updates every turn, so your prompts build on each other.',
+      icon: ICONS.score,
+    },
+    {
+      title: 'Who sees what',
+      desc: "Your instructor sees participation and scores. The team chat isn't part of the research record.",
+      icon: ICONS.lock,
+    },
+    {
+      title: `${needed} teammates online to chat`,
+      desc: `At least ${needed} of you must be online at the same time to message the coach.`,
+      icon: ICONS.wifi,
+    },
+  ]
+}
+
 export default function ChallengeDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
@@ -305,38 +403,7 @@ export default function ChallengeDetail() {
                     How group challenges work
                   </p>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '13px' }}>
-                    {[
-                      {
-                        title: 'Your instructor builds the team',
-                        desc: "You're placed in a team of 2–4 — you can't form your own.",
-                        icon: <><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></>,
-                      },
-                      {
-                        title: 'Two chats, side by side',
-                        desc: 'A private Team chat to plan together, plus the shared coach chat where your prompts go to the AI.',
-                        icon: <><path d="M14 9a2 2 0 0 1-2 2H6l-3 3V5a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2z"/><path d="M18 9h1a2 2 0 0 1 2 2v8l-3-3h-5a2 2 0 0 1-2-2"/></>,
-                      },
-                      {
-                        title: 'Take turns with the coach',
-                        desc: 'Anyone can send a prompt and each one is labeled with who wrote it, but only one runs at a time — so coordinate.',
-                        icon: <><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></>,
-                      },
-                      {
-                        title: 'One shared Husky Score',
-                        desc: 'The whole team shares a single score that updates every turn, so your prompts build on each other.',
-                        icon: <><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></>,
-                      },
-                      {
-                        title: 'Private to your team',
-                        desc: 'Your instructor sees participation and scores — not your messages. The chat stays between teammates.',
-                        icon: <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></>,
-                      },
-                      {
-                        title: '2 teammates online to chat',
-                        desc: 'At least 2 of you must be online at the same time to message the coach.',
-                        icon: <><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></>,
-                      },
-                    ].map((row, i) => (
+                    {groupHowItWorks(challenge).map((row, i) => (
                       <div key={i} style={{ display: 'flex', gap: '11px', alignItems: 'flex-start' }}>
                         <div style={{ width: '30px', height: '30px', borderRadius: '8px', background: '#EDE9FE', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
