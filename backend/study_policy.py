@@ -22,6 +22,7 @@ from database import AsyncSessionLocal, ClassroomChallenge, GroupChallenge, Grou
 
 ARMS = ("control_solo_feed", "collab_coach_artifact")
 PROMINENCE = ("ambient", "on_request", "isolated")
+TEAM_CHAT_LOGGING = ("off", "metadata", "content")
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class CoachPolicy:
     revision_policy: dict | None = None
     verification_policy: str = "none"
     corpus_vector_store_id: str | None = None
+    team_chat_logging: str = "off"
 
     # -- Questions the handlers ask -------------------------------------------
 
@@ -60,6 +62,17 @@ class CoachPolicy:
         return self.prominence == "ambient"
 
     @property
+    def logs_team_chat(self) -> bool:
+        """Does a team-chat message emit a study event? Metadata only (who,
+        when, length) unless `logs_team_chat_content` too."""
+        return self.team_chat_logging in ("metadata", "content")
+
+    @property
+    def logs_team_chat_content(self) -> bool:
+        """Does the export carry the (scrubbed) text of logged messages?"""
+        return self.team_chat_logging == "content"
+
+    @property
     def is_collab_arm(self) -> bool:
         return self.arm == "collab_coach_artifact"
 
@@ -69,6 +82,7 @@ class CoachPolicy:
             "arm": self.arm,
             "prominence": self.prominence,
             "corpus": self.corpus_vector_store_id,
+            "team_chat_logging": self.team_chat_logging,
         }
 
     def to_dict(self) -> dict:
@@ -111,6 +125,7 @@ async def resolve_for_group_session(group_session_id: str) -> CoachPolicy:
             prominence=_clean(cc.coach_prominence, PROMINENCE, "on_request"),
             revision_policy=cc.revision_policy,
             verification_policy=cc.verification_policy or "none",
+            team_chat_logging=_clean(cc.team_chat_logging, TEAM_CHAT_LOGGING, "off"),
         )
 
 
@@ -130,4 +145,5 @@ async def resolve_for_classroom_challenge(classroom_id: str, challenge_id: str) 
             prominence=_clean(cc.coach_prominence, PROMINENCE, "on_request"),
             revision_policy=cc.revision_policy,
             verification_policy=cc.verification_policy or "none",
+            team_chat_logging=_clean(cc.team_chat_logging, TEAM_CHAT_LOGGING, "off"),
         )

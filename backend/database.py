@@ -141,6 +141,10 @@ class User(Base):
     # When the user accepted the research-use notice. NULL = not yet acknowledged,
     # which is what triggers the blocking acceptance gate on login.
     research_ack_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Which version of the notice they acknowledged. NULL with research_ack_at
+    # set means version 1: every acknowledgement before versioning was of the
+    # original notice. Compared against RESEARCH_NOTICE_VERSION (auth.py).
+    research_ack_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Audit only: when the password last changed. Not used for enforcement.
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -410,6 +414,13 @@ class ClassroomChallenge(Base):
     # Ground-truth material the evaluator scores against. NULL = today's
     # behaviour: the rubric vector store only, and a null grounding score.
     reference_corpus_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Whether the team backchannel enters the research record (pending the PI):
+    #   off      - not logged (today's behaviour); messages are still stored for replay
+    #   metadata - one study event per message: who, when, length. No text.
+    #   content  - as metadata, and the export carries the scrubbed message text
+    team_chat_logging: Mapped[str] = mapped_column(
+        String(16), default="off", nullable=False
+    )
 
 
 class InstructorTestEnrollment(Base):
@@ -616,8 +627,9 @@ class VerificationAssignment(Base):
     routing_policy: Mapped[str] = mapped_column(String(32), default="round_robin", nullable=False)
     assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     due_turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Stored status is only ever "pending", "expired" or "reassigned". Every
-    # other outcome is DERIVED from the response and the read log at
+    # Stored status is only ever "pending", "responded", "expired" or
+    # "reassigned". "responded" means a verdict row exists and nothing more;
+    # every outcome is DERIVED from the response and the read log at
     # classification time — a self-reported "completed" would record that a
     # reviewer pressed a button, not that they read anything. "reassigned" is
     # stored because it is an instructor action, not reviewer behaviour: without
@@ -947,6 +959,8 @@ _SQLITE_ADDED_COLUMNS = [
     ("verification_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("contested_responses", "consent_research", "BOOLEAN NOT NULL DEFAULT 0"),
     ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
+    ("classroom_challenges", "team_chat_logging", "VARCHAR(16) NOT NULL DEFAULT 'off'"),
+    ("users", "research_ack_version", "INTEGER"),
     ("eval_results", "score_status", "VARCHAR(16)"),
     ("eval_results", "scored_at", "DATETIME"),
 ]
@@ -1042,6 +1056,9 @@ async def init_db():
                 "consent_research BOOLEAN NOT NULL DEFAULT false",
                 "ALTER TABLE verification_assignments ADD COLUMN IF NOT EXISTS "
                 "replaces_assignment_id VARCHAR",
+                "ALTER TABLE classroom_challenges ADD COLUMN IF NOT EXISTS "
+                "team_chat_logging VARCHAR(16) NOT NULL DEFAULT 'off'",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS research_ack_version INTEGER",
                 # Scoring-pending turns (see EvalResult.score_status). NULL for
                 # every existing row, which reads as "scored at the time".
                 "ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS score_status VARCHAR(16)",

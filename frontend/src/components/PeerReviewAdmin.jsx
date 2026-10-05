@@ -206,7 +206,10 @@ export function PeerReviewsPanel({ baseUrl, team }) {
           <div style={{ fontSize: '12px', fontWeight: 600, color: '#16120E', marginBottom: '6px' }}>Session {s.session_number}</div>
           <div style={{ display: 'grid', gap: '6px' }}>
             {s.assignments.map(a => {
-              const pending = a.status === 'pending' && a.outcome === 'skipped_no_response'
+              // Not after the session ends: the server refuses it, because a
+              // reviewer added then could not read or answer anything that counts.
+              const pending = s.status !== 'completed'
+                && a.status === 'pending' && a.outcome === 'skipped_no_response'
               const options = members.filter(m => m.user_id !== a.author_user_id && m.user_id !== a.reviewer_user_id)
               return (
                 <div key={a.assignment_id} data-testid="review-row"

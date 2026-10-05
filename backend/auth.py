@@ -34,6 +34,44 @@ _PASSWORD_MAX = 256
 _RESET_TTL_MINUTES = int(os.getenv("RESET_TTL_MINUTES", "60"))
 
 
+# ── Research notice ──────────────────────────────────────────────────────────
+# Both read per call, not at import, so a deploy (or a test) can change them
+# without a code edit. Neither changes anything until set:
+#   RESEARCH_NOTICE_VERSION        raise it when approved new consent wording
+#                                  ships; everyone who acknowledged an older
+#                                  version sees the gate again. Default 1.
+#   RESEARCH_NOTICE_ALLOW_DECLINE  "1" adds a "use HuskyAI without taking part"
+#                                  choice to the gate. Off until the IRB-approved
+#                                  wording calls for it.
+def research_notice_version() -> int:
+    try:
+        return max(1, int(os.getenv("RESEARCH_NOTICE_VERSION", "1")))
+    except ValueError:
+        return 1
+
+
+def research_notice_allows_decline() -> bool:
+    return os.getenv("RESEARCH_NOTICE_ALLOW_DECLINE", "").strip().lower() in ("1", "true", "yes")
+
+
+def research_acknowledged(u) -> bool:
+    """Has this user acknowledged the notice currently in force? An
+    acknowledgement from before versioning (research_ack_version NULL) counts
+    as version 1."""
+    if getattr(u, "research_ack_at", None) is None:
+        return False
+    return (getattr(u, "research_ack_version", None) or 1) >= research_notice_version()
+
+
+def _research_fields(u) -> dict:
+    return {
+        "consent_research": bool(getattr(u, "consent_research", False)),
+        "research_acknowledged": research_acknowledged(u),
+        "research_notice_version": research_notice_version(),
+        "research_notice_allow_decline": research_notice_allows_decline(),
+    }
+
+
 def _validate_password(v: str) -> str:
     """Shared by register and reset, so reset can never be the weaker path."""
     if len(v) < _PASSWORD_MIN:
@@ -99,6 +137,8 @@ class TokenResponse(BaseModel):
     is_platform_admin: bool = False
     consent_research: bool = False
     research_acknowledged: bool = False
+    research_notice_version: int = 1
+    research_notice_allow_decline: bool = False
 
 
 class MeResponse(BaseModel):
@@ -108,6 +148,8 @@ class MeResponse(BaseModel):
     is_platform_admin: bool = False
     consent_research: bool = False
     research_acknowledged: bool = False
+    research_notice_version: int = 1
+    research_notice_allow_decline: bool = False
 
 
 class UpdateMeRequest(BaseModel):
@@ -115,6 +157,9 @@ class UpdateMeRequest(BaseModel):
     # accept_research_notice. Both are optional so either flow can call PATCH /me.
     consent_research: bool | None = None
     accept_research_notice: bool | None = None
+    # The gate's "use HuskyAI without taking part" choice. Only accepted while
+    # RESEARCH_NOTICE_ALLOW_DECLINE is on.
+    decline_research_notice: bool | None = None
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -202,8 +247,7 @@ async def register(req: RegisterRequest):
         name=user.name,
         email=user.email,
         is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
-        consent_research=bool(getattr(user, "consent_research", False)),
-        research_acknowledged=getattr(user, "research_ack_at", None) is not None,
+        **_research_fields(user),
     )
 
 
@@ -224,8 +268,7 @@ async def login(req: LoginRequest, request: Request):
         name=user.name,
         email=user.email,
         is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
-        consent_research=bool(getattr(user, "consent_research", False)),
-        research_acknowledged=getattr(user, "research_ack_at", None) is not None,
+        **_research_fields(user),
     )
 
 
@@ -338,16 +381,17 @@ async def me(user_id: str = Depends(_bearer_user_id)):
             name=u.name,
             email=u.email,
             is_platform_admin=bool(getattr(u, "is_platform_admin", False)),
-            consent_research=bool(getattr(u, "consent_research", False)),
-            research_acknowledged=getattr(u, "research_ack_at", None) is not None,
+            **_research_fields(u),
         )
 
 
 @router.patch("/me", response_model=MeResponse)
 async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id)):
     """Update the caller's research settings. Two flows:
-      - accept_research_notice=True: the one-time blocking acceptance. Stamps
-        research_ack_at and turns consent on.
+      - accept_research_notice=True: the blocking acceptance. Stamps
+        research_ack_at with the current notice version and turns consent on.
+      - decline_research_notice=True: the gate's decline choice, when enabled.
+        Stamps the same acknowledgement and turns consent off.
       - consent_research=<bool>: the Settings toggle, to opt out/in later.
     Consent governs FUTURE turns only — each turn snapshots it when scored
     (see _save_turn)."""
@@ -355,10 +399,16 @@ async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id
         u = await db.get(User, user_id)
         if not u:
             raise HTTPException(status_code=404, detail="User not found")
-        if req.accept_research_notice:
+        if req.accept_research_notice or req.decline_research_notice:
+            if req.decline_research_notice and not research_notice_allows_decline():
+                raise HTTPException(status_code=400, detail="Declining is not enabled")
+            # research_ack_at keeps the FIRST acknowledgement — it is an audit
+            # record and is never overwritten; the version says which notice
+            # the latest acknowledgement was of.
             if u.research_ack_at is None:
                 u.research_ack_at = datetime.utcnow()
-            u.consent_research = True
+            u.research_ack_version = research_notice_version()
+            u.consent_research = bool(req.accept_research_notice)
         elif req.consent_research is not None:
             u.consent_research = bool(req.consent_research)
         await db.commit()
@@ -368,6 +418,5 @@ async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id
             name=u.name,
             email=u.email,
             is_platform_admin=bool(getattr(u, "is_platform_admin", False)),
-            consent_research=bool(u.consent_research),
-            research_acknowledged=u.research_ack_at is not None,
+            **_research_fields(u),
         )

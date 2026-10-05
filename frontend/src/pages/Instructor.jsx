@@ -79,6 +79,7 @@ function StudySettings({ cc, onSaved }) {
   const [verification, setVerification] = useState(cc.verification_policy || 'none')
   // Turn after which one graded revision is required; '' = no revision step.
   const [revisionTurn, setRevisionTurn] = useState(cc.require_revision_on_turn ?? '')
+  const [teamChatLogging, setTeamChatLogging] = useState(cc.team_chat_logging || 'off')
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState(null)
 
@@ -90,6 +91,7 @@ function StudySettings({ cc, onSaved }) {
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ study_arm: arm, coach_prominence: prominence,
                                verification_policy: verification,
+                               team_chat_logging: teamChatLogging,
                                require_revision_on_turn: revisionTurn === '' ? null : Number(revisionTurn) }),
       })
       if (r.ok) { setMsg('Saved.'); onSaved?.(await r.json()) }
@@ -121,10 +123,23 @@ function StudySettings({ cc, onSaved }) {
         <span style={lbl}>Coach behaviour</span>
         <select value={prominence} onChange={e => setProminence(e.target.value)} style={sel}>
           <option value="on_request">Answers when asked</option>
-          <option value="ambient">Reacts to the document unprompted</option>
+          {/* Visible but not selectable: nothing in the backend acts on
+              `ambient` yet (CoachPolicy.takes_unsolicited_turns and
+              posts_to_shared_space are unused), so choosing it would run
+              "Answers when asked" while every event says "ambient". */}
+          <option value="ambient" disabled>Reacts to the document unprompted (not built yet)</option>
           <option value="isolated">Cannot see the team's document</option>
         </select>
       </div>
+      {prominence === 'ambient' && (
+        <div role="alert" style={{ fontSize: '11px', color: '#B45309', background: '#FFFBEB',
+                                   border: '1px solid #FCD34D', borderRadius: '7px', padding: '8px 10px',
+                                   lineHeight: 1.6, margin: '-2px 0 8px 160px' }}>
+          This assignment is saved as "Reacts to the document unprompted", which is not
+          built yet: the coach actually answers only when asked, but its events are
+          labelled as the unprompted condition. Pick another coach behaviour and save.
+        </div>
+      )}
 
       <div style={row}>
         <span style={lbl}>Peer review</span>
@@ -140,6 +155,26 @@ function StudySettings({ cc, onSaved }) {
           Pick reviewers per team under Manage teams. A student with no reviewer
           picked gets no review — it never falls back to round robin.
         </div>
+      )}
+
+      {arm === 'collab_coach_artifact' && (
+        <>
+          <div style={row}>
+            <span style={lbl}>Team chat in research</span>
+            <select value={teamChatLogging} onChange={e => setTeamChatLogging(e.target.value)} style={sel}>
+              <option value="off">Not recorded</option>
+              <option value="metadata">Who and when only, no text</option>
+              <option value="content">Full messages (anonymised)</option>
+            </select>
+          </div>
+          {teamChatLogging !== 'off' && (
+            <div style={{ fontSize: '11px', color: '#9A948E', lineHeight: 1.6, margin: '-2px 0 8px 160px' }}>
+              Only use this once the PI has chosen it and the consent notice covers it.
+              Each message is recorded under the setting in force when it was sent, so
+              changing this later never adds text from earlier messages.
+            </div>
+          )}
+        </>
       )}
 
       {arm === 'control_solo_feed' && (
@@ -1569,7 +1604,9 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
-                                        {editFeed.length > 0 && (
+                                        {/* Group/collab assignments never show the
+                                            solo score feed, so the toggles would do nothing there. */}
+                                        {editFeed.length > 0 && c.mode !== 'group' && (
                                           <div style={{ display: 'grid', gap: '4px' }}>
                                             <div style={{ fontSize: '12px', color: '#4A4440' }}>Show score feed to students in</div>
                                             <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>

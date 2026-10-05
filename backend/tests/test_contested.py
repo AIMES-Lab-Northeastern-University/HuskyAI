@@ -159,7 +159,8 @@ def test_adopting_without_opening_either_option_is_recorded_as_uninspected(app_r
     assert out["pairs"][0]["uninspected_adoption"] is True
 
 
-def test_expanding_the_section_first_records_an_inspected_adoption(app_ready):
+def test_opening_an_option_first_records_an_inspected_adoption(app_ready):
+    """Only opening the option itself counts; expanding the section does not."""
     gid, users, admin = asyncio.run(_team())
     client = TestClient(app_ready)
     with _connect(client, gid, users[0]) as ws:
@@ -172,11 +173,13 @@ def test_expanding_the_section_first_records_an_inspected_adoption(app_ready):
     with _connect(client, gid, users[0]) as ws:
         _until(ws, {"artifact"})
         ws.send_text(json.dumps({"type": "artifact_expand", "section_key": "s1"}))
+        ws.send_text(json.dumps({"type": "contested_option_expand", "pair_id": pair, "option": "a"}))
         ws.send_text(json.dumps({"type": "artifact_write", "section_key": None}))  # fence
         _until(ws, {"artifact_error"})
 
     r = client.post(f"/contested/pairs/{pair}/adopt", json={"adopted": "a"}, headers=hdr)
     assert r.json()["inspected_a"] is True
+    assert r.json()["inspected_b"] is False, "expanding the section is not opening option b"
 
 
 def test_a_read_from_before_the_pair_was_surfaced_does_not_count(app_ready):

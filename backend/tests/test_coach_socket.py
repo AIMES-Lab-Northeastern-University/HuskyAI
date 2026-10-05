@@ -553,7 +553,11 @@ def test_a_coach_turn_marks_the_group_session_started(app_ready, stub_model):
                 row = await db.get(GroupSession, gs)
                 return row.status, row.started_at
 
-        assert asyncio.run(status()) == ("not_started", None)
+        # The clock starts on connect (the timer runs from it); the status
+        # waits for a real turn.
+        st, started = asyncio.run(status())
+        assert st == "not_started"
+        assert started is not None
 
         ws.send_text(json.dumps({"type": "message", "content": "hello"}))
         _drain_until(ws, {"done", "error"})
@@ -882,6 +886,7 @@ def test_the_resolved_condition_is_stamped_on_every_event(app_ready, stub_model)
     turns = asyncio.run(_events(gs, "turn"))
     assert turns[0].condition == {
         "arm": "collab_coach_artifact", "prominence": "on_request", "corpus": None,
+        "team_chat_logging": "off",
     }
 
 
@@ -963,3 +968,257 @@ def test_unchanged_save_acks_without_broadcasting_or_logging(app_ready):
     assert len(spy.of_type("artifact_updated")) == 1, "only the real edit reaches teammates"
     assert spy.of_type("verification_assigned") == []
     assert len(asyncio.run(_events(gs, "write"))) == 1
+
+
+@pytest.mark.parametrize("path", ["/ws/coach", "/ws/group"])
+def test_a_socket_that_drops_during_the_handshake_leaves_the_room(app_ready, monkeypatch, path):
+    """room.add() used to run before the try/finally that removes the socket,
+    so a client that disconnected during the handshake sends stayed in the
+    room for good. Under Redis the heartbeat then kept refreshing that ghost,
+    showing an absent student online to their teammates."""
+    import main
+    from fastapi import WebSocketDisconnect
+    from group_room import rooms
+
+    async def drop(_group_id):
+        raise WebSocketDisconnect(1001)
+
+    # Called after room.add(), part-way through the handshake.
+    monkeypatch.setattr(main, "_load_team_chat", drop)
+    group_id, users = asyncio.run(_make_team(1))
+    client = TestClient(app_ready)
+
+    try:
+        with client.websocket_connect(
+            f"{path}?token={_token(users[0])}&group_id={group_id}&session_num=1"
+        ) as ws:
+            _drain_until(ws, {"session_init"})
+    except Exception:
+        pass   # the server closed the socket, which is the point
+
+    gs = asyncio.run(_group_session_id(group_id))
+    room = rooms.peek(gs)
+    assert room is None or not room.connections, "the dropped socket is still in the room"
+
+
+# ── The team timer ───────────────────────────────────────────────────────────
+# GroupSession carried time_limit_minutes / started_at / end_reason but nothing
+# in /ws/coach read them, so a timed assignment ran untimed for every team.
+
+
+async def _time_team(group_id, minutes, started_seconds_ago=None):
+    """Give the team's challenge a time limit and, optionally, a clock that
+    started `started_seconds_ago` (the session row is created here if needed)."""
+    from datetime import datetime, timedelta
+
+    from database import AsyncSessionLocal, Challenge, GroupChallenge, GroupSession
+
+    async with AsyncSessionLocal() as db:
+        team = await db.get(GroupChallenge, group_id)
+        ch = await db.get(Challenge, team.challenge_id)
+        ch.time_limit_minutes = minutes
+        if started_seconds_ago is not None:
+            db.add(GroupSession(
+                group_id=group_id, challenge_id=ch.id, session_number=1,
+                status="in_progress", time_limit_minutes=minutes,
+                started_at=datetime.utcnow() - timedelta(seconds=started_seconds_ago),
+            ))
+        await db.commit()
+
+
+async def _gs_row(group_id):
+    from sqlalchemy import select
+
+    from database import AsyncSessionLocal, GroupSession
+
+    async with AsyncSessionLocal() as db:
+        return (await db.execute(
+            select(GroupSession).where(GroupSession.group_id == group_id)
+        )).scalar_one()
+
+
+def test_a_timed_session_sends_its_deadline_on_connect(app_ready):
+    group_id, users = asyncio.run(_make_team(1))
+    asyncio.run(_time_team(group_id, 20))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        init = _drain_until(ws, {"session_init"})
+
+    assert init["time_limit_minutes"] == 20
+    assert 20 * 60 - 5 <= init["remaining_seconds"] <= 20 * 60
+    assert init["deadline"].endswith("Z")
+    row = asyncio.run(_gs_row(group_id))
+    assert row.time_limit_minutes == 20, "the limit is snapshotted when the clock starts"
+
+
+def test_an_untimed_session_sends_no_deadline(app_ready):
+    group_id, users = asyncio.run(_make_team(1))
+    client = TestClient(app_ready)
+    with _connect(client, group_id, users[0]) as ws:
+        init = _drain_until(ws, {"session_init"})
+    assert init["remaining_seconds"] is None and init["deadline"] is None
+
+
+def test_a_write_past_the_deadline_ends_the_session_for_everyone(app_ready):
+    """Decided server-side on the next action, with the reason recorded as the
+    timer, and announced to every teammate with the same summary."""
+    from datetime import datetime, timedelta
+
+    from database import AsyncSessionLocal, GroupSession
+    from group_room import rooms
+
+    group_id, users = asyncio.run(_make_team(2))
+    asyncio.run(_time_team(group_id, 1))
+    client = TestClient(app_ready)
+    spy = _SpyWS()
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        gs = asyncio.run(_group_session_id(group_id))
+        asyncio.run(rooms.peek(gs).add(spy, users[1], "Member1"))
+
+        # The clock ran out while this socket was open.
+        async def backdate():
+            async with AsyncSessionLocal() as db:
+                row = await db.get(GroupSession, gs)
+                row.started_at = datetime.utcnow() - timedelta(minutes=2)
+                await db.commit()
+        asyncio.run(backdate())
+        # The socket's deadline was fixed at connect; reconnect to pick up the
+        # backdated one, as the server would after a real minute.
+    with _connect(client, group_id, users[0]) as ws:
+        ended = _drain_until(ws, {"session_ended"})
+        ws.send_text(json.dumps({"type": "artifact_write", "section_key": "body",
+                                 "content": "late", "expected_version": 0}))
+        err = _drain_until(ws, {"artifact_error", "artifact_write_ok"})
+
+    assert err["type"] == "artifact_error"
+    assert ended["end_reason"] == "timer_expired"
+    assert ended["summary"]["arm"] == "collab_coach_artifact"
+    row = asyncio.run(_gs_row(group_id))
+    assert (row.status, row.end_reason) == ("completed", "timer_expired")
+    # The teammate's tab was told by the lazy expiry on connect.
+    frames = spy.of_type("session_ended")
+    assert len(frames) == 1, "announced once"
+    assert frames[0]["end_reason"] == "timer_expired"
+    assert frames[0]["ended_by_user_id"] is None
+    assert set(frames[0]["summary"]["per_student"]) == {users[0]}
+    assert len(asyncio.run(_events(gs, "write"))) == 0
+
+
+def test_an_idle_team_is_ended_by_the_timer(app_ready):
+    """Nobody acts after the deadline, and the session still ends."""
+    group_id, users = asyncio.run(_make_team(1))
+    # One minute limit, started 59 s ago: about a second left.
+    asyncio.run(_time_team(group_id, 1, started_seconds_ago=59))
+    client = TestClient(app_ready)
+
+    with _connect(client, group_id, users[0]) as ws:
+        init = _drain_until(ws, {"session_init"})
+        ended = _drain_until(ws, {"session_ended"})
+
+    assert init["remaining_seconds"] <= 1
+    assert ended["end_reason"] == "timer_expired"
+    row = asyncio.run(_gs_row(group_id))
+    assert (row.status, row.end_reason) == ("completed", "timer_expired")
+
+
+def test_expiry_completes_and_announces_exactly_once(app_ready, monkeypatch):
+    """Every socket on every worker runs a timer; only one may end the session."""
+    import main
+
+    group_id, users = asyncio.run(_make_team(2))
+    asyncio.run(_time_team(group_id, 1, started_seconds_ago=120))
+    client = TestClient(app_ready)
+    with _connect(client, group_id, users[0]):
+        pass   # creates the private conversation; the lazy expiry ends it here
+
+    # Re-open it, then race several expiries against each other.
+    async def reopen():
+        from database import AsyncSessionLocal, GroupSession
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, (await _gs_row(group_id)).id)
+            gs.status, gs.completed_at, gs.end_reason = "in_progress", None, None
+            await db.commit()
+            return gs.id
+    gs = asyncio.run(reopen())
+
+    calls = []
+
+    async def count(gsid, detail=None):
+        calls.append(detail)
+    monkeypatch.setattr(main, "_notify_session_ended", count)
+
+    async def race():
+        return await asyncio.gather(*[main._expire_coach_session_if_due(gs) for _ in range(4)])
+    assert all(asyncio.run(race()))
+    assert len(calls) == 1
+    assert calls[0]["end_reason"] == "timer_expired"
+
+
+def test_a_manual_end_reaches_teammates_with_the_summary_and_who_ended_it(app_ready, stub_model):
+    """Teammates used to get a bare "Session ended." with no figures and no
+    indication who ended it or why."""
+    from group_room import rooms
+
+    group_id, users = asyncio.run(_make_team(2))
+    client = TestClient(app_ready)
+    spy = _SpyWS()
+
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        gs = asyncio.run(_group_session_id(group_id))
+        asyncio.run(rooms.peek(gs).add(spy, users[1], "Member1"))
+        ws.send_text(json.dumps({"type": "message", "content": "hello coach"}))
+        _drain_until(ws, {"done", "error"})
+        _drain_until(ws, {"eval", "eval_error"})
+
+        r = client.post(f"/groups/{group_id}/sessions/1/end",
+                        headers={"Authorization": f"Bearer {_token(users[0])}"})
+        assert r.status_code == 200, r.text
+        mine = _drain_until(ws, {"session_ended"})
+
+    frames = spy.of_type("session_ended")
+    assert len(frames) == 1
+    f = frames[0]
+    assert f["end_reason"] == "manual"
+    assert f["ended_by_user_id"] == users[0] and f["ended_by_name"] == "Member0"
+    assert f["summary"] == r.json(), "teammates see exactly what the ender sees"
+    assert f["summary"]["per_student"][users[0]]["name"] == "Member0"
+    assert mine["summary"] == r.json()
+
+    # Ending again changes nothing and announces nothing.
+    r2 = client.post(f"/groups/{group_id}/sessions/1/end",
+                     headers={"Authorization": f"Bearer {_token(users[1])}"})
+    assert r2.status_code == 200 and r2.json()["end_reason"] == "manual"
+    assert len(spy.of_type("session_ended")) == 1
+
+    # A tab reopening the finished session gets the same summary.
+    with _connect(client, group_id, users[1]) as ws:
+        reopened = _drain_until(ws, {"session_ended"})
+    assert reopened["summary"]["session_avg_pei"] == r.json()["session_avg_pei"]
+    assert reopened["end_reason"] == "manual"
+
+
+def test_an_end_pressed_after_the_deadline_records_the_timer(app_ready):
+    group_id, users = asyncio.run(_make_team(1))
+    client = TestClient(app_ready)
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+
+    async def expire_clock():
+        from datetime import datetime, timedelta
+
+        from database import AsyncSessionLocal, GroupSession
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, (await _gs_row(group_id)).id)
+            gs.time_limit_minutes = 1
+            gs.started_at = datetime.utcnow() - timedelta(minutes=5)
+            await db.commit()
+    asyncio.run(expire_clock())
+
+    r = client.post(f"/groups/{group_id}/sessions/1/end",
+                    headers={"Authorization": f"Bearer {_token(users[0])}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["end_reason"] == "timer_expired"

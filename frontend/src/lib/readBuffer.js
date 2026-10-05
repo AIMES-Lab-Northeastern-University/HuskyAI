@@ -154,5 +154,23 @@ export function createReadSender({ scope, socket, now = () => new Date().toISOSt
     pending() {
       return loadBuffer(key)
     },
+
+    /**
+     * Resolve once the server has acked every buffered event matching
+     * `predicate`, or after `timeoutMs`. Resolves true if they all landed.
+     *
+     * For an action sent over HTTP that the server judges from reads sent over
+     * the socket (adopting a contested option is judged on the option's
+     * expand/dwell events): the two travel separately, so without waiting the
+     * HTTP request can arrive first and be judged on a log that is missing them.
+     */
+    async settled(predicate, timeoutMs = 3000, pollMs = 50) {
+      const deadline = Date.now() + timeoutMs
+      while (loadBuffer(key).some(predicate)) {
+        if (Date.now() >= deadline) return false
+        await new Promise((r) => setTimeout(r, pollMs))
+      }
+      return true
+    },
   }
 }

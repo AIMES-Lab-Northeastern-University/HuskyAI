@@ -201,6 +201,45 @@ def test_free_text_is_scrubbed(app_ready):
     assert "[EMAIL]" in content and "[PHONE]" in content
 
 
+def test_a_teammate_named_in_someone_else_s_revision_is_scrubbed(app_ready):
+    """Scrubbing used to run against the author only, so A writing B's name or
+    address into the shared document put B's identity in the export."""
+    from database import AsyncSessionLocal, User
+
+    gid, users, admin = asyncio.run(_team())
+
+    async def b_email():
+        async with AsyncSessionLocal() as db:
+            return (await db.get(User, users[1])).email
+    email_b = asyncio.run(b_email())
+
+    client = TestClient(app_ready)
+    with _connect(client, gid, users[0]) as ws:
+        _until(ws, {"artifact"})
+        ws.send_text(json.dumps({
+            "type": "artifact_write", "section_key": "s1",
+            "content": f"Quillfeather1 owns step 2; ask {email_b.upper()}.",
+            "expected_version": 0,
+        }))
+        _until(ws, {"artifact_write_ok"})
+
+    gs = asyncio.run(_gs_id(gid))
+    bundle = client.get(f"/research/sessions/{gs}/export",
+                        headers={"Authorization": f"Bearer {_token(admin)}"}).json()
+    content = bundle["artifact_revisions"][0]["content"]
+    assert "Quillfeather1" not in content
+    assert email_b.split("@")[0] not in content.lower()
+    assert content == "[NAME] owns step 2; ask [EMAIL]."
+
+
+def test_scrub_people_redacts_every_named_person():
+    from anonymize import scrub_people
+
+    out = scrub_people("Ana told Ben Okafor to email ana.r@x.edu",
+                       [("Ana Ruiz", "ana.r@x.edu"), ("Ben Okafor", None)])
+    assert out == "[NAME] told [NAME] [NAME] to email [EMAIL]"
+
+
 # ── Consent ──────────────────────────────────────────────────────────────────
 
 def test_rows_from_a_non_consenting_student_are_excluded(app_ready, stub_model):
