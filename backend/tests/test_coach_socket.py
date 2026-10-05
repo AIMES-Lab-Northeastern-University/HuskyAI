@@ -964,3 +964,34 @@ def test_unchanged_save_acks_without_broadcasting_or_logging(app_ready):
     assert len(spy.of_type("artifact_updated")) == 1, "only the real edit reaches teammates"
     assert spy.of_type("verification_assigned") == []
     assert len(asyncio.run(_events(gs, "write"))) == 1
+
+
+@pytest.mark.parametrize("path", ["/ws/coach", "/ws/group"])
+def test_a_socket_that_drops_during_the_handshake_leaves_the_room(app_ready, monkeypatch, path):
+    """room.add() used to run before the try/finally that removes the socket,
+    so a client that disconnected during the handshake sends stayed in the
+    room for good. Under Redis the heartbeat then kept refreshing that ghost,
+    showing an absent student online to their teammates."""
+    import main
+    from fastapi import WebSocketDisconnect
+    from group_room import rooms
+
+    async def drop(_group_id):
+        raise WebSocketDisconnect(1001)
+
+    # Called after room.add(), part-way through the handshake.
+    monkeypatch.setattr(main, "_load_team_chat", drop)
+    group_id, users = asyncio.run(_make_team(1))
+    client = TestClient(app_ready)
+
+    try:
+        with client.websocket_connect(
+            f"{path}?token={_token(users[0])}&group_id={group_id}&session_num=1"
+        ) as ws:
+            _drain_until(ws, {"session_init"})
+    except Exception:
+        pass   # the server closed the socket, which is the point
+
+    gs = asyncio.run(_group_session_id(group_id))
+    room = rooms.peek(gs)
+    assert room is None or not room.connections, "the dropped socket is still in the room"

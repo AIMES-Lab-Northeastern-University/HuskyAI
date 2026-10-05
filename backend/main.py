@@ -2358,60 +2358,62 @@ async def group_websocket_endpoint(
         log.critical(f"[WS-GROUP] collaboration backend unavailable: {e}")
         await websocket.close(code=4005, reason="Collaboration backend unavailable")
         return
-    log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
+    # Inside the try from here, so the socket is removed even when the
+    # client drops during the handshake (see /ws/coach).
+    try:
+        log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
 
-    # --- Initial state to the connecting client only ---
-    await websocket.send_text(json.dumps({
-        "type": "session_init",
-        "conversation_id": conversation_id,
-        "group_id": group_id,
-        "session_num": session_num,
-        "turn_count": len(room.history) // 2,
-    }))
-    if session_data:
+        # --- Initial state to the connecting client only ---
         await websocket.send_text(json.dumps({
-            "type": "challenge_context",
-            "data": {
-                "title": session_data.get("title"),
-                "goal": session_data.get("goal"),
-                "brief": session_data.get("brief"),
-                "seed_question": session_data.get("seed_question"),
-            },
-        }))
-    if room.history:
-        client_history = [
-            {
-                "role": m["role"],
-                "content": m["content"],
-                "sender_user_id": m.get("sender_user_id"),
-                "sender_name": m.get("sender_name"),
-                "attachments": [
-                    {"name": a.get("filename") or a.get("name")} for a in m.get("attachments", [])
-                ],
-            }
-            for m in room.history
-        ]
-        await websocket.send_text(json.dumps({
-            "type": "history",
-            "messages": client_history,
+            "type": "session_init",
+            "conversation_id": conversation_id,
+            "group_id": group_id,
+            "session_num": session_num,
             "turn_count": len(room.history) // 2,
         }))
+        if session_data:
+            await websocket.send_text(json.dumps({
+                "type": "challenge_context",
+                "data": {
+                    "title": session_data.get("title"),
+                    "goal": session_data.get("goal"),
+                    "brief": session_data.get("brief"),
+                    "seed_question": session_data.get("seed_question"),
+                },
+            }))
+        if room.history:
+            client_history = [
+                {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "sender_user_id": m.get("sender_user_id"),
+                    "sender_name": m.get("sender_name"),
+                    "attachments": [
+                        {"name": a.get("filename") or a.get("name")} for a in m.get("attachments", [])
+                    ],
+                }
+                for m in room.history
+            ]
+            await websocket.send_text(json.dumps({
+                "type": "history",
+                "messages": client_history,
+                "turn_count": len(room.history) // 2,
+            }))
 
-    # Replay the team backchannel (separate stream; never touches the coach/LLM).
-    team_chat = await _load_team_chat(group_id)
-    if team_chat:
-        await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
+        # Replay the team backchannel (separate stream; never touches the coach/LLM).
+        team_chat = await _load_team_chat(group_id)
+        if team_chat:
+            await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
 
-    # Joining a finished session is read-only: history, no new turns.
-    group_ended = await _group_session_completed(group_session_id)
-    if group_ended:
-        await websocket.send_text(json.dumps({"type": "session_ended"}))
+        # Joining a finished session is read-only: history, no new turns.
+        group_ended = await _group_session_completed(group_session_id)
+        if group_ended:
+            await websocket.send_text(json.dumps({"type": "session_ended"}))
 
-    # Tell everyone (including this client) who is now present.
-    await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+        # Tell everyone (including this client) who is now present.
+        await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
 
-    try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
@@ -2799,125 +2801,129 @@ async def coach_websocket_endpoint(
         await websocket.close(code=4005, reason="Collaboration backend unavailable")
         return
 
-    state = room.private_state(user_id, conversation_id)
-    if not state["loaded"]:
-        state["history"] = await _load_private_history(conversation_id)
-        state["loaded"] = True
-
-    log.info(
-        f"[WS-COACH] {user_id[:8]} joined group={group_id[:8]} session={session_num} "
-        f"({len(room.connections)} sockets live)"
-    )
-
-    await websocket.send_text(json.dumps({
-        "type": "session_init",
-        "conversation_id": conversation_id,
-        "group_id": group_id,
-        # The client needs this to fetch its review inbox and contested pairs;
-        # both are session-scoped and there is no other way to derive it.
-        "group_session_id": group_session_id,
-        "session_num": session_num,
-        "turn_count": len(state["history"]) // 2,
-        "condition": condition,
-    }))
-    if session_data:
-        await websocket.send_text(json.dumps({
-            "type": "challenge_context",
-            "data": {
-                "title": session_data.get("title"),
-                "goal": session_data.get("goal"),
-                "brief": session_data.get("brief"),
-                "seed_question": session_data.get("seed_question"),
-            },
-        }))
-    if state["history"]:
-        await websocket.send_text(json.dumps({
-            "type": "history",
-            "messages": state["history"],
-            "turn_count": len(state["history"]) // 2,
-        }))
-
-    # Initial artifact state. Sent, not logged as a read: delivering it to the
-    # client is not a person looking at it. The client emits artifact_open when
-    # the panel is actually opened.
-    snap = await artifacts.snapshot(group_session_id)
-    await websocket.send_text(json.dumps({"type": "artifact", "data": snap}))
-
-    team_chat = await _load_team_chat(group_id)
-    if team_chat:
-        await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
-
-    # A finished session opens read-only: the artifact and history are shown,
-    # nothing new is accepted. Cached once seen, because completion is final.
-    ended = {"v": await _group_session_completed(group_session_id)}
-    if ended["v"]:
-        await websocket.send_text(json.dumps({"type": "session_ended"}))
-
-    async def _is_ended() -> bool:
-        if not ended["v"]:
-            ended["v"] = await _group_session_completed(group_session_id)
-        return ended["v"]
-
-    async def _closing_dwell(data: dict) -> bool:
-        """The one read still recorded after the end: a dwell the client
-        flushed BECAUSE the session ended, arriving within the grace window.
-        It measures reading done during the session — a section a teammate
-        still had open when someone else pressed End — which would otherwise
-        be lost exactly at the end of every session (#17). New reads after
-        the end are still not recorded (#6)."""
-        if data.get("type") not in ("artifact_dwell", "contested_option_dwell"):
-            return False
-        if data.get("flush") != "session_end":
-            return False
-        try:
-            async with AsyncSessionLocal() as db:
-                gs = await db.get(GroupSession, group_session_id)
-                done = gs.completed_at if gs else None
-        except Exception:
-            return False
-        return done is not None and datetime.utcnow() - done <= timedelta(seconds=_END_DWELL_GRACE_SECONDS)
-
-    await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
-
-    def _client_ts(data: dict):
-        """Client-supplied timestamp, preserved across a buffered reconnect
-        flush. Never used for ordering — seq decides that."""
-        raw = data.get("client_ts")
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            return None
-
-    async def _ack_read(data: dict, result):
-        """Tell the client this read is safely recorded, so it can stop holding it.
-
-        Sent only when the row is in the log: newly saved, or a duplicate from
-        an at-least-once flush that an earlier delivery already recorded, which
-        is exactly what the client needs to hear. A read whose write FAILED is
-        not acked, so the client keeps it buffered and replays it on the next
-        connect. Acking a failure used to make the client delete the only copy
-        of a read the database never got.
-
-        A read with no event_id is a client that predates the buffer; nothing to
-        ack and nothing is waiting for one.
-        """
-        event_id = data.get("event_id")
-        if not event_id:
-            return
-        if result is not None and not result.recorded:
-            log.error(f"[WS-COACH] read {data.get('type')} not recorded; not acking {event_id}")
-            return
-        try:
-            await websocket.send_text(json.dumps({"type": "read_ack", "event_id": event_id}))
-        except Exception:
-            # Socket went away mid-ack. The client keeps the event buffered and
-            # replays it on reconnect, which is the behaviour we want anyway.
-            pass
-
+    # Everything after room.add() runs inside the try, so the finally that
+    # removes the socket covers the handshake too. A client that dropped
+    # during one of these sends used to stay in the room for good -- and
+    # under Redis the heartbeat kept the ghost "online" for its teammates.
     try:
+        state = room.private_state(user_id, conversation_id)
+        if not state["loaded"]:
+            state["history"] = await _load_private_history(conversation_id)
+            state["loaded"] = True
+
+        log.info(
+            f"[WS-COACH] {user_id[:8]} joined group={group_id[:8]} session={session_num} "
+            f"({len(room.connections)} sockets live)"
+        )
+
+        await websocket.send_text(json.dumps({
+            "type": "session_init",
+            "conversation_id": conversation_id,
+            "group_id": group_id,
+            # The client needs this to fetch its review inbox and contested pairs;
+            # both are session-scoped and there is no other way to derive it.
+            "group_session_id": group_session_id,
+            "session_num": session_num,
+            "turn_count": len(state["history"]) // 2,
+            "condition": condition,
+        }))
+        if session_data:
+            await websocket.send_text(json.dumps({
+                "type": "challenge_context",
+                "data": {
+                    "title": session_data.get("title"),
+                    "goal": session_data.get("goal"),
+                    "brief": session_data.get("brief"),
+                    "seed_question": session_data.get("seed_question"),
+                },
+            }))
+        if state["history"]:
+            await websocket.send_text(json.dumps({
+                "type": "history",
+                "messages": state["history"],
+                "turn_count": len(state["history"]) // 2,
+            }))
+
+        # Initial artifact state. Sent, not logged as a read: delivering it to the
+        # client is not a person looking at it. The client emits artifact_open when
+        # the panel is actually opened.
+        snap = await artifacts.snapshot(group_session_id)
+        await websocket.send_text(json.dumps({"type": "artifact", "data": snap}))
+
+        team_chat = await _load_team_chat(group_id)
+        if team_chat:
+            await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
+
+        # A finished session opens read-only: the artifact and history are shown,
+        # nothing new is accepted. Cached once seen, because completion is final.
+        ended = {"v": await _group_session_completed(group_session_id)}
+        if ended["v"]:
+            await websocket.send_text(json.dumps({"type": "session_ended"}))
+
+        async def _is_ended() -> bool:
+            if not ended["v"]:
+                ended["v"] = await _group_session_completed(group_session_id)
+            return ended["v"]
+
+        async def _closing_dwell(data: dict) -> bool:
+            """The one read still recorded after the end: a dwell the client
+            flushed BECAUSE the session ended, arriving within the grace window.
+            It measures reading done during the session — a section a teammate
+            still had open when someone else pressed End — which would otherwise
+            be lost exactly at the end of every session (#17). New reads after
+            the end are still not recorded (#6)."""
+            if data.get("type") not in ("artifact_dwell", "contested_option_dwell"):
+                return False
+            if data.get("flush") != "session_end":
+                return False
+            try:
+                async with AsyncSessionLocal() as db:
+                    gs = await db.get(GroupSession, group_session_id)
+                    done = gs.completed_at if gs else None
+            except Exception:
+                return False
+            return done is not None and datetime.utcnow() - done <= timedelta(seconds=_END_DWELL_GRACE_SECONDS)
+
+        await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+
+        def _client_ts(data: dict):
+            """Client-supplied timestamp, preserved across a buffered reconnect
+            flush. Never used for ordering — seq decides that."""
+            raw = data.get("client_ts")
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                return None
+
+        async def _ack_read(data: dict, result):
+            """Tell the client this read is safely recorded, so it can stop holding it.
+
+            Sent only when the row is in the log: newly saved, or a duplicate from
+            an at-least-once flush that an earlier delivery already recorded, which
+            is exactly what the client needs to hear. A read whose write FAILED is
+            not acked, so the client keeps it buffered and replays it on the next
+            connect. Acking a failure used to make the client delete the only copy
+            of a read the database never got.
+
+            A read with no event_id is a client that predates the buffer; nothing to
+            ack and nothing is waiting for one.
+            """
+            event_id = data.get("event_id")
+            if not event_id:
+                return
+            if result is not None and not result.recorded:
+                log.error(f"[WS-COACH] read {data.get('type')} not recorded; not acking {event_id}")
+                return
+            try:
+                await websocket.send_text(json.dumps({"type": "read_ack", "event_id": event_id}))
+            except Exception:
+                # Socket went away mid-ack. The client keeps the event buffered and
+                # replays it on reconnect, which is the behaviour we want anyway.
+                pass
+
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
