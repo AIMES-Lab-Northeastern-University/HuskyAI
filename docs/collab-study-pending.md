@@ -1,14 +1,20 @@
 # Collaborative study — pending work
 
-Status as of 2026-09-21. Branch `feature/collab-study-phase-1` (10 commits,
-159 tests passing, pushed, not merged).
+Status as of 2026-10-04. Branch `feature/collab-study-phase-1` (backend: 232
+tests passing, 10 skipped — the skips are the real-Redis tests, which need
+`REDIS_URL`; see `docs/multi-worker-deploy.md`).
 
 **What exists already.** Every student in a team has their own private coach;
 the team shares one sectioned document; and every action — including who read
 whose work — lands in a single ordered event log. On top of that: turn-taking
 metrics, the solo control arm, a per-assignment reference corpus with grounding
 scores, routed peer review, contested-answer choices, a de-identified export,
-and UIs for most of it.
+and an instructor UI for every one of those. Multi-worker deployment behind
+Redis has been verified with real processes.
+
+**What is left.** Four PI decisions (items 1–4), one real-network check
+(item 13), and the deliberately deferred auto-detection (item 11). Everything an
+instructor needs to configure and read out a session (items 5–10) is built.
 
 **The principle to preserve.** Anything about *behaviour* is derived from the
 event log, never self-reported. A reviewer who submits a verdict without opening
@@ -38,6 +44,9 @@ likely outside the approved protocol.
 
 **Done looks like.** Updated consent copy in `ConsentGate.jsx`, an IRB amendment
 filed and approved, and a decision on whether existing consents need re-taking.
+
+**Still needs.** The PI and IRB. Nothing technical is outstanding: the copy
+change and a `RESEARCH_NOTICE_VERSION` bump ship together once approved.
 
 **Owner.** PI plus whoever handles IRB. Longest lead time of anything here —
 start it first, in parallel with everything else.
@@ -92,8 +101,11 @@ instructor's Study settings panel: `off` (the default, and the previous
 behaviour), `metadata` (a `group_chat.message` event per message: who, when,
 length, no text), or `content` (as metadata, plus the scrubbed text in the
 export's `team_chat` section). Each event records the mode its message was sent
-under, so a later switch never adds text for earlier messages. See
-`docs/event-schema.md` (`target = group_chat`) and
+under, so a later switch never adds text for earlier messages. The mode is
+resolved once per session into `CoachPolicy.team_chat_logging`
+(`backend/study_policy.py`) and acted on in one place, `_log_team_chat` in
+`backend/main.py`; the event payload carries length only, never text, in both
+modes. See `docs/event-schema.md` (`target = group_chat`) and
 `backend/tests/test_team_chat_logging.py`.
 
 **Decision needed.** Which of the three options to use. Draft consent wording for
@@ -122,109 +134,121 @@ the aggregation implemented in one place.
 
 ---
 
-## Instructor cannot run the study without these
+## Instructor controls — done
 
-Each is a small UI on an endpoint that already works and is already tested.
+Items 5–10 used to be "an endpoint that works, and no UI". Each now has one.
+They are kept here, briefly, because each carries a constraint that is easy to
+undo by accident when the UI is next touched.
 
-### 5. Per-session feed on/off — *no UI*
+All of the per-team panels hang off **Manage teams** on a group-mode challenge
+in the instructor view, in `frontend/src/components/GroupTeamManager.jsx`. The
+per-assignment settings are in `StudySettings` in
+`frontend/src/pages/Instructor.jsx` (the **Study settings** button), saved
+through `PATCH /classrooms/assignments/{id}/study` (`backend/classrooms.py`).
 
-**What.** The control arm runs early sessions with the PEI feed visible and a
-later session without it, to see what carries over.
+### 5. Per-session feed on/off — *done*
 
-**Current state.** Works end to end server-side. The flag lives at
-`Challenge.sessions_data[n]["feed_enabled"]` (absent means `true`). Setting it
-requires editing the database directly.
+**Where.** The challenge editor in `Instructor.jsx` ("Show score feed to
+students in", one checkbox per session), next to the session fields rather than
+in Study settings, because the flag is per *session*, not per assignment. It
+sends `feed_enabled_by_session` on `PATCH /challenges/{id}`;
+`_apply_feed_flags` in `backend/challenges.py` writes
+`sessions_data[n]["feed_enabled"]`, dropping the key when the session is on so
+"absent means true" stays the only representation of on.
 
-**Done looks like.** A per-session toggle in the instructor's challenge editor
-(`frontend/src/pages/Instructor.jsx`). Note it is **per session**, not per
-assignment, so it belongs next to the session's title/goal fields, not in the
-Study settings panel.
+**Behaviour.** Turns are still scored server-side when the feed is hidden, and
+the event log records `feed.suppressed` rather than leaving the absence to be
+inferred. Applies to sessions started after saving.
 
-**Verify with.** `backend/tests/test_control_arm.py` —
-`test_feed_disabled_still_scores_the_turn_server_side`.
+**Tests.** `backend/tests/test_control_arm.py` covers the server-side gating
+(`test_feed_disabled_still_scores_the_turn_server_side` and neighbours). The
+`feed_enabled_by_session` field on the PATCH has no test of its own.
 
----
+### 6. Consequential revision policy — *done*
 
-### 6. Consequential revision policy — *no UI*
+**Where.** "Required revision" in `StudySettings`, shown only for the solo
+control arm: a checkbox plus a turn number (1–50), sent as
+`require_revision_on_turn` (`null` turns it off). The endpoint rebuilds
+`ClassroomChallenge.revision_policy` rather than mutating it, and keeps any
+other keys in it.
 
-**What.** After the feedback is shown for a designated turn, the student must
-submit one revision that counts as the scored artifact of record. The session
-cannot be completed without it (server returns 409).
+**Behaviour.** Not required in a session whose feed is hidden — the revision is
+a response to the feedback, and there is none to respond to
+(`backend/challenges.py`, the completion check). Completion without it is
+refused with 409. See `test_completion_is_refused_until_the_revision_is_submitted`.
 
-**Current state.** Works end to end. Configured via
-`ClassroomChallenge.revision_policy`, shape `{"require_revision_on_turn": N}`.
-No UI sets it.
+### 7. Contested-pair authoring — *done*
 
-**Done looks like.** A field in the Study settings panel
-(`StudySettings` in `frontend/src/pages/Instructor.jsx`) — a turn number, or off.
-Extend `PATCH /classrooms/assignments/{id}/study`, which already handles the
-other three settings.
+**Where.** `frontend/src/components/ContestedPairsAdmin.jsx`, opened with
+**Contested answers** on a team. It lists, creates and deletes pairs through
+`GET|POST /classrooms/{cid}/challenges/{chid}/teams/{tid}/contested-pairs` and
+`DELETE …/contested-pairs/{pair_id}` (`backend/groups.py`), which create the
+group session on demand and delegate to `create_scripted_pair` in
+`backend/contested.py`.
 
----
+**The two constraints are held by construction.** The form's fields are named
+by source — `teammate_answer` and `coach_answer` — and the backend maps them to
+`option_a_text` and `option_b_text`, so A is always the human contribution and
+B always the coach output. The source labels appear only in the instructor
+panel; the student card stays unlabelled
+(`test_the_option_labels_do_not_reveal_which_side_is_the_coach`). Do not add
+labels on the student side.
 
-### 7. Contested-pair authoring — *no UI*
+**Gap.** The team-scoped routes are untested; `backend/tests/test_contested.py`
+exercises the original `/contested/sessions/{id}/pairs` path.
 
-**What.** The instructor writes two divergent answers to the same subproblem in
-advance; one is surfaced to a student mid-session and their choice is recorded.
+### 8. `instructor_assigned` reviewer policy — *fixed*
 
-**Current state.** `POST /contested/sessions/{group_session_id}/pairs` works and
-is tested. The student side is built — pairs appear as a purple card in the
-collaborative workspace. Creating one requires curl.
+**What changed.** `choose_reviewer` in `backend/verification.py` now follows
+the instructor's pairings (author → reviewer, stored in `review_pairings`) and
+nothing else. No pairing, or a paired reviewer who has left the team, returns
+`None`: the contribution is not routed, and — on a team of more than one — a
+`verification.unrouted` event is logged with `reason` `no_pairing` or
+`reviewer_not_on_team`, so the gap is visible in the record instead of silent.
+It never falls through to round-robin.
 
-**Done looks like.** An instructor form: pick a session, pick a section key, type
-option A (the teammate's answer) and option B (the coach's answer), pick which
-student sees it, optionally mark which option the ground truth supports.
+**Where.** `ReviewPairingsEditor` in
+`frontend/src/components/PeerReviewAdmin.jsx`, shown under each team when the
+policy is `instructor_assigned`, saved with
+`PUT /classrooms/{cid}/challenges/{chid}/teams/{tid}/review-pairings`. The
+Study settings dropdown says the same thing the code does: "A student with no
+reviewer picked gets no review — it never falls back to round robin."
+`PeerReviewsPanel` (same file) lists each review's derived outcome and lets
+the instructor reassign a pending one (`POST /verification/{id}/reassign`).
 
-**Two constraints the UI must respect.** Option A is *always* the human
-contribution and B *always* the coach output — if that varies, "adopted A" means
-different things in different rows and the adoption rate becomes uninterpretable.
-And the student-facing API deliberately does not label which is which; do not
-add labels in the UI.
+**Gap.** Nothing in `backend/tests/` exercises the `instructor_assigned` branch,
+the `unrouted` event, or the review-pairings route. `test_verification.py`
+covers round-robin and outcome classification only. Add a test before relying
+on this arm.
 
----
+### 9. Turn-taking dashboard — *done*
 
-### 8. `instructor_assigned` reviewer policy is a lie — *bug, not a gap*
+**Where.** `frontend/src/components/TurnTakingPanel.jsx`, shown in each team's
+analytics. It reads the classroom-scoped
+`GET /classrooms/{cid}/challenges/{chid}/teams/{tid}/turn-taking`, which uses
+the same pure function as `/research/sessions/{id}/turn-taking`
+(`backend/analysis/turn_taking.py`); both are covered by
+`backend/tests/test_turn_taking.py`.
 
-**What.** `ClassroomChallenge.verification_policy` accepts
-`instructor_assigned`, and the Study settings dropdown offers "I assign
-manually".
+**Constraints held.** A `null` renders as a dash with the reason it is missing,
+never as zero or a drawn bar. Metrics are per session and deliberately not
+averaged across sessions. The codebook version is shown at the foot of the
+panel. It is instructor-only — keep it that way while a study is running (see
+`docs/metrics-codebook.md`).
 
-**Current state.** `choose_reviewer` in `backend/verification.py` only
-special-cases `"random"`; every other value falls through to load-balanced
-round-robin. **Selecting "I assign manually" silently does round-robin instead.**
+### 10. Export download — *done*
 
-**Done looks like.** Either implement manual assignment (an instructor UI that
-creates `VerificationAssignment` rows directly, with `choose_reviewer` returning
-`None` for this policy so nothing is auto-routed), or remove the option from the
-dropdown until it exists. Do not leave it as-is — a setting that claims one
-behaviour and performs another will corrupt a study arm silently.
+**Where.** `frontend/src/components/ResearchExportPanel.jsx`, one row per team
+session with **Download JSON** and **Download JSONL**, from
+`GET /research/sessions/{id}/export` (`backend/research_export.py`). An
+"include students who did not consent" checkbox sets `include_unconsented`.
 
----
-
-## Nothing to look at yet
-
-### 9. Turn-taking dashboard
-
-`GET /research/sessions/{group_session_id}/turn-taking` returns contribution
-share, equality (Gini and normalised entropy), alternation rate, write→read
-latency, **read-before-write ratio** and coach reliance. Instructor and admin
-scoped. Nothing in the frontend consumes it.
-
-**Read `docs/metrics-codebook.md` first.** Several values are deliberately
-`null` rather than `0` — "no eligible writes" and "nobody did it" are different
-findings, and rendering `null` as zero would misreport the result. Students must
-not see these numbers live: showing contribution share during a session turns
-the measurement into an incentive.
-
-### 10. Export download
-
-`GET /research/sessions/{id}/export?format=json|jsonl` returns the
-de-identified bundle. No download button anywhere.
-
-**Done looks like.** A button on the instructor's session view. It must surface
-the `consent_filtered` flag in the filename or UI — an archived file that was
-exported with `include_unconsented=true` must never be mistakable for a
-consented one.
+**The `consent_filtered` rule is held.** The filename is built from the
+downloaded bundle's own `consent_filtered` flag, not from the checkbox:
+`huskyai-<team>-session<n>-consented-<date>.json` or
+`…-INCLUDES-UNCONSENTED-…`. A bundle whose flag cannot be read is labelled
+`INCLUDES-UNCONSENTED`, the safe direction. The backend's `Content-Disposition`
+filename uses the same rule.
 
 ---
 
@@ -240,33 +264,52 @@ corpora in use first, so there is ground truth to label against. Build behind a
 flag; scripted pairs stay the default for study v1 because they are
 deterministic and comparable across teams.
 
-### 12. Multi-worker support — *built, unverified against a real Redis*
+## Deployment and reliability
 
-**Done.** The in-process `asyncio.Lock` is gone from `backend/events.py`: `seq`
-is `MAX(seq)+1` guaranteed by `UNIQUE(scope, seq)`, retried up to 8 times, so
-two workers racing produce a gapless sequence rather than duplicates
-(`test_two_event_loops_still_produce_one_gapless_sequence` stages it with two
-threads and two event loops). The artifact write path is covered the same way:
-`UNIQUE(section_id, version)` turns a cross-worker version race into the
-ordinary conflict, returning the current text to rebase against, instead of
-silently dropping a revision.
+### 12. Multi-worker support — *done, verified against a real Redis on 2026-10-04*
 
-`backend/group_room.py` now has two modes. With `REDIS_URL` unset it is the
-in-process room, correct on one worker, unchanged. With it set, presence
-(ZSET + HASH with a heartbeat), broadcast (pub/sub with origin suppression) and
-the per-student coach-turn lock (`SET NX PX` + compare-and-delete release) move
-to Redis, so any number of workers can serve one team. A configured but
-unreachable Redis refuses sessions with close code 4005 rather than degrading to
-per-worker rooms, which would look live while teammates were invisible to each
-other. Shared rate-limit counters moved to Redis on the same switch.
+**What exists.** Event ordering never depended on Redis: `seq` in
+`backend/events.py` is `MAX(seq)+1` guaranteed by `UNIQUE(scope, seq)` and
+retried, and artifact writes are guarded by `UNIQUE(section_id, version)`, so a
+cross-worker race becomes the ordinary conflict rather than a lost revision.
 
-**Still to do before running multiple workers.** Nothing has been exercised
-against a real Redis server: `backend/tests/test_group_room_redis.py` drives the
-fan-out through an injected fake shared by two instances (key naming, envelope
-shape, echo suppression, presence merging and eviction, lock semantics,
-heartbeat) and one case checks a real unreachable client fails loudly, but the
-wire behaviour of `redis.asyncio` is untested here. Bring up a Redis, set
-`REDIS_URL`, run with `--workers 2`, and put two teammates on one team.
+With `REDIS_URL` set, `backend/group_room.py` moves presence, broadcast, the
+per-student coach lock and the legacy shared-room team turn lock to Redis;
+`backend/coordination.py` gives background work (score retries, session
+analyses, corpus ingests) short leases so it runs once rather than once per
+worker; `backend/rate_limit.py` shares its counters; and
+`database.startup_lock` serialises schema setup and seeding on Postgres. A
+configured but unreachable Redis refuses group and coach sessions with close
+code 4005 rather than degrading to per-worker rooms. Solo chat is unaffected.
+
+**Verified.** Two real Uvicorn processes sharing one Redis and one database:
+
+- presence is visible across workers;
+- team turn lock: a second worker sees the team busy, and turn numbers are
+  never duplicated;
+- per-student coach lock holds across two tabs on different workers, while
+  teammates' coaches are not blocked and one student's private coach output
+  never reaches another;
+- team chat and artifact writes cross workers;
+- `session_ended` propagates to every worker;
+- the per-account login limit is shared;
+- a Redis restart recovers in about 5 s;
+- a worker SIGKILLed mid-turn: the turn lock is held until its 300 s TTL, the
+  dead worker's members age out after about 45 s, and the survivors' roster is
+  now pushed by their heartbeat when that happens (commit 783de56; before it,
+  survivors kept showing the dead members until something else changed).
+
+All 10 real-Redis tests in `backend/tests` (`test_multiworker_redis.py`,
+`test_rate_limit_shared.py`) pass against a real server. They are skipped in an
+ordinary run, which is why the suite reports 10 skipped.
+
+**How to deploy it.** `docs/multi-worker-deploy.md` — what `REDIS_URL` turns
+on, what a worker crash costs a team, and a pre-deploy checklist.
+
+**Not covered.** A Redis outage *during* a session closes group and coach
+sockets with 1011 and refuses reconnects with 4005 until Redis is back; the
+coach workspace stops retrying on 4005, so students reload once it recovers.
+That path was exercised by restarting Redis, not by a long outage in a class.
 
 ### 13. Disconnect-buffer verification — *still needs a human and a real drop*
 
@@ -293,9 +336,17 @@ arrived. No amount of unit testing substitutes for one real drop.
 
 ## Suggested order
 
-1. **Item 1** (consent/IRB) — start immediately, longest lead time, blocks the run.
-2. **Items 5, 6, 7** — an instructor hits these within five minutes of trying to run a session.
-3. **Item 8** — small, and it is actively misleading right now.
-4. **Items 2, 3** — chase the decisions; the implementations are small once made.
-5. **Items 9, 10** — needed before anyone can read results.
-6. **Items 11, 12, 13** — after a first real run.
+1. **Item 1** (consent/IRB) — still first. Longest lead time, blocks the run, and
+   nothing technical is waiting on anything else.
+2. **Items 3, 4, 2** — chase the decisions. Item 3 is a dropdown once decided
+   and must be decided before the first real session; item 4 changes what the
+   instructor views report; item 2 is the only one that still needs building
+   (column, migration, UI, prompt) after the decision.
+3. **Tests for item 8** — the `instructor_assigned` routing, the `unrouted`
+   event and the review-pairings route have no backend test. Add them before a
+   study arm depends on manual pairing.
+4. **Item 13** — one real network drop, in progress separately.
+5. **A dry run** — one instructor configures an assignment end to end through
+   the UI (items 5–10), a team runs a session on the multi-worker deployment
+   (item 12, `docs/multi-worker-deploy.md`), and the export is read back.
+6. **Item 11** — after a first real run, once corpora are in use.
