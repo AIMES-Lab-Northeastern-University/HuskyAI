@@ -440,6 +440,10 @@ async def list_classroom_linked_challenges(
             "total_sessions": c.total_sessions,
             "is_active": bool(c.is_active),
             "week": c.week,
+            # The edit form seeds "Timed session" from these; omitting them made
+            # every save of a timed challenge clear its timer and min turns.
+            "time_limit_minutes": c.time_limit_minutes,
+            "min_turns": c.min_turns,
             "sort_order": int(sort_order),
             "mode": mode or "solo",
             "team_min": int(team_min) if team_min is not None else 2,
