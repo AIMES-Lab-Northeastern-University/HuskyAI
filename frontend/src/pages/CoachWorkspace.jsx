@@ -269,6 +269,22 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
 
 /* ───────────────────────────── The page ───────────────────────────── */
 
+// Below this width the two panes cannot sit side by side: the artifact pane
+// becomes a full-screen overlay opened and closed by its existing toggle.
+const NARROW_QUERY = '(max-width: 640px)'
+
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia?.(NARROW_QUERY).matches ?? false)
+  useEffect(() => {
+    const mq = window.matchMedia?.(NARROW_QUERY)
+    if (!mq) return
+    const onChange = (e) => setNarrow(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return narrow
+}
+
 export default function CoachWorkspace() {
   const navigate = useNavigate()
   const { id: groupId } = useParams()
@@ -278,6 +294,7 @@ export default function CoachWorkspace() {
   const token = localStorage.getItem('token')
   const user = JSON.parse(localStorage.getItem('user') || 'null')
   const myName = user?.name || 'You'
+  const narrow = useNarrow()
 
   const [messages, setMessages]       = useState([])
   const [streaming, setStreaming]     = useState('')
@@ -292,6 +309,10 @@ export default function CoachWorkspace() {
   const [input, setInput]             = useState('')
   const [connStatus, setConn]         = useState('disconnected')
   const [members, setMembers]         = useState([])
+  // The whole team, online or not. Presence (`members`) only lists who is
+  // connected, so names for edits and the end summary come from here.
+  const [roster, setRoster]           = useState([])
+  const [challengeTitle, setChTitle]  = useState(null)
   const [challengeContext, setCtx]    = useState(null)
   const [condition, setCondition]     = useState(null)
 
@@ -736,6 +757,27 @@ export default function CoachWorkspace() {
     }
   }, [groupId, sessionNum, flushAllDwell])
 
+  // Team roster and the challenge's title. Plain GETs for display only — they
+  // record nothing, and the socket stays the source of everything measured.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const g = await fetch(`${API_URL}/groups/${groupId}`, { headers: authHeaders() })
+        if (!g.ok || cancelled) return
+        const group = await g.json()
+        if (cancelled) return
+        if (Array.isArray(group.members)) setRoster(group.members)
+        if (!group.challenge_id) return
+        const c = await fetch(`${API_URL}/challenges/${group.challenge_id}`, { headers: authHeaders() })
+        if (c.ok && !cancelled) setChTitle((await c.json()).title || null)
+      } catch (e) {
+        console.error('could not load team details', e)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [groupId])
+
   // Review inbox and contested pairs. Polled on change rather than pushed:
   // both are low-frequency, and a dedicated socket message for each would add
   // two more frame types to a handler that already carries the measurement.
@@ -789,7 +831,7 @@ export default function CoachWorkspace() {
 
   const nameFor = (uidStr) => {
     if (uidStr && user?.id === uidStr) return 'You'
-    return members.find(m => m.user_id === uidStr)?.name
+    return (members.find(m => m.user_id === uidStr) || roster.find(m => m.user_id === uidStr))?.name
   }
 
   const coachReplies = messages.filter(m => m.role === 'assistant').map(m => m.content)
@@ -804,12 +846,12 @@ export default function CoachWorkspace() {
                 className="text-[12px] font-bold text-[#6B6560] hover:text-[#16120E] cursor-pointer">← Challenges</button>
         <div className="flex-1 min-w-0">
           <div className="text-[14px] font-bold text-[#16120E] truncate">
-            {challengeContext?.title || 'Collaborative session'}
+            {challengeTitle || challengeContext?.title || 'Collaborative session'}
           </div>
-          <div className="text-[11px] text-[#9A948E]">
+          <div className="text-[11px] text-[#9A948E] truncate">
             {/* The study condition is deliberately NOT shown: a student who can
                 read their arm or prominence knows what is being measured. */}
-            Session {sessionNum} · Your coach is private to you
+            Session {sessionNum}{challengeTitle && challengeContext?.title && !/^session \d+$/i.test(challengeContext.title.trim()) ? `: ${challengeContext.title}` : ''} · Your coach is private to you
           </div>
         </div>
         <div className="flex items-center gap-1.5">
@@ -959,7 +1001,11 @@ export default function CoachWorkspace() {
         </div>
 
         {/* ── Shared artifact ── */}
-        <div className="flex flex-col flex-shrink-0 bg-[#F7F3EE]" style={{ width: artifactOpen ? 460 : 52 }}>
+        {/* On a phone the open pane covers the screen instead of squeezing the
+            coach column to nothing; the same toggle opens and closes it, so the
+            open/close events are exactly those of the desktop panel. */}
+        <div className={`flex flex-col flex-shrink-0 bg-[#F7F3EE] ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
+             style={{ width: narrow && artifactOpen ? '100%' : artifactOpen ? 460 : 52 }}>
           {!artifactOpen ? (
             <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-l border-[#E7E0D8]" style={{ borderLeftWidth: '1.5px' }}>
               <button onClick={togglePanel} title="Open shared artifact" aria-label="Open shared artifact"
@@ -1087,14 +1133,22 @@ export default function CoachWorkspace() {
               </div>
 
               {/* Team backchannel: student-to-student only. Firewalled by design
-                  from the coach prompt and the evaluator, and currently emits no
-                  study event — whether human deliberation enters the research
-                  record is an open question for the PI. Messages are persisted
-                  in group_chat_messages either way, so deciding later is free. */}
+                  from the coach prompt and the evaluator. Whether it enters the
+                  research record is the assignment's team_chat_logging setting
+                  (off | metadata | content, delivered in session_init's
+                  condition), so the header says so rather than implying privacy
+                  when it is logged. Messages are persisted in
+                  group_chat_messages either way. */}
               <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: 240 }}>
                 <div className="px-4 py-2 flex items-center gap-2 flex-shrink-0">
                   <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Team chat</span>
-                  <span className="text-[10px] text-[#9A948E]">· not seen by any coach</span>
+                  <span className="text-[10px] text-[#9A948E]">
+                    · not seen by any coach{condition?.team_chat_logging === 'content'
+                      ? ' · recorded for research'
+                      : condition?.team_chat_logging === 'metadata'
+                        ? ' · timing logged for research, not text'
+                        : ''}
+                  </span>
                 </div>
                 <div className="flex-1 overflow-y-auto px-4 pb-2 flex flex-col gap-2">
                   {teamChat.length === 0 && (

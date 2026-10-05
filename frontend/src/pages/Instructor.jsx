@@ -123,10 +123,23 @@ function StudySettings({ cc, onSaved }) {
         <span style={lbl}>Coach behaviour</span>
         <select value={prominence} onChange={e => setProminence(e.target.value)} style={sel}>
           <option value="on_request">Answers when asked</option>
-          <option value="ambient">Reacts to the document unprompted</option>
+          {/* Visible but not selectable: nothing in the backend acts on
+              `ambient` yet (CoachPolicy.takes_unsolicited_turns and
+              posts_to_shared_space are unused), so choosing it would run
+              "Answers when asked" while every event says "ambient". */}
+          <option value="ambient" disabled>Reacts to the document unprompted (not built yet)</option>
           <option value="isolated">Cannot see the team's document</option>
         </select>
       </div>
+      {prominence === 'ambient' && (
+        <div role="alert" style={{ fontSize: '11px', color: '#B45309', background: '#FFFBEB',
+                                   border: '1px solid #FCD34D', borderRadius: '7px', padding: '8px 10px',
+                                   lineHeight: 1.6, margin: '-2px 0 8px 160px' }}>
+          This assignment is saved as "Reacts to the document unprompted", which is not
+          built yet: the coach actually answers only when asked, but its events are
+          labelled as the unprompted condition. Pick another coach behaviour and save.
+        </div>
+      )}
 
       <div style={row}>
         <span style={lbl}>Peer review</span>
@@ -1591,7 +1604,9 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
-                                        {editFeed.length > 0 && (
+                                        {/* Group/collab assignments never show the
+                                            solo score feed, so the toggles would do nothing there. */}
+                                        {editFeed.length > 0 && c.mode !== 'group' && (
                                           <div style={{ display: 'grid', gap: '4px' }}>
                                             <div style={{ fontSize: '12px', color: '#4A4440' }}>Show score feed to students in</div>
                                             <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
