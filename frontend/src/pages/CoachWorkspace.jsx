@@ -269,6 +269,22 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
 
 /* ───────────────────────────── The page ───────────────────────────── */
 
+// Below this width the two panes cannot sit side by side: the artifact pane
+// becomes a full-screen overlay opened and closed by its existing toggle.
+const NARROW_QUERY = '(max-width: 640px)'
+
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia?.(NARROW_QUERY).matches ?? false)
+  useEffect(() => {
+    const mq = window.matchMedia?.(NARROW_QUERY)
+    if (!mq) return
+    const onChange = (e) => setNarrow(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return narrow
+}
+
 export default function CoachWorkspace() {
   const navigate = useNavigate()
   const { id: groupId } = useParams()
@@ -278,6 +294,7 @@ export default function CoachWorkspace() {
   const token = localStorage.getItem('token')
   const user = JSON.parse(localStorage.getItem('user') || 'null')
   const myName = user?.name || 'You'
+  const narrow = useNarrow()
 
   const [messages, setMessages]       = useState([])
   const [streaming, setStreaming]     = useState('')
@@ -829,7 +846,7 @@ export default function CoachWorkspace() {
           <div className="text-[11px] text-[#9A948E] truncate">
             {/* The study condition is deliberately NOT shown: a student who can
                 read their arm or prominence knows what is being measured. */}
-            Session {sessionNum}{challengeTitle && challengeContext?.title ? `: ${challengeContext.title}` : ''} · Your coach is private to you
+            Session {sessionNum}{challengeTitle && challengeContext?.title && !/^session \d+$/i.test(challengeContext.title.trim()) ? `: ${challengeContext.title}` : ''} · Your coach is private to you
           </div>
         </div>
         <div className="flex items-center gap-1.5">
@@ -979,7 +996,11 @@ export default function CoachWorkspace() {
         </div>
 
         {/* ── Shared artifact ── */}
-        <div className="flex flex-col flex-shrink-0 bg-[#F7F3EE]" style={{ width: artifactOpen ? 460 : 52 }}>
+        {/* On a phone the open pane covers the screen instead of squeezing the
+            coach column to nothing; the same toggle opens and closes it, so the
+            open/close events are exactly those of the desktop panel. */}
+        <div className={`flex flex-col flex-shrink-0 bg-[#F7F3EE] ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
+             style={{ width: narrow && artifactOpen ? '100%' : artifactOpen ? 460 : 52 }}>
           {!artifactOpen ? (
             <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-l border-[#E7E0D8]" style={{ borderLeftWidth: '1.5px' }}>
               <button onClick={togglePanel} title="Open shared artifact" aria-label="Open shared artifact"
