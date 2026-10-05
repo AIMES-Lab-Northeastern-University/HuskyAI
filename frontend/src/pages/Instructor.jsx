@@ -1604,7 +1604,9 @@ export default function Instructor() {
                                             </span>
                                           </div>
                                         )}
-                                        {editFeed.length > 0 && (
+                                        {/* Group/collab assignments never show the
+                                            solo score feed, so the toggles would do nothing there. */}
+                                        {editFeed.length > 0 && c.mode !== 'group' && (
                                           <div style={{ display: 'grid', gap: '4px' }}>
                                             <div style={{ fontSize: '12px', color: '#4A4440' }}>Show score feed to students in</div>
                                             <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
