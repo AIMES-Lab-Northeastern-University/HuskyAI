@@ -60,8 +60,9 @@ async def _setup(logging="metadata", team_min=2, team_max=3, assign=True, mode="
 
 
 def _get(app, cid, uid):
-    with TestClient(app) as client:
-        r = client.get(f"/challenges/{cid}", headers={"Authorization": f"Bearer {_token(uid)}"})
+    # No `with`: that runs the app's lifespan, which wires the shared room
+    # manager to REDIS_URL and then closes it, breaking later tests that use it.
+    r = TestClient(app).get(f"/challenges/{cid}", headers={"Authorization": f"Bearer {_token(uid)}"})
     assert r.status_code == 200, r.text
     return r.json()
 
