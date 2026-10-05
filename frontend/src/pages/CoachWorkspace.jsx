@@ -940,7 +940,7 @@ export default function CoachWorkspace() {
               Team mean PEI {summary.session_avg_pei ?? '—'} across {summary.turns} turn{summary.turns === 1 ? '' : 's'}
               {summary.per_student && Object.keys(summary.per_student).length > 1 && (
                 <> · {Object.entries(summary.per_student)
-                  .map(([uidStr, v]) => `${v.name || nameFor(uidStr) || 'member'}:${v.avg_pei ?? '—'} (${v.turns})`)
+                  .map(([uidStr, v]) => `${v.name || nameFor(uidStr) || 'member'}: ${v.avg_pei ?? '—'} (${v.turns} turn${v.turns === 1 ? '' : 's'})`)
                   .join(' · ')}</>
               )}
             </span>
