@@ -317,3 +317,70 @@ def test_verification_is_inert_when_the_policy_is_none(app_ready):
                 VerificationAssignment.group_session_id == gs))).scalars().all())
 
     assert asyncio.run(count()) == 0
+
+
+def _routed_review(client, gid, users):
+    """users[0] writes s1, which is routed to a teammate. Returns (gs, row)."""
+    from database import AsyncSessionLocal
+    from verification import outcomes_for_session
+
+    with _connect(client, gid, users[0]) as ws:
+        _until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "artifact_write", "section_key": "s1",
+                                 "content": "x", "expected_version": 0}))
+        _until(ws, {"artifact_write_ok"})
+    gs = asyncio.run(_gs_id(gid))
+
+    async def rows():
+        async with AsyncSessionLocal() as db:
+            return await outcomes_for_session(db, gs)
+    return gs, asyncio.run(rows())[0]
+
+
+def test_a_verdict_marks_the_assignment_responded_and_nothing_more(app_ready):
+    """The export showed status "pending" beside verdict "correct". The stored
+    status now says a verdict exists; the outcome is still derived from reads."""
+    from database import AsyncSessionLocal, VerificationAssignment
+    from verification import outcomes_for_session
+
+    gid, users = asyncio.run(_team_with_policy(3))
+    client = TestClient(app_ready)
+    gs, a = _routed_review(client, gid, users)
+
+    r = client.post(f"/verification/{a['assignment_id']}/respond", json={"verdict": "correct"},
+                    headers={"Authorization": f"Bearer {_token(a['reviewer_user_id'])}"})
+    assert r.status_code == 200, r.text
+
+    async def state():
+        async with AsyncSessionLocal() as db:
+            row = await db.get(VerificationAssignment, a["assignment_id"])
+            return row.status, (await outcomes_for_session(db, gs))[0]
+    stored, outcome_row = asyncio.run(state())
+    assert stored == "responded"
+    assert outcome_row["status"] == "responded"
+    assert outcome_row["outcome"] == "skipped_unread", "a verdict alone is not a check"
+
+
+def test_a_review_cannot_be_reassigned_after_the_session_ends(app_ready):
+    from database import AsyncSessionLocal, GroupSession
+
+    gid, users = asyncio.run(_team_with_policy(3))
+    client = TestClient(app_ready)
+    gs, a = _routed_review(client, gid, users)
+
+    end = client.post(f"/groups/{gid}/sessions/1/end",
+                      headers={"Authorization": f"Bearer {_token(users[0])}"})
+    assert end.status_code == 200, end.text
+
+    other = next(u for u in users if u not in (a["author_user_id"], a["reviewer_user_id"]))
+    # users[0] is the section's instructor in _team_with_policy.
+    r = client.post(f"/verification/{a['assignment_id']}/reassign",
+                    json={"reviewer_user_id": other},
+                    headers={"Authorization": f"Bearer {_token(users[0])}"})
+    assert r.status_code == 409, r.text
+    assert "ended" in r.json()["detail"]
+
+    async def status():
+        async with AsyncSessionLocal() as db:
+            return (await db.get(GroupSession, gs)).status
+    assert asyncio.run(status()) == "completed"

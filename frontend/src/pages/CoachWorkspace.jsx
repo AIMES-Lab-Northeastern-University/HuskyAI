@@ -38,6 +38,11 @@ function scoreColor(pei) {
   if (pei <= 80) return '#0D9488'
   return '#16A34A'
 }
+function fmtClock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
 function timeAgo(iso) {
   if (!iso) return 'never'
   const s = Math.floor((Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime()) / 1000)
@@ -337,6 +342,13 @@ export default function CoachWorkspace() {
   const [ending, setEnding]           = useState(false)
   const [endError, setEndError]       = useState('')
   const [summary, setSummary]         = useState(null)
+  // { reason, byName } — why the session ended, for every teammate, not just
+  // the one who pressed End.
+  const [endInfo, setEndInfo]         = useState(null)
+  // Timed sessions: the countdown runs from the server's remaining_seconds.
+  // The server decides and enforces the end; this only displays it.
+  const [deadlineMs, setDeadlineMs]   = useState(null)
+  const [remainingMs, setRemainingMs] = useState(null)
   const [groupSessionId, setGsId]     = useState(null)
   const [inbox, setInbox]             = useState([])
   const [pairs, setPairs]             = useState([])
@@ -527,6 +539,13 @@ export default function CoachWorkspace() {
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         if (data.condition) setCondition(data.condition)
         if (data.group_session_id) setGsId(data.group_session_id)
+        if (typeof data.remaining_seconds === 'number') {
+          setDeadlineMs(Date.now() + data.remaining_seconds * 1000)
+          setRemainingMs(data.remaining_seconds * 1000)
+        } else {
+          setDeadlineMs(null)
+          setRemainingMs(null)
+        }
         break
       case 'challenge_context': setCtx(data.data); break
       case 'history':
@@ -640,6 +659,12 @@ export default function CoachWorkspace() {
         flushAllDwell('session_end')
         endedRef.current = true
         setEnded(true)
+        // The same figures the student who ended it sees. A bare frame (a
+        // refused late turn) keeps what is already shown.
+        if (data.summary) setSummary(data.summary)
+        if (data.end_reason) {
+          setEndInfo({ reason: data.end_reason, byName: data.ended_by_name || null })
+        }
         break
       case 'busy':
         // This student's coach already has a turn running (another tab, or a
@@ -746,7 +771,9 @@ export default function CoachWorkspace() {
       // session stayed open on the server for everyone else.
       if (!r.ok) { setEndError(await readApiError(r, 'Could not end the session')); return }
       flushAllDwell('session_end')
-      setSummary(await r.json().catch(() => null))
+      const s = await r.json().catch(() => null)
+      setSummary(s)
+      if (s?.end_reason) setEndInfo(prev => prev || { reason: s.end_reason, byName: myName })
       endedRef.current = true
       setEnded(true)
     } catch (e) {
@@ -755,7 +782,17 @@ export default function CoachWorkspace() {
     } finally {
       setEnding(false)
     }
-  }, [groupId, sessionNum, flushAllDwell])
+  }, [groupId, sessionNum, flushAllDwell, myName])
+
+  // Countdown tick. Display only: the server ends the session at the deadline
+  // (and refuses anything after it) whether or not this tab is open.
+  useEffect(() => {
+    if (!deadlineMs || sessionEnded) return
+    const tick = () => setRemainingMs(deadlineMs - Date.now())
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [deadlineMs, sessionEnded])
 
   // Team roster and the challenge's title. Plain GETs for display only — they
   // record nothing, and the socket stays the source of everything measured.
@@ -873,6 +910,12 @@ export default function CoachWorkspace() {
             <div className="text-[9px] font-bold text-[#9A948E] uppercase tracking-[0.5px]">Your PEI</div>
           </div>
         )}
+        {!sessionEnded && remainingMs != null && (
+          <div className={`flex items-center gap-1 px-2 py-1 rounded-[8px] border text-[12px] font-bold tabular-nums ${remainingMs <= 60000 ? 'bg-[#FEF3E8] text-[#C2410C] border-[#FED7AA]' : 'bg-[#F7F3EE] text-[#6B6560] border-[#E7E0D8]'}`}
+               title={remainingMs <= 60000 ? 'Session ends soon' : 'Time remaining in this team session'}>
+            <span aria-hidden>⏱</span>{fmtClock(remainingMs)}
+          </div>
+        )}
         {!sessionEnded && endError && (
           <span role="alert" className="text-[12px] text-[#C8102E] max-w-[260px]">{endError}</span>
         )}
@@ -887,13 +930,17 @@ export default function CoachWorkspace() {
 
       {sessionEnded && (
         <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex items-center gap-4 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
-          <span className="text-[13px] font-bold text-[#0D9488]">Session ended.</span>
+          <span className="text-[13px] font-bold text-[#0D9488]">
+            {endInfo?.reason === 'timer_expired' ? 'Time is up — session ended.'
+              : endInfo?.byName ? `Session ended by ${endInfo.byName}.`
+              : 'Session ended.'}
+          </span>
           {summary && (
             <span className="text-[12px] text-[#4A4440]">
               Team mean PEI {summary.session_avg_pei ?? '—'} across {summary.turns} turn{summary.turns === 1 ? '' : 's'}
               {summary.per_student && Object.keys(summary.per_student).length > 1 && (
                 <> · {Object.entries(summary.per_student)
-                  .map(([uidStr, v]) => `${nameFor(uidStr) || 'member'}: ${v.avg_pei ?? '—'} (${v.turns})`)
+                  .map(([uidStr, v]) => `${v.name || nameFor(uidStr) || 'member'}:${v.avg_pei ?? '—'} (${v.turns})`)
                   .join(' · ')}</>
               )}
             </span>

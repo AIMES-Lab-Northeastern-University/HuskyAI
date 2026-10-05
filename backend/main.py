@@ -2358,60 +2358,62 @@ async def group_websocket_endpoint(
         log.critical(f"[WS-GROUP] collaboration backend unavailable: {e}")
         await websocket.close(code=4005, reason="Collaboration backend unavailable")
         return
-    log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
+    # Inside the try from here, so the socket is removed even when the
+    # client drops during the handshake (see /ws/coach).
+    try:
+        log.info(f"[WS-GROUP] {user_id[:8]} joined group={group_id[:8]} session={session_num} ({len(room.connections)} live)")
 
-    # --- Initial state to the connecting client only ---
-    await websocket.send_text(json.dumps({
-        "type": "session_init",
-        "conversation_id": conversation_id,
-        "group_id": group_id,
-        "session_num": session_num,
-        "turn_count": len(room.history) // 2,
-    }))
-    if session_data:
+        # --- Initial state to the connecting client only ---
         await websocket.send_text(json.dumps({
-            "type": "challenge_context",
-            "data": {
-                "title": session_data.get("title"),
-                "goal": session_data.get("goal"),
-                "brief": session_data.get("brief"),
-                "seed_question": session_data.get("seed_question"),
-            },
-        }))
-    if room.history:
-        client_history = [
-            {
-                "role": m["role"],
-                "content": m["content"],
-                "sender_user_id": m.get("sender_user_id"),
-                "sender_name": m.get("sender_name"),
-                "attachments": [
-                    {"name": a.get("filename") or a.get("name")} for a in m.get("attachments", [])
-                ],
-            }
-            for m in room.history
-        ]
-        await websocket.send_text(json.dumps({
-            "type": "history",
-            "messages": client_history,
+            "type": "session_init",
+            "conversation_id": conversation_id,
+            "group_id": group_id,
+            "session_num": session_num,
             "turn_count": len(room.history) // 2,
         }))
+        if session_data:
+            await websocket.send_text(json.dumps({
+                "type": "challenge_context",
+                "data": {
+                    "title": session_data.get("title"),
+                    "goal": session_data.get("goal"),
+                    "brief": session_data.get("brief"),
+                    "seed_question": session_data.get("seed_question"),
+                },
+            }))
+        if room.history:
+            client_history = [
+                {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "sender_user_id": m.get("sender_user_id"),
+                    "sender_name": m.get("sender_name"),
+                    "attachments": [
+                        {"name": a.get("filename") or a.get("name")} for a in m.get("attachments", [])
+                    ],
+                }
+                for m in room.history
+            ]
+            await websocket.send_text(json.dumps({
+                "type": "history",
+                "messages": client_history,
+                "turn_count": len(room.history) // 2,
+            }))
 
-    # Replay the team backchannel (separate stream; never touches the coach/LLM).
-    team_chat = await _load_team_chat(group_id)
-    if team_chat:
-        await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
+        # Replay the team backchannel (separate stream; never touches the coach/LLM).
+        team_chat = await _load_team_chat(group_id)
+        if team_chat:
+            await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
 
-    # Joining a finished session is read-only: history, no new turns.
-    group_ended = await _group_session_completed(group_session_id)
-    if group_ended:
-        await websocket.send_text(json.dumps({"type": "session_ended"}))
+        # Joining a finished session is read-only: history, no new turns.
+        group_ended = await _group_session_completed(group_session_id)
+        if group_ended:
+            await websocket.send_text(json.dumps({"type": "session_ended"}))
 
-    # Tell everyone (including this client) who is now present.
-    await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+        # Tell everyone (including this client) who is now present.
+        await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
 
-    try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
@@ -2758,6 +2760,19 @@ async def coach_websocket_endpoint(
     group_session_id, _shared_conversation_id, challenge_id = ensured
 
     conversation_id = await _ensure_coach_conversation(group_session_id, user_id)
+
+    # The team's clock: started by the first member in, deadline fixed from then.
+    await _start_coach_clock(group_session_id, challenge_id)
+    async with AsyncSessionLocal() as _db:
+        _gs = await _db.get(GroupSession, group_session_id)
+        time_limit_minutes = _gs.time_limit_minutes if _gs else None
+        deadline = _group_deadline(_gs)
+    # Lazy expiry, as for a solo session: a team that left a timed session open
+    # past its deadline finds it ended when anyone next connects.
+    if deadline is not None and datetime.utcnow() >= deadline:
+        await _expire_coach_session_if_due(group_session_id)
+    timer_task = None
+
     # Resolved ONCE per session. Every handler below asks this object a question
     # rather than re-deriving the condition, which is what stops two sessions
     # nominally in the same arm behaving differently (see study_policy.py).
@@ -2799,125 +2814,159 @@ async def coach_websocket_endpoint(
         await websocket.close(code=4005, reason="Collaboration backend unavailable")
         return
 
-    state = room.private_state(user_id, conversation_id)
-    if not state["loaded"]:
-        state["history"] = await _load_private_history(conversation_id)
-        state["loaded"] = True
-
-    log.info(
-        f"[WS-COACH] {user_id[:8]} joined group={group_id[:8]} session={session_num} "
-        f"({len(room.connections)} sockets live)"
-    )
-
-    await websocket.send_text(json.dumps({
-        "type": "session_init",
-        "conversation_id": conversation_id,
-        "group_id": group_id,
-        # The client needs this to fetch its review inbox and contested pairs;
-        # both are session-scoped and there is no other way to derive it.
-        "group_session_id": group_session_id,
-        "session_num": session_num,
-        "turn_count": len(state["history"]) // 2,
-        "condition": condition,
-    }))
-    if session_data:
-        await websocket.send_text(json.dumps({
-            "type": "challenge_context",
-            "data": {
-                "title": session_data.get("title"),
-                "goal": session_data.get("goal"),
-                "brief": session_data.get("brief"),
-                "seed_question": session_data.get("seed_question"),
-            },
-        }))
-    if state["history"]:
-        await websocket.send_text(json.dumps({
-            "type": "history",
-            "messages": state["history"],
-            "turn_count": len(state["history"]) // 2,
-        }))
-
-    # Initial artifact state. Sent, not logged as a read: delivering it to the
-    # client is not a person looking at it. The client emits artifact_open when
-    # the panel is actually opened.
-    snap = await artifacts.snapshot(group_session_id)
-    await websocket.send_text(json.dumps({"type": "artifact", "data": snap}))
-
-    team_chat = await _load_team_chat(group_id)
-    if team_chat:
-        await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
-
-    # A finished session opens read-only: the artifact and history are shown,
-    # nothing new is accepted. Cached once seen, because completion is final.
-    ended = {"v": await _group_session_completed(group_session_id)}
-    if ended["v"]:
-        await websocket.send_text(json.dumps({"type": "session_ended"}))
-
-    async def _is_ended() -> bool:
-        if not ended["v"]:
-            ended["v"] = await _group_session_completed(group_session_id)
-        return ended["v"]
-
-    async def _closing_dwell(data: dict) -> bool:
-        """The one read still recorded after the end: a dwell the client
-        flushed BECAUSE the session ended, arriving within the grace window.
-        It measures reading done during the session — a section a teammate
-        still had open when someone else pressed End — which would otherwise
-        be lost exactly at the end of every session (#17). New reads after
-        the end are still not recorded (#6)."""
-        if data.get("type") not in ("artifact_dwell", "contested_option_dwell"):
-            return False
-        if data.get("flush") != "session_end":
-            return False
-        try:
-            async with AsyncSessionLocal() as db:
-                gs = await db.get(GroupSession, group_session_id)
-                done = gs.completed_at if gs else None
-        except Exception:
-            return False
-        return done is not None and datetime.utcnow() - done <= timedelta(seconds=_END_DWELL_GRACE_SECONDS)
-
-    await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
-    await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
-
-    def _client_ts(data: dict):
-        """Client-supplied timestamp, preserved across a buffered reconnect
-        flush. Never used for ordering — seq decides that."""
-        raw = data.get("client_ts")
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            return None
-
-    async def _ack_read(data: dict, result):
-        """Tell the client this read is safely recorded, so it can stop holding it.
-
-        Sent only when the row is in the log: newly saved, or a duplicate from
-        an at-least-once flush that an earlier delivery already recorded, which
-        is exactly what the client needs to hear. A read whose write FAILED is
-        not acked, so the client keeps it buffered and replays it on the next
-        connect. Acking a failure used to make the client delete the only copy
-        of a read the database never got.
-
-        A read with no event_id is a client that predates the buffer; nothing to
-        ack and nothing is waiting for one.
-        """
-        event_id = data.get("event_id")
-        if not event_id:
-            return
-        if result is not None and not result.recorded:
-            log.error(f"[WS-COACH] read {data.get('type')} not recorded; not acking {event_id}")
-            return
-        try:
-            await websocket.send_text(json.dumps({"type": "read_ack", "event_id": event_id}))
-        except Exception:
-            # Socket went away mid-ack. The client keeps the event buffered and
-            # replays it on reconnect, which is the behaviour we want anyway.
-            pass
-
+    # Everything after room.add() runs inside the try, so the finally that
+    # removes the socket covers the handshake too. A client that dropped
+    # during one of these sends used to stay in the room for good -- and
+    # under Redis the heartbeat kept the ghost "online" for its teammates.
     try:
+        state = room.private_state(user_id, conversation_id)
+        if not state["loaded"]:
+            state["history"] = await _load_private_history(conversation_id)
+            state["loaded"] = True
+
+        log.info(
+            f"[WS-COACH] {user_id[:8]} joined group={group_id[:8]} session={session_num} "
+            f"({len(room.connections)} sockets live)"
+        )
+
+        await websocket.send_text(json.dumps({
+            "type": "session_init",
+            "conversation_id": conversation_id,
+            "group_id": group_id,
+            # The client needs this to fetch its review inbox and contested pairs;
+            # both are session-scoped and there is no other way to derive it.
+            "group_session_id": group_session_id,
+            "session_num": session_num,
+            "turn_count": len(state["history"]) // 2,
+            "condition": condition,
+            # Timed sessions only; all None when untimed. remaining_seconds is
+            # what the countdown runs from, so a skewed client clock cannot
+            # shift it; the deadline itself is decided and enforced here.
+            "time_limit_minutes": time_limit_minutes,
+            "deadline": deadline.isoformat() + "Z" if deadline else None,
+            "remaining_seconds": (max(0, int((deadline - datetime.utcnow()).total_seconds()))
+                                  if deadline else None),
+        }))
+        if session_data:
+            await websocket.send_text(json.dumps({
+                "type": "challenge_context",
+                "data": {
+                    "title": session_data.get("title"),
+                    "goal": session_data.get("goal"),
+                    "brief": session_data.get("brief"),
+                    "seed_question": session_data.get("seed_question"),
+                },
+            }))
+        if state["history"]:
+            await websocket.send_text(json.dumps({
+                "type": "history",
+                "messages": state["history"],
+                "turn_count": len(state["history"]) // 2,
+            }))
+
+        # Initial artifact state. Sent, not logged as a read: delivering it to the
+        # client is not a person looking at it. The client emits artifact_open when
+        # the panel is actually opened.
+        snap = await artifacts.snapshot(group_session_id)
+        await websocket.send_text(json.dumps({"type": "artifact", "data": snap}))
+
+        team_chat = await _load_team_chat(group_id)
+        if team_chat:
+            await websocket.send_text(json.dumps({"type": "team_chat_history", "messages": team_chat}))
+
+        # A finished session opens read-only: the artifact and history are shown,
+        # nothing new is accepted. Cached once seen, because completion is final.
+        ended = {"v": await _group_session_completed(group_session_id)}
+        if ended["v"]:
+            # With the same figures teammates saw when it ended live.
+            async with AsyncSessionLocal() as _db:
+                _gs = await _db.get(GroupSession, group_session_id)
+                summary, _ = await _coach_session_summary(
+                    _db, _gs, await _private_coach_conversations(_db, group_session_id))
+            await websocket.send_text(json.dumps({
+                "type": "session_ended", "end_reason": summary["end_reason"], "summary": summary,
+            }))
+
+        async def _is_ended() -> bool:
+            if not ended["v"]:
+                if deadline is not None and datetime.utcnow() >= deadline:
+                    # Past the deadline is over whether or not this call is the
+                    # one that records it.
+                    await _expire_coach_session_if_due(group_session_id)
+                    ended["v"] = True
+                else:
+                    ended["v"] = await _group_session_completed(group_session_id)
+            return ended["v"]
+
+        if deadline is not None and not ended["v"]:
+            async def _end_at_deadline():
+                # So an idle team still ends: every connected socket, on every
+                # worker, runs one of these; the conditional completion lets
+                # exactly one of them end the session and announce it.
+                await asyncio.sleep(max(0.0, (deadline - datetime.utcnow()).total_seconds()) + 0.5)
+                await _expire_coach_session_if_due(group_session_id)
+
+            timer_task = asyncio.create_task(_end_at_deadline())
+
+        async def _closing_dwell(data: dict) -> bool:
+            """The one read still recorded after the end: a dwell the client
+            flushed BECAUSE the session ended, arriving within the grace window.
+            It measures reading done during the session — a section a teammate
+            still had open when someone else pressed End — which would otherwise
+            be lost exactly at the end of every session (#17). New reads after
+            the end are still not recorded (#6)."""
+            if data.get("type") not in ("artifact_dwell", "contested_option_dwell"):
+                return False
+            if data.get("flush") != "session_end":
+                return False
+            try:
+                async with AsyncSessionLocal() as db:
+                    gs = await db.get(GroupSession, group_session_id)
+                    done = gs.completed_at if gs else None
+            except Exception:
+                return False
+            return done is not None and datetime.utcnow() - done <= timedelta(seconds=_END_DWELL_GRACE_SECONDS)
+
+        await room.broadcast({"type": "member_joined", "user_id": user_id, "name": my_name})
+        await room.broadcast({"type": "presence", "members": await room.members_snapshot()})
+
+        def _client_ts(data: dict):
+            """Client-supplied timestamp, preserved across a buffered reconnect
+            flush. Never used for ordering — seq decides that."""
+            raw = data.get("client_ts")
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                return None
+
+        async def _ack_read(data: dict, result):
+            """Tell the client this read is safely recorded, so it can stop holding it.
+
+            Sent only when the row is in the log: newly saved, or a duplicate from
+            an at-least-once flush that an earlier delivery already recorded, which
+            is exactly what the client needs to hear. A read whose write FAILED is
+            not acked, so the client keeps it buffered and replays it on the next
+            connect. Acking a failure used to make the client delete the only copy
+            of a read the database never got.
+
+            A read with no event_id is a client that predates the buffer; nothing to
+            ack and nothing is waiting for one.
+            """
+            event_id = data.get("event_id")
+            if not event_id:
+                return
+            if result is not None and not result.recorded:
+                log.error(f"[WS-COACH] read {data.get('type')} not recorded; not acking {event_id}")
+                return
+            try:
+                await websocket.send_text(json.dumps({"type": "read_ack", "event_id": event_id}))
+            except Exception:
+                # Socket went away mid-ack. The client keeps the event buffered and
+                # replays it on reconnect, which is the behaviour we want anyway.
+                pass
+
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
@@ -3239,6 +3288,8 @@ async def coach_websocket_endpoint(
     except Exception as e:
         log.error(f"[WS-COACH] unexpected error: {type(e).__name__}: {e}", exc_info=True)
     finally:
+        if timer_task is not None:
+            timer_task.cancel()
         await room.remove(websocket)
         await _announce_leave(room, user_id, my_name)
         await rooms.drop_if_empty(group_session_id)
@@ -3496,9 +3547,9 @@ def _spawn_group_analysis(group_session_id: str):
     task.add_done_callback(_analysis_tasks.discard)
 
 
-async def _notify_session_ended(group_session_id: str) -> None:
+async def _notify_session_ended(group_session_id: str, detail: dict | None = None) -> None:
     try:
-        await rooms.notify(group_session_id, {"type": "session_ended"})
+        await rooms.notify(group_session_id, {"type": "session_ended", **(detail or {})})
     except Exception as e:
         # The session IS ended (committed above); a tab that missed this is
         # still refused on its next turn or write (#6) and told then.
@@ -3597,34 +3648,27 @@ async def get_turn_taking(
     }
 
 
-async def _end_coach_session(db, gs, private_conversations: list) -> dict:
-    """Finalise a session in the private-coach arm.
+async def _coach_session_summary(db, gs, private_conversations: list) -> tuple[dict, float | None]:
+    """The end-of-session figures for the private-coach arm, and the unrounded
+    team mean. Read-only, so the ender, every teammate's session_ended frame
+    and a tab reopening a finished session all see the same numbers.
 
     Reports a team mean across every member's turns AND each member's own
     average, rather than collapsing to one number. What a *team's* single PEI
     should mean when each student has their own coach and their own score is a
     research question, not an engineering default — so this exposes both and
-    decides nothing. `session_avg_pei` is set to the team mean only so existing
-    instructor views keep rendering something truthful.
-
-    Narrative session analysis is deliberately NOT generated here: it would be
-    per-student, and GroupSession.session_analysis is a single blob shaped for
-    the shared-coach arm. Storing N analyses needs a schema decision that has
-    not been made, and writing one student's narrative into a team-level field
-    would be worse than omitting it.
+    decides nothing.
     """
     per_student: dict[str, dict] = {}
     all_pei: list[float] = []
-    now = datetime.utcnow()
+    user_ids = [c.user_id for c in private_conversations]
+    names = {}
+    if user_ids:
+        names = {u.id: u.name for u in (await db.execute(
+            select(User).where(User.id.in_(user_ids))
+        )).scalars().all()}
 
     for conv in private_conversations:
-        row = (await db.execute(
-            select(func.avg(EvalResult.pei), func.count(EvalResult.id)).where(
-                EvalResult.conversation_id == conv.id,
-                EvalResult.pei.is_not(None),
-            )
-        )).one_or_none()
-        avg, n = (row[0], row[1]) if row else (None, 0)
         peis = (await db.execute(
             select(EvalResult.pei).where(
                 EvalResult.conversation_id == conv.id, EvalResult.pei.is_not(None)
@@ -3632,26 +3676,14 @@ async def _end_coach_session(db, gs, private_conversations: list) -> dict:
         )).scalars().all()
         all_pei.extend(float(p) for p in peis)
         per_student[conv.user_id] = {
-            "avg_pei": round(float(avg), 1) if avg is not None else None,
-            "turns": int(n or 0),
+            "avg_pei": round(sum(peis) / len(peis), 1) if peis else None,
+            "turns": len(peis),
+            # Teammates may be offline when the frame arrives, so the client
+            # cannot always name them from presence.
+            "name": names.get(conv.user_id),
         }
-        if conv.ended_at is None:
-            conv.ended_at = now
 
     team_mean = round(sum(all_pei) / len(all_pei), 2) if all_pei else None
-    if team_mean is not None:
-        gs.session_avg_pei = team_mean
-    gs.status = "completed"
-    gs.completed_at = now
-    if gs.end_reason is None:
-        gs.end_reason = "manual"
-    await db.commit()
-
-    # notify, not peek+broadcast: under Redis the team's sockets may be on
-    # other workers, and a worker that holds no room for this session would
-    # otherwise tell nobody. Every teammate's tab must lock, wherever it is.
-    await _notify_session_ended(gs.id)
-
     return {
         "arm": "collab_coach_artifact",
         "session_avg_pei": round(team_mean, 1) if team_mean is not None else None,
@@ -3659,7 +3691,133 @@ async def _end_coach_session(db, gs, private_conversations: list) -> dict:
         "per_student": per_student,
         "analysis_status": None,
         "end_reason": gs.end_reason,
+    }, team_mean
+
+
+async def _private_coach_conversations(db, group_session_id: str) -> list:
+    return (await db.execute(
+        select(Conversation).where(
+            Conversation.group_session_id == group_session_id,
+            Conversation.kind == "coach_private",
+        )
+    )).scalars().all()
+
+
+async def _end_coach_session(db, gs, private_conversations: list, *,
+                             end_reason: str = "manual",
+                             ended_by: tuple[str, str] | None = None) -> dict:
+    """Finalise a session in the private-coach arm.
+
+    `session_avg_pei` is set to the team mean only so existing instructor views
+    keep rendering something truthful (see _coach_session_summary).
+
+    Completion is one conditional UPDATE, so of a manual End, the timer on
+    every connected socket and a lazy check on every worker, exactly one
+    completes the session and announces it; the rest just return the summary.
+
+    Narrative session analysis is deliberately NOT generated here: it would be
+    per-student, and GroupSession.session_analysis is a single blob shaped for
+    the shared-coach arm. Storing N analyses needs a schema decision that has
+    not been made, and writing one student's narrative into a team-level field
+    would be worse than omitting it.
+    """
+    summary, team_mean = await _coach_session_summary(db, gs, private_conversations)
+    now = datetime.utcnow()
+    for conv in private_conversations:
+        if conv.ended_at is None:
+            conv.ended_at = now
+
+    values = {
+        "status": "completed",
+        "completed_at": now,
+        # A reason already recorded is never overwritten.
+        "end_reason": func.coalesce(GroupSession.end_reason, end_reason),
     }
+    if team_mean is not None:
+        values["session_avg_pei"] = team_mean
+    res = await db.execute(
+        update(GroupSession)
+        .where(GroupSession.id == gs.id, GroupSession.status != "completed")
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    won = res.rowcount == 1
+    await db.commit()
+    await db.refresh(gs)
+    summary["end_reason"] = gs.end_reason
+
+    if won:
+        # notify, not peek+broadcast: under Redis the team's sockets may be on
+        # other workers, and a worker that holds no room for this session would
+        # otherwise tell nobody. Every teammate's tab must lock, wherever it is,
+        # and sees the same summary, and who ended it, as the student who did.
+        await _notify_session_ended(gs.id, {
+            "end_reason": gs.end_reason,
+            "ended_by_user_id": ended_by[0] if ended_by else None,
+            "ended_by_name": ended_by[1] if ended_by else None,
+            "summary": summary,
+        })
+
+    return summary
+
+
+def _group_deadline(gs) -> datetime | None:
+    """started_at + the time limit snapshotted with it; None when untimed."""
+    if gs is None or not gs.started_at or not gs.time_limit_minutes:
+        return None
+    return gs.started_at + timedelta(minutes=gs.time_limit_minutes)
+
+
+async def _start_coach_clock(group_session_id: str, challenge_id: str | None) -> None:
+    """Start the team's clock when the first member opens the workspace — the
+    counterpart of a solo session's start — snapshotting the challenge's timer
+    with it, as a solo session does. Conditional, so teammates arriving together
+    on any worker agree on one start, and editing the challenge later never
+    moves a running session's deadline. A session started before this existed
+    keeps its started_at and stays untimed."""
+    try:
+        async with AsyncSessionLocal() as db:
+            ch = await db.get(Challenge, challenge_id) if challenge_id else None
+            await db.execute(
+                update(GroupSession)
+                .where(GroupSession.id == group_session_id, GroupSession.started_at.is_(None))
+                .values(
+                    started_at=datetime.utcnow(),
+                    time_limit_minutes=ch.time_limit_minutes if ch else None,
+                    # Snapshotted for the record only. Whether min turns counts
+                    # per student or per team is an open research decision, so
+                    # no team is held to it yet (see end_group_session).
+                    min_turns=ch.min_turns if ch else None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await db.commit()
+    except Exception as e:
+        log.error(f"[WS-COACH] could not start the session clock: {e}")
+
+
+async def _expire_coach_session_if_due(group_session_id: str) -> bool:
+    """End a private-coach session that is past its deadline, server-side, with
+    end_reason "timer_expired". Returns whether the session is over. Called on
+    connect, before every turn, write and chat message, by each socket's timer
+    (so an idle team still ends) and from /end; the conditional completion in
+    _end_coach_session makes that safe from any number of callers."""
+    try:
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            if gs is None:
+                return False
+            if gs.status == "completed":
+                return True
+            deadline = _group_deadline(gs)
+            if deadline is None or datetime.utcnow() < deadline:
+                return False
+            private = await _private_coach_conversations(db, gs.id)
+            await _end_coach_session(db, gs, private, end_reason="timer_expired")
+            return True
+    except Exception as e:
+        log.error(f"[WS-COACH] could not expire session {group_session_id[:8]}: {e}")
+        return False
 
 
 @app.post("/groups/{group_id}/sessions/{session_num}/end")
@@ -3678,15 +3836,19 @@ async def end_group_session(
     # one (still created by _ensure_group_session) is empty. Averaging over it
     # would report avg_pei=None, turns=0 and then run a narrative analysis over
     # an empty transcript.
-    private = (await db.execute(
-        select(Conversation).where(
-            Conversation.group_session_id == gs.id,
-            Conversation.kind == "coach_private",
-        )
-    )).scalars().all()
+    private = await _private_coach_conversations(db, gs.id)
 
     if private:
-        return await _end_coach_session(db, gs, private)
+        # Decided server-side, as for a solo session: an End pressed after the
+        # deadline records the timer, not the student. No min-turns check here
+        # yet — whether min turns counts per student or per team is an open
+        # research decision, so a team can still end at any point.
+        deadline = _group_deadline(gs)
+        if deadline is not None and datetime.utcnow() >= deadline:
+            return await _end_coach_session(db, gs, private, end_reason="timer_expired")
+        me = await db.get(User, user_id)
+        return await _end_coach_session(db, gs, private, end_reason="manual",
+                                        ended_by=(user_id, me.name if me else None))
 
     avg_pei = turn_count = None
     if gs.conversation_id:

@@ -627,8 +627,9 @@ class VerificationAssignment(Base):
     routing_policy: Mapped[str] = mapped_column(String(32), default="round_robin", nullable=False)
     assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     due_turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Stored status is only ever "pending", "expired" or "reassigned". Every
-    # other outcome is DERIVED from the response and the read log at
+    # Stored status is only ever "pending", "responded", "expired" or
+    # "reassigned". "responded" means a verdict row exists and nothing more;
+    # every outcome is DERIVED from the response and the read log at
     # classification time — a self-reported "completed" would record that a
     # reviewer pressed a button, not that they read anything. "reassigned" is
     # stored because it is an instructor action, not reviewer behaviour: without

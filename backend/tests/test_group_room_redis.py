@@ -483,3 +483,23 @@ def test_the_heartbeat_stops_when_the_last_socket_leaves():
     running, after = asyncio.run(run())
     assert running is True
     assert after is None
+
+
+def test_a_failed_add_leaves_no_socket_behind():
+    """The endpoint refuses a socket whose add() raised and never reaches its
+    cleanup, so add() must not leave it in the room for the heartbeat."""
+    async def run():
+        a, _ = two_workers()
+
+        async def down(*_args):
+            raise RedisUnavailable("down")
+
+        a.register = down
+        room = GroupRoom("gs-add-fail", fanout=a)
+        with pytest.raises(RedisUnavailable):
+            await room.add(FakeWS(), "user-a", "Ana")
+        return room.connections, room._heartbeat_task
+
+    connections, task = asyncio.run(run())
+    assert connections == {}
+    assert task is None

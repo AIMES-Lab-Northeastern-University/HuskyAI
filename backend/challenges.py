@@ -30,6 +30,7 @@ from database import (
     EvalResult,
     GroupChallenge,
     GroupMember,
+    GroupSession,
     InstructorTestEnrollment,
     User,
     UserChallengeSession,
@@ -937,6 +938,28 @@ def _group_settings(row) -> dict:
     }
 
 
+async def _team_sessions(db: AsyncSession, user_id: str,
+                         challenge_id: str | None = None) -> dict[str, dict[int, GroupSession]]:
+    """The group sessions of every team this student is on, by challenge then
+    session number. A team session never gets a UserChallengeSession, so
+    progress read from those alone showed a finished team session as 0%."""
+    q = (
+        select(GroupSession)
+        .join(GroupMember, GroupMember.group_id == GroupSession.group_id)
+        .where(GroupMember.user_id == user_id)
+    )
+    if challenge_id is not None:
+        q = q.where(GroupSession.challenge_id == challenge_id)
+    out: dict[str, dict[int, GroupSession]] = {}
+    for gs in (await db.execute(q)).scalars().all():
+        prev = out.setdefault(gs.challenge_id, {}).get(gs.session_number)
+        # A student on two teams for one challenge (moved between them) keeps
+        # the furthest-along session.
+        if prev is None or (gs.status == "completed" and prev.status != "completed"):
+            out[gs.challenge_id][gs.session_number] = gs
+    return out
+
+
 async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str):
     """For a student: (is_group_mode, team_or_None, settings_or_None). The team is
     their prof-assigned GroupChallenge for this challenge in one of their
@@ -1139,11 +1162,15 @@ async def list_challenges(
         sessions_by_challenge.setdefault(s.challenge_id, []).append(s)
 
     group_ids = await _student_group_mode_challenge_ids(db, user_id)
+    team_sessions = await _team_sessions(db, user_id)
 
     out = []
     for ch in challenges:
         user_ch_sessions = sessions_by_challenge.get(ch.id, [])
-        completed = sum(1 for s in user_ch_sessions if s.status == "completed")
+        completed = len(
+            {s.session_number for s in user_ch_sessions if s.status == "completed"}
+            | {n for n, gs in team_sessions.get(ch.id, {}).items() if gs.status == "completed"}
+        )
         best_pei = max((s.best_pei for s in user_ch_sessions if s.best_pei is not None), default=None)
         out.append({
             "id": ch.id,
@@ -1349,10 +1376,29 @@ async def get_challenge(
     )
     user_sessions = sessions_result.scalars().all()
     sessions_map = {s.session_number: s for s in user_sessions}
+    team_map = (await _team_sessions(db, user_id, challenge_id)).get(challenge_id, {})
 
     sessions_out = []
     for i, sd in enumerate(ch.sessions_data, start=1):
         us = sessions_map.get(i)
+        gs = team_map.get(i) if us is None else None
+        if gs is not None:
+            # A team session: its status, timing and end reason are the team's.
+            sessions_out.append({
+                "session_number": i,
+                "title": sd["title"],
+                "goal": sd["goal"],
+                "brief": sd["brief"],
+                "seed_question": sd["seed_question"],
+                "status": gs.status or "not_started",
+                "best_pei": gs.best_pei,
+                "conversation_id": None,
+                "started_at": gs.started_at.isoformat() if gs.started_at else None,
+                "completed_at": gs.completed_at.isoformat() if gs.completed_at else None,
+                "end_reason": gs.end_reason,
+                **(await _finish_hints(db, user_id, challenge_id, None)),
+            })
+            continue
         sessions_out.append({
             "session_number": i,
             "title": sd["title"],

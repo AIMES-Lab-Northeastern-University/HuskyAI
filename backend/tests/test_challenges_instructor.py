@@ -372,3 +372,23 @@ async def test_sections_round_trip_and_an_explicit_empty_list_clears_them(asgi_a
 
         detail = await client.get(f"/challenges/{ch_id}", headers=h)
         assert detail.json()["sections"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_section_listing_carries_the_timer_so_an_edit_does_not_clear_it(asgi_app):
+    """The instructor edit form seeds "Timed session" from this listing. Without
+    the fields it seeded unchecked, and the next save wrote nulls over the
+    timer and min turns."""
+    async with AsyncClient(transport=ASGITransport(app=asgi_app), base_url="http://test") as client:
+        h, room = await _instructor_with_room(client)
+        r = await client.post("/challenges", json={
+            "classroom_id": room, "title": "Timed", "description": "d",
+            "total_sessions": 1, "time_limit_minutes": 20, "min_turns": 2,
+        }, headers=h)
+        assert r.status_code == 201, r.text
+        ch_id = r.json()["id"]
+
+        listing = await client.get(f"/classrooms/{room}/challenges", headers=h)
+        mine = [c for c in listing.json() if c["id"] == ch_id][0]
+        assert mine["time_limit_minutes"] == 20
+        assert mine["min_turns"] == 2

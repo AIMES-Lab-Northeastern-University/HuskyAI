@@ -28,6 +28,8 @@ from database import (
     ClassroomMembership,
     Conversation,
     EvalResult,
+    GroupChallenge,
+    GroupSession,
     InstructorTestEnrollment,
     User,
     UserChallengeSession,
@@ -440,6 +442,10 @@ async def list_classroom_linked_challenges(
             "total_sessions": c.total_sessions,
             "is_active": bool(c.is_active),
             "week": c.week,
+            # The edit form seeds "Timed session" from these; omitting them made
+            # every save of a timed challenge clear its timer and min turns.
+            "time_limit_minutes": c.time_limit_minutes,
+            "min_turns": c.min_turns,
             "sort_order": int(sort_order),
             "mode": mode or "solo",
             "team_min": int(team_min) if team_min is not None else 2,
@@ -569,6 +575,51 @@ async def classroom_summary(
     }
 
 
+_STARTED = ("in_progress", "completed")
+
+
+async def _session_statuses(db: AsyncSession, classroom_id: str, student_ids: list,
+                            challenge_ids: list) -> dict[tuple, dict]:
+    """Every started challenge session of these students, solo and team, keyed
+    (user_id, challenge_id, session_number) -> {status, started_at, completed_at}.
+
+    A collaborative session lives on GroupSession, not UserChallengeSession, so
+    counting only the latter showed a section whose teams had finished their
+    sessions as never having started. A team session counts for a member only
+    if that member opened it — their private coach conversation is created when
+    they join — so a student who never turned up is not shown as active
+    because their teammates were.
+    """
+    out: dict[tuple, dict] = {}
+    if not student_ids or not challenge_ids:
+        return out
+    solo = (await db.execute(
+        select(UserChallengeSession.user_id, UserChallengeSession.challenge_id,
+               UserChallengeSession.session_number, UserChallengeSession.status,
+               UserChallengeSession.started_at, UserChallengeSession.completed_at)
+        .where(UserChallengeSession.user_id.in_(student_ids),
+               UserChallengeSession.challenge_id.in_(challenge_ids),
+               UserChallengeSession.status.in_(_STARTED))
+    )).all()
+    team = (await db.execute(
+        select(Conversation.user_id, GroupSession.challenge_id, GroupSession.session_number,
+               GroupSession.status, GroupSession.started_at, GroupSession.completed_at)
+        .join(GroupSession, GroupSession.id == Conversation.group_session_id)
+        .join(GroupChallenge, GroupChallenge.id == GroupSession.group_id)
+        .where(Conversation.kind == "coach_private",
+               Conversation.user_id.in_(student_ids),
+               GroupChallenge.classroom_id == classroom_id,
+               GroupSession.challenge_id.in_(challenge_ids),
+               GroupSession.status.in_(_STARTED))
+        .distinct()
+    )).all()
+    for uid, cid, num, st, sa, ca in [*solo, *team]:
+        prev = out.get((uid, cid, num))
+        if prev is None or (st == "completed" and prev["status"] != "completed"):
+            out[(uid, cid, num)] = {"status": st, "started_at": sa, "completed_at": ca}
+    return out
+
+
 @router.get("/{classroom_id}/analytics")
 async def classroom_instructor_analytics(
     classroom_id: str,
@@ -663,21 +714,9 @@ async def classroom_instructor_analytics(
             UserChallengeSession.challenge_id.in_(challenge_ids),
         )
 
-        n_started = await db.scalar(
-            select(func.count()).select_from(UserChallengeSession).where(
-                *base_scope,
-                UserChallengeSession.status.in_(("in_progress", "completed")),
-            )
-        )
-        out["sessions_started"] = int(n_started or 0)
-
-        n_completed = await db.scalar(
-            select(func.count()).select_from(UserChallengeSession).where(
-                *base_scope,
-                UserChallengeSession.status == "completed",
-            )
-        )
-        out["sessions_completed"] = int(n_completed or 0)
+        statuses = await _session_statuses(db, classroom_id, student_ids, challenge_ids)
+        out["sessions_started"] = len(statuses)
+        out["sessions_completed"] = sum(1 for v in statuses.values() if v["status"] == "completed")
 
         avg_pei = await db.scalar(
             select(func.avg(UserChallengeSession.best_pei)).where(
@@ -688,32 +727,14 @@ async def classroom_instructor_analytics(
         if avg_pei is not None:
             out["avg_best_pei"] = round(float(avg_pei), 2)
 
-        act_rows = await db.execute(
-            select(UserChallengeSession.user_id)
-            .where(
-                *base_scope,
-                UserChallengeSession.status.in_(("in_progress", "completed")),
-            )
-            .distinct()
-        )
-        out["students_with_activity"] = len(act_rows.all())
+        out["students_with_activity"] = len({uid for (uid, _, _) in statuses})
 
-        st_started = await db.execute(
-            select(UserChallengeSession.challenge_id, func.count())
-            .where(
-                *base_scope,
-                UserChallengeSession.status.in_(("in_progress", "completed")),
-            )
-            .group_by(UserChallengeSession.challenge_id)
-        )
-        started_map = {row[0]: int(row[1]) for row in st_started.all()}
-
-        st_done = await db.execute(
-            select(UserChallengeSession.challenge_id, func.count())
-            .where(*base_scope, UserChallengeSession.status == "completed")
-            .group_by(UserChallengeSession.challenge_id)
-        )
-        done_map = {row[0]: int(row[1]) for row in st_done.all()}
+        started_map: dict[str, int] = {}
+        done_map: dict[str, int] = {}
+        for (_, cid, _), v in statuses.items():
+            started_map[cid] = started_map.get(cid, 0) + 1
+            if v["status"] == "completed":
+                done_map[cid] = done_map.get(cid, 0) + 1
 
         st_avg = await db.execute(
             select(UserChallengeSession.challenge_id, func.avg(UserChallengeSession.best_pei))
@@ -749,6 +770,8 @@ async def classroom_instructor_analytics(
         for m in (m1, m2):
             if m is not None:
                 last_candidates.append(m)
+        for v in statuses.values():
+            last_candidates.extend(t for t in (v["started_at"], v["completed_at"]) if t is not None)
     if last_candidates:
         latest = max(last_candidates)
         if hasattr(latest, "isoformat"):
@@ -882,24 +905,9 @@ async def classroom_student_activity(
             UserChallengeSession.user_id == student_user_id,
             UserChallengeSession.challenge_id.in_(challenge_ids),
         )
-        sessions_started = int(
-            await db.scalar(
-                select(func.count()).select_from(UserChallengeSession).where(
-                    *base,
-                    UserChallengeSession.status.in_(("in_progress", "completed")),
-                )
-            )
-            or 0
-        )
-        sessions_completed = int(
-            await db.scalar(
-                select(func.count()).select_from(UserChallengeSession).where(
-                    *base,
-                    UserChallengeSession.status == "completed",
-                )
-            )
-            or 0
-        )
+        statuses = await _session_statuses(db, classroom_id, [student_user_id], challenge_ids)
+        sessions_started = len(statuses)
+        sessions_completed = sum(1 for v in statuses.values() if v["status"] == "completed")
         ab = await db.scalar(
             select(func.avg(UserChallengeSession.best_pei)).where(
                 *base,
@@ -915,21 +923,13 @@ async def classroom_student_activity(
             if m is not None:
                 last_candidates.append(m)
 
-        st_started = await db.execute(
-            select(UserChallengeSession.challenge_id, func.count())
-            .where(
-                *base,
-                UserChallengeSession.status.in_(("in_progress", "completed")),
-            )
-            .group_by(UserChallengeSession.challenge_id)
-        )
-        started_map = {row[0]: int(row[1]) for row in st_started.all()}
-        st_done = await db.execute(
-            select(UserChallengeSession.challenge_id, func.count())
-            .where(*base, UserChallengeSession.status == "completed")
-            .group_by(UserChallengeSession.challenge_id)
-        )
-        done_map = {row[0]: int(row[1]) for row in st_done.all()}
+        started_map: dict[str, int] = {}
+        done_map: dict[str, int] = {}
+        for (_, cid, _), v in statuses.items():
+            started_map[cid] = started_map.get(cid, 0) + 1
+            if v["status"] == "completed":
+                done_map[cid] = done_map.get(cid, 0) + 1
+            last_candidates.extend(t for t in (v["started_at"], v["completed_at"]) if t is not None)
         st_avg = await db.execute(
             select(UserChallengeSession.challenge_id, func.avg(UserChallengeSession.best_pei))
             .where(*base, UserChallengeSession.best_pei.is_not(None))
@@ -976,6 +976,22 @@ async def classroom_student_activity(
                     "best_pei": round(float(bpei), 2) if bpei is not None else None,
                     "started_at": _iso_dt(sa),
                     "completed_at": _iso_dt(ca),
+                }
+            )
+        # Team sessions this student opened, which have no solo row.
+        solo_keys = {(r["challenge_id"], r["session_number"]) for r in session_rows}
+        for (_, cid, snum), v in statuses.items():
+            if (cid, snum) in solo_keys:
+                continue
+            session_rows.append(
+                {
+                    "challenge_id": cid,
+                    "challenge_title": title_map.get(cid, ""),
+                    "session_number": int(snum),
+                    "status": v["status"],
+                    "best_pei": None,
+                    "started_at": _iso_dt(v["started_at"]),
+                    "completed_at": _iso_dt(v["completed_at"]),
                 }
             )
         session_rows.sort(

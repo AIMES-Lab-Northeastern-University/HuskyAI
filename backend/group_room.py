@@ -576,7 +576,13 @@ class GroupRoom:
         socket_id = uuid.uuid4().hex
         self.connections[ws] = {"user_id": user_id, "name": name, "socket_id": socket_id}
         if self._fanout is not None:
-            await self._fanout.register(self.group_session_id, socket_id, user_id, name)
+            try:
+                await self._fanout.register(self.group_session_id, socket_id, user_id, name)
+            except BaseException:
+                # The caller refuses the socket and never reaches its cleanup,
+                # so a failed add must leave nothing behind for the heartbeat.
+                self.connections.pop(ws, None)
+                raise
             if self._heartbeat_task is None:
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 

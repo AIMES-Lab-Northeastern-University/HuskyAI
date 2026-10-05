@@ -26,6 +26,7 @@ from database import (
     ContestedPair,
     ContestedResponse,
     ClassroomMembership,
+    Conversation,
     EvalResult,
     GroupChallenge,
     GroupMember,
@@ -194,6 +195,11 @@ async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
     shared conversation up to that turn, so a turn's score reflects the context
     every member built, not the lone author. Per-student skill scoring is a
     separate, deliberate feature (attributed re-evaluation), not done here.
+
+    In the private-coach arm the shared conversation stays empty and every turn
+    is in a member's own coach_private conversation, so both are read: a prompt
+    there belongs to the conversation's owner, and the team-level quality is the
+    mean over every member's turns, as in _end_coach_session.
     """
     members = await _members_payload(db, team.id)
     name_by_id = {m["user_id"]: m["name"] for m in members}
@@ -213,39 +219,57 @@ async def _team_analytics(db: AsyncSession, team: GroupChallenge) -> dict:
     sessions_with_activity = 0
 
     for s in sessions:
-        if not s.conversation_id:
-            continue
-        umsgs = (
+        convs = (
             await db.execute(
-                select(Message)
-                .where(Message.conversation_id == s.conversation_id, Message.role == "user")
-                .order_by(Message.created_at, Message.id)
+                select(Conversation)
+                .where(
+                    Conversation.group_session_id == s.id,
+                    (Conversation.id == s.conversation_id) | (Conversation.kind == "coach_private"),
+                )
+                .order_by(Conversation.started_at, Conversation.id)
             )
         ).scalars().all()
-        evals = (
-            await db.execute(
-                select(EvalResult)
-                .where(EvalResult.conversation_id == s.conversation_id)
-                .order_by(EvalResult.created_at, EvalResult.id)
-            )
-        ).scalars().all()
-        if umsgs:
+        session_rows: list[tuple] = []
+        for conv in convs:
+            umsgs = (
+                await db.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conv.id, Message.role == "user")
+                    .order_by(Message.created_at, Message.id)
+                )
+            ).scalars().all()
+            evals = (
+                await db.execute(
+                    select(EvalResult)
+                    .where(EvalResult.conversation_id == conv.id)
+                    .order_by(EvalResult.created_at, EvalResult.id)
+                )
+            ).scalars().all()
+            all_evals.extend(evals)
+            private = conv.kind == "coach_private"
+            # Within a conversation the Nth user message pairs with the Nth eval
+            # (both ordered by created_at, id) — the same reconstruction the
+            # post-session analysis uses.
+            for i, m in enumerate(umsgs):
+                sender = m.sender_user_id or (conv.user_id if private else None)
+                ev = evals[i] if i < len(evals) else None
+                session_rows.append((m.created_at, m.id, sender, i + 1, ev))
+        if session_rows:
             sessions_with_activity += 1
-        all_evals.extend(evals)
-        # Within a conversation the Nth user message pairs with the Nth eval
-        # (both ordered by created_at, id) — the same reconstruction the
-        # post-session analysis uses.
-        for i, m in enumerate(umsgs):
+        # One timeline per session in the order the prompts were sent. `turn`
+        # is the turn within its own conversation: a private coach's third
+        # turn is that student's third, whatever teammates did in between.
+        session_rows.sort(key=lambda r: (r[0] is None, r[0] or 0, r[1]))
+        for _created, _mid, sender, turn, ev in session_rows:
             total_turns += 1
-            if m.sender_user_id:
-                turns_by_user[m.sender_user_id] += 1
-            ev = evals[i] if i < len(evals) else None
+            if sender:
+                turns_by_user[sender] += 1
             timeline.append(
                 {
                     "session": s.session_number,
-                    "turn": i + 1,
-                    "sender_user_id": m.sender_user_id,
-                    "sender_name": name_by_id.get(m.sender_user_id, "Unknown"),
+                    "turn": turn,
+                    "sender_user_id": sender,
+                    "sender_name": name_by_id.get(sender, "Unknown"),
                     "pei": ev.pei if ev else None,
                 }
             )
