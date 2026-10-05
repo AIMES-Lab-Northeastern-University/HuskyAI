@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from analysis.turn_taking import METRICS_VERSION, compute_turn_taking, events_for_group_session
-from anonymize import pseudonymize, scrub
+from anonymize import pseudonymize, scrub_people
 from challenges import get_current_user, get_db
 from database import (Artifact, ArtifactRevision, ContestedPair, ContestedResponse,
                       Conversation, EvalResult, GroupChallenge, GroupChatMessage,
@@ -110,26 +110,40 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
             select(GroupMember.user_id).where(GroupMember.group_id == gs.group_id)
         )).all()
     ]
-    users = {
-        u.id: u for u in (await db.execute(
-            select(User).where(User.id.in_(members or [""]))
-        )).scalars().all()
-    }
 
-    def ident(uid):
-        """Scrub terms for this author: their own name and email."""
-        u = users.get(uid)
-        return (u.name if u else None, u.email if u else None)
-
-    # ── Events ──────────────────────────────────────────────────────────────
-    # Everyone who could appear in a payload: current members plus anyone who
-    # authored or reviewed work here (a student removed from the team since).
+    # Everyone who could appear in a payload or be named in the text: current
+    # members plus anyone who wrote, reviewed, chose or chatted here (a student
+    # removed from the team since).
     known_ids = set(members)
     for a, r in (await db.execute(
         select(VerificationAssignment.author_user_id, VerificationAssignment.reviewer_user_id)
         .where(VerificationAssignment.group_session_id == group_session_id)
     )).all():
         known_ids.update((a, r))
+    for q in (
+        select(ArtifactRevision.author_user_id)
+        .join(Artifact, Artifact.id == ArtifactRevision.artifact_id)
+        .where(Artifact.group_session_id == group_session_id),
+        select(ContestedPair.surfaced_to_user_id)
+        .where(ContestedPair.group_session_id == group_session_id),
+        select(GroupChatMessage.sender_user_id).where(GroupChatMessage.group_id == gs.group_id),
+    ):
+        known_ids.update(uid for (uid,) in (await db.execute(q.distinct())).all() if uid)
+    known_ids.discard(None)
+
+    # Every free-text field is scrubbed against all of them, not only its
+    # author: the document and the chat are written together, and a revision
+    # by one student naming a teammate would otherwise leak that teammate.
+    people = [
+        (u.name, u.email) for u in (await db.execute(
+            select(User).where(User.id.in_(known_ids or {""}))
+        )).scalars().all()
+    ]
+
+    def scrub_text(text):
+        return scrub_people(text, people)
+
+    # ── Events ──────────────────────────────────────────────────────────────
     raw_events = (await db.execute(
         select(StudyEvent).where(StudyEvent.group_session_id == group_session_id)
         .order_by(StudyEvent.seq)
@@ -165,7 +179,6 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
         for r in rows:
             if consent_only and not r.consent_research:
                 continue
-            name, email = ident(r.author_user_id)
             revisions.append({
                 "section_key": r.section_key,
                 "version": r.version,
@@ -173,7 +186,7 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
                 "origin": r.origin,
                 "bytes_added": r.bytes_added,
                 "bytes_removed": r.bytes_removed,
-                "content": scrub(r.content, name, email),
+                "content": scrub_text(r.content),
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
 
@@ -255,7 +268,6 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
         r = responses.get(p.id)
         if consent_only and r is not None and not r.consent_research:
             continue
-        name, email = ident(p.surfaced_to_user_id)
         contested_rows.append({
             "subproblem_key": p.subproblem_key,
             "origin": p.origin,
@@ -265,15 +277,15 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
             "inspected_a": bool(r.inspected_a) if r else None,
             "inspected_b": bool(r.inspected_b) if r else None,
             "uninspected_adoption": bool(r) and not (r.inspected_a or r.inspected_b),
-            "rationale": scrub(r.rationale_text, name, email) if r else None,
+            "rationale": scrub_text(r.rationale_text) if r else None,
         })
 
     # ── Team chat ───────────────────────────────────────────────────────────
     # Text only for messages whose event was logged under "content" — the event
     # records the mode it was sent under, so switching an assignment to
     # "content" later cannot sweep in messages sent under "metadata" or "off".
-    # Consent follows the event's snapshot. Scrubbed against every member, not
-    # just the sender: a backchannel is where students address each other by name.
+    # Consent follows the event's snapshot. Scrubbed against everyone, like the
+    # rest of the bundle: a backchannel is where students address each other by name.
     chat_events = [
         e for e in raw_events
         if e.target == "group_chat" and e.action == "message" and e.ref_id
@@ -292,13 +304,10 @@ async def build_session_bundle(db: AsyncSession, group_session_id: str,
         m = chat_msgs.get(e.ref_id)
         if m is None:
             continue
-        text = m.content
-        for uid in [m.sender_user_id, *members]:
-            text = scrub(text, *ident(uid))
         team_chat_rows.append({
             "seq": e.seq,
             "sender": _anon(m.sender_user_id),
-            "content": text,
+            "content": scrub_text(m.content),
             "created_at": m.created_at.isoformat() if m.created_at else None,
         })
 
