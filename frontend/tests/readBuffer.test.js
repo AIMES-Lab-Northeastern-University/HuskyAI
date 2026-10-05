@@ -219,6 +219,27 @@ describe('scoping', () => {
   })
 })
 
+describe('settled', () => {
+  it('waits for matching events to be acked', async () => {
+    const ws = fakeSocket()
+    const sender = createReadSender({ scope: SCOPE, socket: () => ws })
+    const e = sender.emit({ type: 'contested_option_dwell', pair_id: 'p1', option: 'a', duration_ms: 900 })
+    sender.emit({ type: 'artifact_expand', section_key: 's1' })   // unrelated, never acked
+
+    const done = sender.settled((ev) => ev.pair_id === 'p1', 1000, 5)
+    setTimeout(() => sender.ack(e.event_id), 20)
+
+    await expect(done).resolves.toBe(true)
+  })
+
+  it('gives up after the timeout instead of blocking forever', async () => {
+    const sender = createReadSender({ scope: SCOPE, socket: () => fakeSocket({ open: false }) })
+    sender.emit({ type: 'contested_option_expand', pair_id: 'p1', option: 'b' })
+
+    await expect(sender.settled((ev) => ev.pair_id === 'p1', 30, 5)).resolves.toBe(false)
+  })
+})
+
 describe('storage failure', () => {
   it('still sends when localStorage refuses to write', () => {
     const ws = fakeSocket()

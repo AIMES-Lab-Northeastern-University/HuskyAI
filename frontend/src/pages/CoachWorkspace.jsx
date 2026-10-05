@@ -773,6 +773,11 @@ export default function CoachWorkspace() {
     // the choice is recorded.
     stopDwell(`o:${pairId}:a`, 'collapse')
     stopDwell(`o:${pairId}:b`, 'collapse')
+    // The server judges inspection and dwell from those socket events, but the
+    // choice goes over HTTP; wait for them to be acked or the choice can be
+    // recorded first, with no dwell and possibly "uninspected". Bounded, so a
+    // dead socket delays the choice rather than blocking it.
+    await reader.current.settled((ev) => ev.pair_id === pairId)
     try {
       const r = await fetch(`${API_URL}/contested/pairs/${pairId}/adopt`, {
         method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
