@@ -9,6 +9,7 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     include: ['tests/**/*.test.{js,jsx}'],
+    setupFiles: ['tests/setup.js'],
     restoreMocks: true,
   },
   server: {

@@ -46,7 +46,7 @@ describe('Section save', () => {
     // A teammate saves v2 while we are still typing.
     render({ onSave, section: { ...base, content: 'v1 text + theirs', version: 2 } })
     click(button('Save'))
-    expect(onSave).toHaveBeenCalledWith('evidence', 'v1 text + mine', 1)
+    expect(onSave).toHaveBeenCalledWith('evidence', 'v1 text + mine', 1, 'student_typed')
   })
 
   it('hands the draft back on a conflict instead of replacing it with theirs', () => {
@@ -64,6 +64,6 @@ describe('Section save', () => {
     expect(container.textContent).toContain('their v2')   // shown so it can be folded in
     // Retrying now rebases on v2, the version the user has just been shown.
     click(button('Save'))
-    expect(onSave).toHaveBeenLastCalledWith('evidence', 'my draft', 2)
+    expect(onSave).toHaveBeenLastCalledWith('evidence', 'my draft', 2, 'student_typed')
   })
 })
