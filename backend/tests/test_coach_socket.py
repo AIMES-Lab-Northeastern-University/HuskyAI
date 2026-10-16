@@ -768,6 +768,65 @@ def test_ending_a_coach_session_aggregates_across_private_conversations(app_read
     assert asyncio.run(status()) == ("completed", "manual")
 
 
+def test_team_pei_is_equal_weight_not_turn_pooled(app_ready, monkeypatch):
+    """The team score weights each student once, not each turn, so a talkative
+    student cannot pull the team number toward their own score.
+
+    Student A takes two turns (both score 90); student B takes one (scores 30).
+    Pooling every turn would give (90+90+30)/3 = 70. The equal-weight mean is
+    (90 + 30)/2 = 60, reported with the range. See docs/metrics-codebook.md."""
+    import main
+    from database import AsyncSessionLocal, GroupSession
+
+    # PEIs handed out in call order: A's two turns, then B's one.
+    scores = iter([90.0, 90.0, 30.0])
+
+    monkeypatch.setattr(main.client.aio.models, "generate_content_stream", _fake_stream)
+
+    async def fake_eval(_history, corpus_vector_store_id=None):
+        return {"scores": {"PEI": next(scores)}}
+
+    monkeypatch.setattr(main, "evaluate_conversation", fake_eval)
+
+    group_id, users = asyncio.run(_make_team(2))
+    client = TestClient(app_ready)
+
+    # Student A: two turns.
+    with _connect(client, group_id, users[0]) as ws:
+        _drain_until(ws, {"artifact"})
+        for _ in range(2):
+            ws.send_text(json.dumps({"type": "message", "content": "a"}))
+            _drain_until(ws, {"done", "error"})
+            _drain_until(ws, {"eval", "eval_error"})
+
+    # Student B: one turn.
+    with _connect(client, group_id, users[1]) as ws:
+        _drain_until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "message", "content": "b"}))
+        _drain_until(ws, {"done", "error"})
+        _drain_until(ws, {"eval", "eval_error"})
+
+    r = client.post(f"/groups/{group_id}/sessions/1/end",
+                    headers={"Authorization": f"Bearer {_token(users[0])}"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["turns"] == 3, "every scored turn is still counted"
+    assert body["session_avg_pei"] == 60.0, "equal-weight mean, not the pooled 70"
+    assert body["pei_range"] == {"min": 30.0, "max": 90.0}
+    assert body["per_student"][users[0]]["avg_pei"] == 90.0
+    assert body["per_student"][users[0]]["turns"] == 2
+    assert body["per_student"][users[1]]["avg_pei"] == 30.0
+    assert body["per_student"][users[1]]["turns"] == 1
+
+    # The stored figure matches the equal-weight mean, not the pooled one.
+    async def stored():
+        async with AsyncSessionLocal() as db:
+            return (await db.get(GroupSession, await _group_session_id(group_id))).session_avg_pei
+
+    assert asyncio.run(stored()) == 60.0
+
+
 def test_ending_still_works_for_the_legacy_shared_coach_arm(app_ready):
     """The arm switch must not break /ws/group teams, which have a shared
     conversation and no private ones."""

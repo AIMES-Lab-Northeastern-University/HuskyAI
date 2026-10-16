@@ -3653,14 +3653,18 @@ async def _coach_session_summary(db, gs, private_conversations: list) -> tuple[d
     team mean. Read-only, so the ender, every teammate's session_ended frame
     and a tab reopening a finished session all see the same numbers.
 
-    Reports a team mean across every member's turns AND each member's own
-    average, rather than collapsing to one number. What a *team's* single PEI
-    should mean when each student has their own coach and their own score is a
-    research question, not an engineering default — so this exposes both and
-    decides nothing.
+    The team score is an EQUAL-WEIGHT mean: the average of each student's own
+    average PEI, so every student counts once no matter how many turns they
+    took. The earlier placeholder pooled every turn (sum of all turns / turn
+    count), which let the most active student dominate — a student with 20 turns
+    outweighed a teammate with 3. It is returned with the range (min/max of the
+    per-student averages) so a single number can never hide a split team, and
+    each student's own average is still exposed in `per_student`. See
+    docs/metrics-codebook.md ("Team PEI") for the definition.
     """
     per_student: dict[str, dict] = {}
-    all_pei: list[float] = []
+    student_means: list[float] = []  # one value per student, unrounded — equal weight
+    total_turns = 0
     user_ids = [c.user_id for c in private_conversations]
     names = {}
     if user_ids:
@@ -3674,7 +3678,9 @@ async def _coach_session_summary(db, gs, private_conversations: list) -> tuple[d
                 EvalResult.conversation_id == conv.id, EvalResult.pei.is_not(None)
             )
         )).scalars().all()
-        all_pei.extend(float(p) for p in peis)
+        if peis:
+            student_means.append(sum(float(p) for p in peis) / len(peis))
+        total_turns += len(peis)
         per_student[conv.user_id] = {
             "avg_pei": round(sum(peis) / len(peis), 1) if peis else None,
             "turns": len(peis),
@@ -3683,11 +3689,19 @@ async def _coach_session_summary(db, gs, private_conversations: list) -> tuple[d
             "name": names.get(conv.user_id),
         }
 
-    team_mean = round(sum(all_pei) / len(all_pei), 2) if all_pei else None
+    # Equal-weight mean of the per-student averages (not of raw turns), plus the
+    # spread. A student with no scored turn has no average and is simply not
+    # counted — they do not drag the team mean toward zero.
+    team_mean = round(sum(student_means) / len(student_means), 2) if student_means else None
+    pei_range = (
+        {"min": round(min(student_means), 1), "max": round(max(student_means), 1)}
+        if student_means else None
+    )
     return {
         "arm": "collab_coach_artifact",
         "session_avg_pei": round(team_mean, 1) if team_mean is not None else None,
-        "turns": len(all_pei),
+        "pei_range": pei_range,
+        "turns": total_turns,
         "per_student": per_student,
         "analysis_status": None,
         "end_reason": gs.end_reason,
