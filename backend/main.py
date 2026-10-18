@@ -2790,6 +2790,27 @@ async def _load_private_history(conversation_id: str) -> list[dict]:
         return [{"role": m.role, "content": m.content} for m in msgs]
 
 
+# Most of the shared document a coach turn carries. Sections are capped at
+# artifacts.MAX_SECTION_CHARS each, but a twelve-section document could still
+# put ~240k characters into every turn. Under the budget nothing is cut.
+_COACH_ARTIFACT_BUDGET = 12_000
+_SHORTENED_NOTE = "\n[…shortened for length]"
+
+
+def _fit_sections(lengths: list[int], budget: int) -> list[int]:
+    """How many characters of each section fit, sharing the budget fairly: short
+    sections keep all their text and the long ones split what is left equally."""
+    allowed = [0] * len(lengths)
+    remaining = budget
+    todo = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    while todo:
+        share = remaining // len(todo)
+        i = todo.pop(0)
+        allowed[i] = min(lengths[i], share)
+        remaining -= allowed[i]
+    return allowed
+
+
 def _artifact_prompt_block(snap: dict | None) -> tuple[str, list[str]]:
     """Render the shared artifact for injection into a coach prompt.
 
@@ -2808,10 +2829,13 @@ def _artifact_prompt_block(snap: dict | None) -> tuple[str, list[str]]:
     written = [s for s in snap["sections"] if (s.get("content") or "").strip()]
     if not written:
         return "", []
+    texts = [(s.get("content") or "").strip() for s in written]
+    fits = _fit_sections([len(t) for t in texts], _COACH_ARTIFACT_BUDGET)
     parts = ["--- SHARED TEAM ARTIFACT (your student's team is writing this together) ---"]
-    for s in written:
+    for s, text, fit in zip(written, texts, fits):
         label = s.get("title") or s["key"]
-        parts.append(f"\n## {label}\n{(s.get('content') or '').strip()}")
+        body = text if fit >= len(text) else text[:fit].rstrip() + _SHORTENED_NOTE
+        parts.append(f"\n## {label}\n{body}")
     parts.append(
         "\n--- END ARTIFACT ---\n"
         "This is the team's shared work, which may include teammates' contributions. "

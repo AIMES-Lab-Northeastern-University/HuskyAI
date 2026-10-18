@@ -64,6 +64,13 @@ ORIGIN_TRACKING = {"copy+paste"}
 
 MAX_SECTION_KEY_LEN = 64
 
+# Longest a section may be. Every save stores the whole section as a revision
+# and, outside the isolated arm, the document rides along with every coach
+# turn, so an unbounded paste grows both the database and the prompt bill.
+# 20k characters is several pages, far past what one section of a team write-up
+# needs. Mirrored in frontend/src/pages/CoachWorkspace.jsx (SECTION_MAX_CHARS).
+MAX_SECTION_CHARS = 20_000
+
 
 class ArtifactConfigError(ValueError):
     """The instructor's section decomposition is unusable. Raised at creation
@@ -285,6 +292,16 @@ async def write_section(
         return {"ok": False, "error": f"unknown origin {origin!r}"}
     if origin_tracking not in ORIGIN_TRACKING:
         origin_tracking = None
+    if len(content) > MAX_SECTION_CHARS:
+        # Refused before any lookup or lock: nothing is stored, no version is
+        # spent, and the writer keeps their draft to trim.
+        return {
+            "ok": False,
+            "error": "section_too_long",
+            "limit": MAX_SECTION_CHARS,
+            "message": f"This section is {len(content):,} characters; the limit is "
+                       f"{MAX_SECTION_CHARS:,}. Shorten it and save again.",
+        }
 
     # Deliberately does NOT create the artifact. Creating one here would use the
     # default shape, and because sections are never restructured afterwards a

@@ -9,6 +9,8 @@ import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 import { AttachButton, FileChip, PendingFiles, usePendingFiles } from '../components/Attachments'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
+// Mirrors backend artifacts.MAX_SECTION_CHARS; the server refuses longer saves.
+const SECTION_MAX_CHARS = 20000
 
 /* Collaborative-study workspace: this student's PRIVATE coach on the left, the
  * team's shared artifact on the right.
@@ -238,11 +240,15 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
                 style={{ borderWidth: '1.5px' }}
                 placeholder="Write the team's work for this section…"
               />
+              <div className={`mt-1 text-right text-[11px] ${draft.length > SECTION_MAX_CHARS ? 'text-[#C8102E] font-bold' : 'text-[#9A948E]'}`}>
+                {draft.length.toLocaleString()} / {SECTION_MAX_CHARS.toLocaleString()} characters
+                {draft.length > SECTION_MAX_CHARS && ' · shorten this section to save'}
+              </div>
               {saveError && (
                 <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>
               )}
               <div className="flex gap-2 mt-2">
-                <button onClick={save} disabled={saving}
+                <button onClick={save} disabled={saving || draft.length > SECTION_MAX_CHARS}
                         className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
                   {saving ? 'Saving…' : 'Save'}
                 </button>
