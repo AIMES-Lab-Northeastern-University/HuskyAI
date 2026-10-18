@@ -449,10 +449,21 @@ export default function Challenges() {
             </div>
           )}
 
-          {/* Challenge grid */}
+          {/* Challenge grid: team challenges get their own section above solo ones */}
           {!loading && !error && filtered.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
+            {[
+              ['Team challenges', 'Worked on together with your assigned team', filtered.filter(c => c.group_mode)],
+              ['Solo challenges', 'Worked on on your own with the coach', filtered.filter(c => !c.group_mode)],
+            ].filter(([, , list]) => list.length > 0).map(([heading, sub, list]) => (
+            <section key={heading}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', marginBottom: '12px' }}>
+                <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: '22px', fontWeight: 400, color: '#16120E', margin: 0 }}>{heading}</h2>
+                <span style={{ fontSize: '12px', fontWeight: 700, color: '#9A948E' }}>{list.length}</span>
+                <span style={{ fontSize: '12px', color: '#9A948E' }}>· {sub}</span>
+              </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-              {filtered.map(c => {
+              {list.map(c => {
                 const progress = c.total_sessions > 0
                   ? Math.round((c.sessions_completed / c.total_sessions) * 100)
                   : 0
@@ -588,6 +599,9 @@ export default function Challenges() {
                   </div>
                 )
               })}
+            </div>
+            </section>
+            ))}
             </div>
           )}
           </>
