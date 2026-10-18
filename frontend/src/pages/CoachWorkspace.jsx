@@ -6,6 +6,7 @@ import { DIM_META } from '../lib/metricInfo'
 import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
 import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
+import { AttachButton, FileChip, PendingFiles, usePendingFiles } from '../components/Attachments'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -342,6 +343,8 @@ export default function CoachWorkspace() {
   const pendingSaves = useRef(new Set())
   const [teamChat, setTeamChat]       = useState([])
   const [teamInput, setTeamInput]     = useState('')
+  const coachFiles = usePendingFiles()
+  const teamFiles  = usePendingFiles()
   const [sessionEnded, setEnded]      = useState(false)
   const [ending, setEnding]           = useState(false)
   const [endError, setEndError]       = useState('')
@@ -555,7 +558,10 @@ export default function CoachWorkspace() {
       case 'history':
         if (Array.isArray(data.messages)) {
           setMessages(data.messages.filter(m => m?.role && typeof m.content === 'string')
-            .map(m => ({ role: m.role, content: m.content })))
+            .map(m => ({
+              role: m.role, content: m.content,
+              attachments: (m.attachments || []).map(a => ({ name: a.filename || a.name })),
+            })))
         }
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         break
@@ -647,6 +653,7 @@ export default function CoachWorkspace() {
         if (Array.isArray(data.messages)) {
           setTeamChat(data.messages.map(m => ({
             senderName: m.sender_name, content: m.content, isSelf: m.sender_name === myName,
+            attachments: m.attachments || [],
           })))
         }
         break
@@ -654,8 +661,44 @@ export default function CoachWorkspace() {
         // Human-only backchannel. Never enters a coach prompt or the evaluator;
         // whether it enters the research record at all is an open question, so
         // nothing here emits a study event.
-        setTeamChat(prev => [...prev, { senderName: data.sender_name, content: data.content, isSelf: false }])
+        setTeamChat(prev => [...prev, {
+          senderName: data.sender_name, content: data.content, isSelf: false, attachments: data.attachments || [],
+        }])
         break
+      case 'team_chat_saved':
+        // My own message, now stored: swap its placeholder chips for the
+        // stored files so they become downloadable.
+        setTeamChat(prev => prev.map(m => (m.clientId && m.clientId === data.client_id
+          ? { ...m, attachments: [...(data.attachments || []), ...(m.attachments || []).filter(a => a.failed)] }
+          : m)))
+        break
+      case 'team_chat_rejected': {
+        const reasons = Object.fromEntries((data.files || []).map(f => [f.name, f.reason]))
+        setTeamChat(prev => prev
+          .map(m => (m.clientId && m.clientId === data.client_id
+            ? { ...m, attachments: (m.attachments || []).map(a => (a.name in reasons ? { ...a, failed: true, reason: reasons[a.name] } : a)) }
+            : m))
+          // Nothing left of a files-only message: drop the bubble, keep the notice.
+          .filter(m => !(m.clientId === data.client_id && !m.content && (m.attachments || []).every(a => a.failed))))
+        teamFiles.setNotice(`Not sent: ${(data.files || []).map(f => `${f.name} (${f.reason})`).join(', ')}`)
+        break
+      }
+      case 'attachment_warning': {
+        // The server dropped files from my last coach message; mark them.
+        const reasons = Object.fromEntries((data.files || []).map(f => [f.name, f.reason]))
+        setMessages(prev => {
+          const next = [...prev]
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === 'user') {
+              next[i] = { ...next[i], attachments: (next[i].attachments || []).map(a => (
+                a.name in reasons ? { ...a, failed: true, reason: reasons[a.name] } : a)) }
+              break
+            }
+          }
+          return next
+        })
+        break
+      }
       case 'session_ended':
         // Close every open clock now. The server accepts these for a short
         // grace window after the end, because they measure reading done
@@ -747,21 +790,29 @@ export default function CoachWorkspace() {
 
   const send = useCallback(() => {
     const content = input.trim()
-    if (!content || isStreaming || isTyping || isEvaluating) return
+    const files = coachFiles.files
+    if ((!content && !files.length) || isStreaming || isTyping || isEvaluating) return
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
     lastSentRef.current = content
-    setMessages(prev => [...prev, { role: 'user', content }])
-    wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: [] }))
+    setMessages(prev => [...prev, { role: 'user', content, attachments: files.map(f => ({ name: f.name })) }])
+    wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: coachFiles.toWire() }))
     setInput('')
-  }, [input, isStreaming, isTyping, isEvaluating])
+    coachFiles.clear()
+  }, [input, coachFiles, isStreaming, isTyping, isEvaluating])
 
   const sendTeamChat = useCallback(() => {
     const content = teamInput.trim()
-    if (!content || wsRef.current?.readyState !== WebSocket.OPEN) return
-    setTeamChat(prev => [...prev, { senderName: myName, content, isSelf: true }])
-    wsRef.current.send(JSON.stringify({ type: 'team_chat', content }))
+    const files = teamFiles.files
+    if ((!content && !files.length) || wsRef.current?.readyState !== WebSocket.OPEN) return
+    // Matches the server's team_chat_saved / team_chat_rejected back to this bubble.
+    const clientId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    setTeamChat(prev => [...prev, {
+      senderName: myName, content, isSelf: true, clientId, attachments: files.map(f => ({ name: f.name })),
+    }])
+    wsRef.current.send(JSON.stringify({ type: 'team_chat', content, client_id: clientId, attachments: teamFiles.toWire() }))
     setTeamInput('')
-  }, [teamInput, myName])
+    teamFiles.clear()
+  }, [teamInput, teamFiles, myName])
 
   const endSession = useCallback(async () => {
     if (!window.confirm('End this session for the whole team? Everyone will be disconnected.')) return
@@ -1006,8 +1057,13 @@ export default function CoachWorkspace() {
                     ? 'bg-[#C8102E] text-white'
                     : 'bg-[#FDFCFB] text-[#16120E] border border-[#E7E0D8]'}`}
                      style={m.role === 'user' ? {} : { borderWidth: '1.5px' }}>
+                  {m.attachments?.length > 0 && (
+                    <div className={`flex flex-wrap gap-1.5 ${m.content ? 'mb-1.5' : ''}`}>
+                      {m.attachments.map((a, j) => <FileChip key={j} file={a} tone={m.role === 'user' ? 'dark' : 'light'} />)}
+                    </div>
+                  )}
                   {m.role === 'user'
-                    ? <p className="whitespace-pre-wrap">{m.content}</p>
+                    ? (m.content && <p className="whitespace-pre-wrap">{m.content}</p>)
                     : <div className="prose-chat"><ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown></div>}
                   {m.role === 'assistant' && !sessionEnded && artifact?.sections?.length > 0 && (
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -1050,7 +1106,10 @@ export default function CoachWorkspace() {
           </div>
 
           <div className="p-4 bg-[#FDFCFB] border-t border-[#E7E0D8] flex-shrink-0" style={{ borderTopWidth: '1.5px' }}>
+            <PendingFiles files={coachFiles.files} onRemove={coachFiles.remove} notice={coachFiles.notice} />
             <div className="flex gap-2">
+              <AttachButton onFiles={coachFiles.add} disabled={busy || connStatus !== 'connected'}
+                            label="Attach a file for your coach" />
               <textarea
                 value={input}
                 onChange={e => setInput(e.target.value)}
@@ -1061,7 +1120,7 @@ export default function CoachWorkspace() {
                 className="flex-1 px-4 py-2.5 text-[14px] bg-white border border-[#E7E0D8] rounded-[12px] resize-none focus:outline-none focus:border-[#C8102E] disabled:opacity-60"
                 style={{ borderWidth: '1.5px' }}
               />
-              <button onClick={send} disabled={busy || !input.trim() || connStatus !== 'connected'}
+              <button onClick={send} disabled={busy || (!input.trim() && !coachFiles.files.length) || connStatus !== 'connected'}
                       className="px-4 py-2.5 text-[13px] font-bold text-white bg-[#C8102E] rounded-[12px] hover:bg-[#A50D26] disabled:opacity-40 cursor-pointer">
                 Send
               </button>
@@ -1228,13 +1287,25 @@ export default function CoachWorkspace() {
                       <div className={`max-w-[85%] px-3 py-1.5 rounded-[10px] text-[12px] ${
                         m.isSelf ? 'bg-[#EDE9FE] text-[#16120E]' : 'bg-[#F7F3EE] text-[#16120E]'}`}>
                         {!m.isSelf && <div className="text-[10px] font-bold text-[#6B6560] mb-0.5">{m.senderName}</div>}
-                        <span className="whitespace-pre-wrap">{m.content}</span>
+                        {m.attachments?.length > 0 && (
+                          <div className={`flex flex-wrap gap-1 ${m.content ? 'mb-1' : ''}`}>
+                            {m.attachments.map((a, j) => <FileChip key={a.id || j} file={a} groupId={groupId} />)}
+                          </div>
+                        )}
+                        {m.content && <span className="whitespace-pre-wrap">{m.content}</span>}
                       </div>
                     </div>
                   ))}
                   <div ref={teamEndRef} />
                 </div>
+                {(teamFiles.files.length > 0 || teamFiles.notice) && (
+                  <div className="px-3 pt-2 flex-shrink-0">
+                    <PendingFiles files={teamFiles.files} onRemove={teamFiles.remove} notice={teamFiles.notice} />
+                  </div>
+                )}
                 <div className="p-3 flex gap-2 flex-shrink-0">
+                  <AttachButton onFiles={teamFiles.add} disabled={sessionEnded || connStatus !== 'connected'}
+                                label="Share a file with your team" compact />
                   <input
                     value={teamInput}
                     onChange={e => setTeamInput(e.target.value)}
@@ -1244,7 +1315,7 @@ export default function CoachWorkspace() {
                     className="flex-1 px-3 py-1.5 text-[12px] bg-white border border-[#E7E0D8] rounded-[8px] focus:outline-none focus:border-[#7C3AED] disabled:opacity-60"
                     style={{ borderWidth: '1.5px' }}
                   />
-                  <button onClick={sendTeamChat} disabled={sessionEnded || !teamInput.trim() || connStatus !== 'connected'}
+                  <button onClick={sendTeamChat} disabled={sessionEnded || (!teamInput.trim() && !teamFiles.files.length) || connStatus !== 'connected'}
                           className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#7C3AED] rounded-[8px] disabled:opacity-40 cursor-pointer">
                     Send
                   </button>

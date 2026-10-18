@@ -3,6 +3,7 @@ import io
 import re
 import json
 import base64
+from urllib.parse import quote
 import asyncio
 import logging
 import weakref
@@ -22,7 +23,7 @@ from session_analysis import analyze_session
 from sqlalchemy import select, update, func
 from sqlalchemy.exc import IntegrityError
 
-from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership
+from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership, GroupChatAttachment
 from group_room import RedisUnavailable, rooms
 from events import log_event
 import artifacts
@@ -32,7 +33,7 @@ from study_policy import resolve_for_group_session
 
 # Version of the study event schema (docs/event-schema.md). Echoed in research
 # responses so an exported dataset is interpretable against a fixed spec.
-STUDY_SCHEMA_VERSION = "1.1.0"
+STUDY_SCHEMA_VERSION = "1.2.0"
 from auth import router as auth_router, resolve_token_user_id, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
@@ -513,12 +514,20 @@ async def _enforce_chat_attachment_caps(conversation_id: str, attachments: list)
                 func.coalesce(func.sum(Attachment.size_bytes), 0),
             ).where(Attachment.conversation_id == conversation_id)
         )).one()
-    used_count, used_bytes = int(row[0]), int(row[1])
+    return _cap_attachments(
+        int(row[0]), int(row[1]), attachments,
+        size_of=lambda att: (len(att.get("data", "") or "") * 3) // 4,
+        name_of=lambda att: _att_field(att, "filename", "name") or "file",
+    )
 
+
+def _cap_attachments(used_count: int, used_bytes: int, attachments: list, *, size_of, name_of):
+    """Admit attachments while the running file count and bytes stay under the
+    per-chat caps, given what the chat already holds. Returns (kept, rejected)."""
     kept, rejected = [], []
     for att in attachments:
-        name = _att_field(att, "filename", "name") or "file"
-        approx = (len(att.get("data", "") or "") * 3) // 4
+        name = name_of(att)
+        approx = size_of(att)
         if used_count + 1 > _MAX_CHAT_ATTACH_COUNT:
             rejected.append({"name": name, "reason": f"chat limit reached (max {_MAX_CHAT_ATTACH_COUNT} files per chat)"})
             continue
@@ -2134,22 +2143,128 @@ async def _load_group_history(conversation_id: str) -> list[dict]:
     return history
 
 
-async def _save_team_chat(group_id: str, user_id: str, content: str) -> tuple[str, str | None]:
-    """Persist one team-backchannel message. This stream is human-only — it is
-    never sent to Gemini or scored, and it enters the research record only under
-    the assignment's team_chat_logging setting (see _log_team_chat). Returns
-    (message id, created_at ISO string)."""
+# Files a student may share in team chat. Narrower than what the coach accepts:
+# a teammate opens these in the app's own origin, so anything a browser would
+# render as a page (HTML, SVG) is refused, and the download endpoint still
+# serves unknown types as opaque bytes.
+_TEAM_CHAT_MIME_BY_EXT = {
+    ".pdf": "application/pdf",
+    ".docx": _DOCX_MIME,
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _team_chat_files(attachments) -> tuple[list[dict], list[dict]]:
+    """Validate and decode team-chat attachments. The type comes from the
+    extension, never the client's claimed mime. Returns (files, rejected), each
+    file as {filename, mime_type, data: bytes}."""
+    kept, rejected = _sanitize_attachments(attachments)
+    files = []
+    for att in kept:
+        name = (_att_field(att, "filename", "name") or "file").strip()[:512]
+        ext = os.path.splitext(name)[1].lower()
+        mime = _TEAM_CHAT_MIME_BY_EXT.get(ext)
+        if mime is None:
+            rejected.append({"name": name, "reason": "file type not allowed in team chat"})
+            continue
+        try:
+            raw = base64.b64decode(att.get("data") or "", validate=True)
+        except (ValueError, TypeError):
+            rejected.append({"name": name, "reason": "could not read file"})
+            continue
+        if not raw:
+            rejected.append({"name": name, "reason": "file is empty"})
+            continue
+        files.append({"filename": name, "mime_type": mime, "data": raw})
+    return files, rejected
+
+
+async def _cap_team_chat_files(group_id: str, files: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The per-chat file caps, counted over everything this team has shared."""
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(
+            select(
+                func.count(GroupChatAttachment.id),
+                func.coalesce(func.sum(GroupChatAttachment.size_bytes), 0),
+            ).where(GroupChatAttachment.group_id == group_id)
+        )).one()
+    return _cap_attachments(int(row[0]), int(row[1]), files,
+                            size_of=lambda f: len(f["data"]), name_of=lambda f: f["filename"])
+
+
+def _team_chat_file_meta(a) -> dict:
+    return {"id": a.id, "filename": a.filename, "mime_type": a.mime_type, "size_bytes": a.size_bytes}
+
+
+async def _save_team_chat(group_id: str, user_id: str, content: str,
+                          files: list[dict] | None = None) -> tuple[str, str | None, list[dict]]:
+    """Persist one team-backchannel message and any files shared with it. This
+    stream is human-only — it is never sent to Gemini or scored, and it enters
+    the research record only under the assignment's team_chat_logging setting
+    (see _log_team_chat). Returns (message id, created_at ISO string, file
+    metadata without the bytes)."""
     async with AsyncSessionLocal() as db:
         msg = GroupChatMessage(group_id=group_id, sender_user_id=user_id, content=content)
         db.add(msg)
+        await db.flush()
+        rows = [
+            GroupChatAttachment(message_id=msg.id, group_id=group_id, filename=f["filename"],
+                                mime_type=f["mime_type"], size_bytes=len(f["data"]), data=f["data"])
+            for f in files or []
+        ]
+        db.add_all(rows)
         await db.commit()
         await db.refresh(msg)
-        return msg.id, (msg.created_at.isoformat() if msg.created_at else None)
+        return (msg.id, (msg.created_at.isoformat() if msg.created_at else None),
+                [_team_chat_file_meta(a) for a in rows])
+
+
+async def _handle_team_chat(websocket, room, data: dict, group_id: str, user_id: str,
+                            my_name: str, before_notify=None) -> None:
+    """Validate, store and broadcast one team-chat message from either team
+    socket. The sender gets `team_chat_saved` back (their own copy is drawn
+    locally, and the broadcast excludes them) so their file chips can link to
+    the stored files. `before_notify(message_id, text, file_metadata)` runs
+    after the save and before anyone is told, for logging."""
+    content = (data.get("content") or "").strip()
+    files, rejected = _team_chat_files(data.get("attachments"))
+    if files:
+        files, over_cap = await _cap_team_chat_files(group_id, files)
+        rejected.extend(over_cap)
+    if rejected:
+        await websocket.send_text(json.dumps({"type": "team_chat_rejected", "files": rejected,
+                                              "client_id": data.get("client_id")}))
+    if not content and not files:
+        return
+    chat_id, created_at, meta = await _save_team_chat(group_id, user_id, content, files)
+    if before_notify is not None:
+        await before_notify(chat_id, content, meta)
+    await websocket.send_text(json.dumps({"type": "team_chat_saved", "client_id": data.get("client_id"),
+                                          "id": chat_id, "attachments": meta}))
+    await room.broadcast(
+        {
+            "type": "team_chat",
+            "id": chat_id,
+            "sender_user_id": user_id,
+            "sender_name": my_name,
+            "content": content,
+            "attachments": meta,
+            "created_at": created_at,
+        },
+        exclude=websocket,
+    )
 
 
 async def _log_team_chat(policy, group_session_id: str, user_id: str, message_id: str,
                          content: str, classroom_id: str | None, challenge_id: str | None,
-                         condition: dict) -> None:
+                         condition: dict, files: list[dict] | None = None) -> None:
     """One study event per team-chat message, when the assignment logs team chat.
 
     The payload is metadata only — length, never text — in both modes. Under
@@ -2173,6 +2288,14 @@ async def _log_team_chat(policy, group_session_id: str, user_id: str, message_id
             "chars": len(content),
             "words": len(content.split()),
             "content_logged": policy.logs_team_chat_content,
+            # Shared files are described, never copied: the bytes stay in
+            # group_chat_attachments, outside the research record. Only present
+            # when files were attached, so text-only events are unchanged.
+            **({
+                "attachments": len(files),
+                "attachment_bytes": sum(f["size_bytes"] for f in files),
+                "attachment_types": sorted({f["mime_type"] for f in files}),
+            } if files else {}),
         },
         condition=condition,
     )
@@ -2187,11 +2310,22 @@ async def _load_team_chat(group_id: str) -> list[dict]:
             .where(GroupChatMessage.group_id == group_id)
             .order_by(GroupChatMessage.created_at)
         )
+        # Metadata only; the bytes are fetched on demand by a member.
+        files: dict[str, list[dict]] = {}
+        for a in (await db.execute(
+            select(GroupChatAttachment.id, GroupChatAttachment.message_id, GroupChatAttachment.filename,
+                   GroupChatAttachment.mime_type, GroupChatAttachment.size_bytes)
+            .where(GroupChatAttachment.group_id == group_id)
+            .order_by(GroupChatAttachment.created_at)
+        )).all():
+            files.setdefault(a.message_id, []).append(_team_chat_file_meta(a))
         return [
             {
+                "id": m.id,
                 "sender_user_id": m.sender_user_id,
                 "sender_name": name,
                 "content": m.content,
+                "attachments": files.get(m.id, []),
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m, name in rows.all()
@@ -2433,20 +2567,7 @@ async def group_websocket_endpoint(
             # Team backchannel: student-to-student only. Free-form (no turn lock),
             # never sent to Gemini, never scored. Persisted separately for replay.
             if mtype == "team_chat":
-                chat_content = (data.get("content") or "").strip()
-                if not chat_content:
-                    continue
-                _, created_at = await _save_team_chat(group_id, user_id, chat_content)
-                await room.broadcast(
-                    {
-                        "type": "team_chat",
-                        "sender_user_id": user_id,
-                        "sender_name": my_name,
-                        "content": chat_content,
-                        "created_at": created_at,
-                    },
-                    exclude=websocket,
-                )
+                await _handle_team_chat(websocket, room, data, group_id, user_id, my_name)
                 continue
 
             if mtype != "message":
@@ -3134,25 +3255,14 @@ async def coach_websocket_endpoint(
                 continue
 
             if mtype == "team_chat":
-                chat_content = (data.get("content") or "").strip()
-                if not chat_content:
-                    continue
-                chat_id, created_at = await _save_team_chat(group_id, user_id, chat_content)
-                # Still delivered after the end, but outside the measurement
-                # window, so not logged (same rule as reads).
-                if not await _is_ended():
-                    await _log_team_chat(policy, group_session_id, user_id, chat_id, chat_content,
-                                         _classroom_id, challenge_id, condition)
-                await room.broadcast(
-                    {
-                        "type": "team_chat",
-                        "sender_user_id": user_id,
-                        "sender_name": my_name,
-                        "content": chat_content,
-                        "created_at": created_at,
-                    },
-                    exclude=websocket,
-                )
+                async def _log_chat(chat_id, chat_content, files):
+                    # Still delivered after the end, but outside the measurement
+                    # window, so not logged (same rule as reads).
+                    if not await _is_ended():
+                        await _log_team_chat(policy, group_session_id, user_id, chat_id, chat_content,
+                                             _classroom_id, challenge_id, condition, files)
+                await _handle_team_chat(websocket, room, data, group_id, user_id, my_name,
+                                        before_notify=_log_chat)
                 continue
 
             if mtype != "message":
@@ -3904,6 +4014,35 @@ async def end_group_session(
         "analysis_status": (gs.session_analysis or {}).get("status"),
         "end_reason": gs.end_reason,
     }
+
+
+@app.get("/groups/{group_id}/team-chat/attachments/{attachment_id}")
+async def download_team_chat_attachment(
+    group_id: str,
+    attachment_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """A file shared in team chat, for members of that team only. Always sent
+    as a download, never rendered inline, so a shared file cannot run as a page
+    in the app's origin."""
+    member = (await db.execute(
+        select(GroupMember.id).where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+    )).scalar_one_or_none()
+    if member is None:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    att = await db.get(GroupChatAttachment, attachment_id)
+    if att is None or att.group_id != group_id:
+        raise HTTPException(status_code=404, detail="File not found")
+    mime = att.mime_type if att.mime_type in _TEAM_CHAT_MIME_BY_EXT.values() else "application/octet-stream"
+    return Response(
+        content=att.data,
+        media_type=mime,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(att.filename)}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/groups/{group_id}/sessions/{session_num}/analysis")

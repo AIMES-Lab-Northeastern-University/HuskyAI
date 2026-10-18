@@ -523,6 +523,26 @@ class GroupChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class GroupChatAttachment(Base):
+    """A file a student shared in the team backchannel, for teammates to open.
+
+    Same isolation as GroupChatMessage: never sent to a coach, never scored, and
+    never copied into study_events — the event for its message carries only the
+    count, size and type of what was attached. Served back only to members of
+    the team (GET /groups/{group_id}/team-chat/attachments/{id})."""
+
+    __tablename__ = "group_chat_attachments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    message_id: Mapped[str] = mapped_column(String, ForeignKey("group_chat_messages.id"), nullable=False, index=True)
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ContestedPair(Base):
     """Two answers to the same subproblem that disagree: one from a teammate,
     one from the student's own coach.
