@@ -4040,6 +4040,39 @@ async def end_group_session(
     }
 
 
+async def _team_chat_attachment_or_403(db, group_id: str, attachment_id: str, user_id: str):
+    member = (await db.execute(
+        select(GroupMember.id).where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+    )).scalar_one_or_none()
+    if member is None:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    att = await db.get(GroupChatAttachment, attachment_id)
+    if att is None or att.group_id != group_id:
+        raise HTTPException(status_code=404, detail="File not found")
+    return att
+
+
+@app.get("/groups/{group_id}/team-chat/attachments/{attachment_id}/text")
+async def preview_team_chat_docx(
+    group_id: str,
+    attachment_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """The visible text of a shared .docx, for the in-app preview. Browsers can
+    show images, PDFs and plain text themselves; a Word file they can only
+    download, so its text is extracted here (the same extraction the coach uses)."""
+    att = await _team_chat_attachment_or_403(db, group_id, attachment_id, user_id)
+    if att.mime_type != _DOCX_MIME:
+        raise HTTPException(status_code=400, detail="Only Word documents need a text preview")
+    try:
+        text = await asyncio.to_thread(_extract_docx_text, att.data)
+    except Exception as e:
+        log.warning(f"could not extract docx text for preview {attachment_id}: {e}")
+        raise HTTPException(status_code=422, detail="This document could not be read. Download it instead.")
+    return {"filename": att.filename, "text": text}
+
+
 @app.get("/groups/{group_id}/team-chat/attachments/{attachment_id}")
 async def download_team_chat_attachment(
     group_id: str,
@@ -4049,15 +4082,9 @@ async def download_team_chat_attachment(
 ):
     """A file shared in team chat, for members of that team only. Always sent
     as a download, never rendered inline, so a shared file cannot run as a page
-    in the app's origin."""
-    member = (await db.execute(
-        select(GroupMember.id).where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
-    )).scalar_one_or_none()
-    if member is None:
-        raise HTTPException(status_code=403, detail="You are not a member of this group")
-    att = await db.get(GroupChatAttachment, attachment_id)
-    if att is None or att.group_id != group_id:
-        raise HTTPException(status_code=404, detail="File not found")
+    in the app's origin. The in-app preview fetches these bytes too and shows
+    them itself (image, PDF viewer or plain text)."""
+    att = await _team_chat_attachment_or_403(db, group_id, attachment_id, user_id)
     mime = att.mime_type if att.mime_type in _TEAM_CHAT_MIME_BY_EXT.values() else "application/octet-stream"
     return Response(
         content=att.data,

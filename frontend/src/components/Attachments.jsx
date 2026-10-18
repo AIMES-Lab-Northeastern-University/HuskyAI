@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { API_URL, authHeaders } from '../lib/api'
 
 // Client-side mirror of the backend caps (backend/main.py _MAX_ATTACH_*). A
@@ -95,12 +95,19 @@ export function PendingFiles({ files, onRemove, notice }) {
   )
 }
 
-/** Fetch a team-chat file with the session token and save it. A plain link
- *  can't carry the Authorization header. */
-async function downloadTeamFile(groupId, file) {
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+const TEXT_MIME = new Set(['text/plain', 'text/markdown', 'text/csv'])
+
+// Fetched with the session token: a plain link can't carry the Authorization
+// header, so every view and download goes through a blob.
+async function fetchTeamFile(groupId, file) {
   const r = await fetch(`${API_URL}/groups/${groupId}/team-chat/attachments/${file.id}`, { headers: authHeaders() })
-  if (!r.ok) throw new Error(`download failed (${r.status})`)
-  const url = URL.createObjectURL(await r.blob())
+  if (!r.ok) throw new Error(`Could not load the file (${r.status})`)
+  return r.blob()
+}
+
+async function downloadTeamFile(groupId, file) {
+  const url = URL.createObjectURL(await fetchTeamFile(groupId, file))
   const a = document.createElement('a')
   a.href = url
   a.download = file.filename
@@ -110,10 +117,90 @@ async function downloadTeamFile(groupId, file) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-/** A file on a sent message. Clickable once the server has stored it (has an
- *  id and a groupId to fetch from); struck through if the server refused it. */
+/** A shared file opened inside the app. Images and PDFs are shown from the
+ *  file itself, text files as plain text, and Word documents as the text the
+ *  server extracts (browsers can't display .docx). Nothing is rendered as a
+ *  page: the server only accepts these types, and text is shown, not parsed. */
+function FilePreview({ groupId, file, onClose }) {
+  const [view, setView] = useState({ state: 'loading' })
+  const [downloadError, setDownloadError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    let url = null
+    ;(async () => {
+      try {
+        if (file.mime_type === DOCX_MIME) {
+          const r = await fetch(`${API_URL}/groups/${groupId}/team-chat/attachments/${file.id}/text`, { headers: authHeaders() })
+          const body = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(body.detail || `Could not load the file (${r.status})`)
+          if (!cancelled) setView({ state: 'text', text: body.text || '(This document has no text.)' })
+          return
+        }
+        const blob = await fetchTeamFile(groupId, file)
+        if (TEXT_MIME.has(file.mime_type)) {
+          const text = await blob.text()
+          if (!cancelled) setView({ state: 'text', text })
+          return
+        }
+        // Typed explicitly so the browser picks its image or PDF viewer.
+        url = URL.createObjectURL(new Blob([blob], { type: file.mime_type }))
+        if (!cancelled) setView({ state: file.mime_type === 'application/pdf' ? 'pdf' : 'image', url })
+      } catch (e) {
+        if (!cancelled) setView({ state: 'error', message: String(e.message || e) })
+      }
+    })()
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url) }
+  }, [groupId, file])
+
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div role="dialog" aria-modal="true" aria-label={`Preview of ${file.filename}`} onClick={onClose}
+         className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(22,18,14,0.45)' }}>
+      <div onClick={e => e.stopPropagation()}
+           className="bg-[#FDFCFB] rounded-[14px] flex flex-col w-full overflow-hidden"
+           style={{ maxWidth: '900px', height: 'min(85vh, 900px)', border: '1.5px solid #E7E0D8' }}>
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-[#E7E0D8] flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+          <ClipIcon className="w-4 h-4 text-[#6B6560]" />
+          <span className="text-[14px] font-semibold text-[#16120E] truncate min-w-0">{file.filename}</span>
+          {downloadError && <span className="text-[11px] text-[#C8102E]">{downloadError}</span>}
+          <button type="button" onClick={() => downloadTeamFile(groupId, file).then(() => setDownloadError('')).catch(e => setDownloadError(String(e.message || e)))}
+                  className="ml-auto px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer flex-shrink-0">
+            Download
+          </button>
+          <button type="button" onClick={onClose} aria-label="Close preview"
+                  className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] border-0 cursor-pointer flex-shrink-0">
+            Close
+          </button>
+        </div>
+        <div className="flex-1 min-h-0 overflow-auto bg-white">
+          {view.state === 'loading' && <div className="p-6 text-[13px] text-[#9A948E]">Opening…</div>}
+          {view.state === 'error' && <div className="p-6 text-[13px] text-[#C8102E]">{view.message}</div>}
+          {view.state === 'text' && (
+            <pre className="p-5 m-0 text-[13px] leading-relaxed text-[#16120E] whitespace-pre-wrap break-words font-mono">{view.text}</pre>
+          )}
+          {view.state === 'image' && (
+            <div className="h-full flex items-center justify-center p-4">
+              <img src={view.url} alt={file.filename} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+            </div>
+          )}
+          {view.state === 'pdf' && <iframe src={view.url} title={file.filename} className="w-full h-full border-0" />}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** A file on a sent message. Opens a preview once the server has stored it
+ *  (has an id and a groupId to fetch from); struck through if refused. */
 export function FileChip({ file, groupId, tone = 'light' }) {
-  const [err, setErr] = useState('')
+  const [open, setOpen] = useState(false)
+  const close = useCallback(() => setOpen(false), [])
   const name = file.filename || file.name
   const base = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-[6px] border text-[11px] max-w-full'
   if (file.failed) {
@@ -128,11 +215,12 @@ export function FileChip({ file, groupId, tone = 'light' }) {
     return <span className={`${base} ${colors}`}><ClipIcon className="w-3 h-3" /><span className="truncate">{name}</span></span>
   }
   return (
-    <button type="button" title={err || `Download ${name}`}
-            onClick={() => downloadTeamFile(groupId, file).then(() => setErr('')).catch(e => setErr(String(e.message || e)))}
-            className={`${base} ${colors} cursor-pointer hover:underline`}>
-      <ClipIcon className="w-3 h-3" /><span className="truncate">{name}</span>
-      {err && <span className="text-[#C8102E] no-underline">!</span>}
-    </button>
+    <>
+      <button type="button" title={`Open ${name}`} onClick={() => setOpen(true)}
+              className={`${base} ${colors} cursor-pointer hover:underline`}>
+        <ClipIcon className="w-3 h-3" /><span className="truncate">{name}</span>
+      </button>
+      {open && <FilePreview groupId={groupId} file={file} onClose={close} />}
+    </>
   )
 }

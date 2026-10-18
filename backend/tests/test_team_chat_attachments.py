@@ -103,3 +103,39 @@ def test_the_study_event_describes_files_without_carrying_them(app_ready):
         "attachments": 2, "attachment_bytes": len(PDF) + 6,
         "attachment_types": ["application/pdf", "image/png"],
     }
+
+
+def _docx_bytes(*paragraphs):
+    import io
+
+    import docx
+    d = docx.Document()
+    for p in paragraphs:
+        d.add_paragraph(p)
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def test_a_shared_word_document_can_be_previewed_as_text_by_members(app_ready):
+    t = asyncio.run(_team())
+    client = TestClient(app_ready)
+    with _connect(client, t["gid"], t["users"][0]) as ws:
+        _until(ws, {"artifact"})
+        ws.send_text(json.dumps({"type": "team_chat", "content": "", "attachments": [
+            _file("brief.docx", _docx_bytes("Route 7 lost 22% of riders.", "Recommend a review.")),
+            _file("notes.txt", b"plain"),
+        ]}))
+        docx_meta, txt_meta = _until(ws, {"team_chat_saved"})["attachments"]
+
+    def preview(att_id, uid):
+        return client.get(f"/groups/{t['gid']}/team-chat/attachments/{att_id}/text",
+                          headers={"Authorization": f"Bearer {_token(uid)}"})
+
+    r = preview(docx_meta["id"], t["users"][1])
+    assert r.status_code == 200
+    assert r.json() == {"filename": "brief.docx",
+                        "text": "Route 7 lost 22% of riders.\nRecommend a review."}
+    # Other types are previewed by the browser from the file itself.
+    assert preview(txt_meta["id"], t["users"][1]).status_code == 400
+    assert preview(docx_meta["id"], t["owner"]).status_code == 403
