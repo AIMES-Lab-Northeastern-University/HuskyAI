@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { API_URL, authHeaders } from '../lib/api'
 
 // Client-side mirror of the backend caps (backend/main.py _MAX_ATTACH_*). A
@@ -98,30 +98,78 @@ export function PendingFiles({ files, onRemove, notice }) {
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const TEXT_MIME = new Set(['text/plain', 'text/markdown', 'text/csv'])
 
-// Fetched with the session token: a plain link can't carry the Authorization
-// header, so every view and download goes through a blob.
-async function fetchTeamFile(groupId, file) {
-  const r = await fetch(`${API_URL}/groups/${groupId}/team-chat/attachments/${file.id}`, { headers: authHeaders() })
-  if (!r.ok) throw new Error(`Could not load the file (${r.status})`)
-  return r.blob()
+// The type a preview needs, from the extension (the browser's own guess for a
+// picked file is often empty). Mirrors backend _TEAM_CHAT_MIME_BY_EXT.
+const MIME_BY_EXT = {
+  '.pdf': 'application/pdf', '.docx': DOCX_MIME, '.txt': 'text/plain', '.md': 'text/markdown',
+  '.csv': 'text/csv', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp', '.gif': 'image/gif',
+}
+const mimeFor = name => MIME_BY_EXT[(name.match(/\.[^.]+$/)?.[0] || '').toLowerCase()] || 'application/octet-stream'
+
+/** Where a previewed file's bytes come from: a team-chat file is fetched from
+ *  its members-only endpoint (with the session token — a plain link can't carry
+ *  the Authorization header); a coach-chat file is already on the page as
+ *  base64, from the chat history or from the student's own pick. */
+function teamSource(groupId, file) {
+  const base = `${API_URL}/groups/${groupId}/team-chat/attachments/${file.id}`
+  return {
+    name: file.filename,
+    mime: file.mime_type,
+    blob: async () => {
+      const r = await fetch(base, { headers: authHeaders() })
+      if (!r.ok) throw new Error(`Could not load the file (${r.status})`)
+      return r.blob()
+    },
+    docxText: async () => {
+      const r = await fetch(`${base}/text`, { headers: authHeaders() })
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(body.detail || `Could not load the file (${r.status})`)
+      return body.text
+    },
+  }
 }
 
-async function downloadTeamFile(groupId, file) {
-  const url = URL.createObjectURL(await fetchTeamFile(groupId, file))
+function localSource(file) {
+  const name = file.filename || file.name
+  const mime = mimeFor(name)
+  return {
+    name,
+    mime,
+    blob: async () => {
+      const bin = atob(file.data)
+      const bytes = new Uint8Array(bin.length)
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+      return new Blob([bytes], { type: mime })
+    },
+    docxText: async () => {
+      const r = await fetch(`${API_URL}/files/docx-text`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ data: file.data }),
+      })
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(body.detail || `Could not read the file (${r.status})`)
+      return body.text
+    },
+  }
+}
+
+async function downloadSource(source) {
+  const url = URL.createObjectURL(await source.blob())
   const a = document.createElement('a')
   a.href = url
-  a.download = file.filename
+  a.download = source.name
   document.body.appendChild(a)
   a.click()
   a.remove()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-/** A shared file opened inside the app. Images and PDFs are shown from the
- *  file itself, text files as plain text, and Word documents as the text the
- *  server extracts (browsers can't display .docx). Nothing is rendered as a
- *  page: the server only accepts these types, and text is shown, not parsed. */
-function FilePreview({ groupId, file, onClose }) {
+/** A file opened inside the app. Images and PDFs are shown from the file
+ *  itself, text files as plain text, and Word documents as the text the server
+ *  extracts (browsers can't display .docx). Nothing is rendered as a page: only
+ *  these types are accepted, and text is shown, not parsed. */
+function FilePreview({ source, onClose }) {
   const [view, setView] = useState({ state: 'loading' })
   const [downloadError, setDownloadError] = useState('')
 
@@ -130,28 +178,30 @@ function FilePreview({ groupId, file, onClose }) {
     let url = null
     ;(async () => {
       try {
-        if (file.mime_type === DOCX_MIME) {
-          const r = await fetch(`${API_URL}/groups/${groupId}/team-chat/attachments/${file.id}/text`, { headers: authHeaders() })
-          const body = await r.json().catch(() => ({}))
-          if (!r.ok) throw new Error(body.detail || `Could not load the file (${r.status})`)
-          if (!cancelled) setView({ state: 'text', text: body.text || '(This document has no text.)' })
+        if (source.mime === DOCX_MIME) {
+          const text = await source.docxText()
+          if (!cancelled) setView({ state: 'text', text: text || '(This document has no text.)' })
           return
         }
-        const blob = await fetchTeamFile(groupId, file)
-        if (TEXT_MIME.has(file.mime_type)) {
+        const blob = await source.blob()
+        if (TEXT_MIME.has(source.mime)) {
           const text = await blob.text()
           if (!cancelled) setView({ state: 'text', text })
           return
         }
+        if (source.mime !== 'application/pdf' && !source.mime.startsWith('image/')) {
+          if (!cancelled) setView({ state: 'error', message: "This file can't be previewed. Download it instead." })
+          return
+        }
         // Typed explicitly so the browser picks its image or PDF viewer.
-        url = URL.createObjectURL(new Blob([blob], { type: file.mime_type }))
-        if (!cancelled) setView({ state: file.mime_type === 'application/pdf' ? 'pdf' : 'image', url })
+        url = URL.createObjectURL(new Blob([blob], { type: source.mime }))
+        if (!cancelled) setView({ state: source.mime === 'application/pdf' ? 'pdf' : 'image', url })
       } catch (e) {
         if (!cancelled) setView({ state: 'error', message: String(e.message || e) })
       }
     })()
     return () => { cancelled = true; if (url) URL.revokeObjectURL(url) }
-  }, [groupId, file])
+  }, [source])
 
   useEffect(() => {
     const onKey = e => { if (e.key === 'Escape') onClose() }
@@ -160,16 +210,16 @@ function FilePreview({ groupId, file, onClose }) {
   }, [onClose])
 
   return (
-    <div role="dialog" aria-modal="true" aria-label={`Preview of ${file.filename}`} onClick={onClose}
+    <div role="dialog" aria-modal="true" aria-label={`Preview of ${source.name}`} onClick={onClose}
          className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(22,18,14,0.45)' }}>
       <div onClick={e => e.stopPropagation()}
            className="bg-[#FDFCFB] rounded-[14px] flex flex-col w-full overflow-hidden"
            style={{ maxWidth: '900px', height: 'min(85vh, 900px)', border: '1.5px solid #E7E0D8' }}>
         <div className="flex items-center gap-2 px-4 py-3 border-b border-[#E7E0D8] flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <ClipIcon className="w-4 h-4 text-[#6B6560]" />
-          <span className="text-[14px] font-semibold text-[#16120E] truncate min-w-0">{file.filename}</span>
+          <span className="text-[14px] font-semibold text-[#16120E] truncate min-w-0">{source.name}</span>
           {downloadError && <span className="text-[11px] text-[#C8102E]">{downloadError}</span>}
-          <button type="button" onClick={() => downloadTeamFile(groupId, file).then(() => setDownloadError('')).catch(e => setDownloadError(String(e.message || e)))}
+          <button type="button" onClick={() => downloadSource(source).then(() => setDownloadError('')).catch(e => setDownloadError(String(e.message || e)))}
                   className="ml-auto px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer flex-shrink-0">
             Download
           </button>
@@ -186,21 +236,24 @@ function FilePreview({ groupId, file, onClose }) {
           )}
           {view.state === 'image' && (
             <div className="h-full flex items-center justify-center p-4">
-              <img src={view.url} alt={file.filename} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+              <img src={view.url} alt={source.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
             </div>
           )}
-          {view.state === 'pdf' && <iframe src={view.url} title={file.filename} className="w-full h-full border-0" />}
+          {view.state === 'pdf' && <iframe src={view.url} title={source.name} className="w-full h-full border-0" />}
         </div>
       </div>
     </div>
   )
 }
 
-/** A file on a sent message. Opens a preview once the server has stored it
- *  (has an id and a groupId to fetch from); struck through if refused. */
+/** A file on a sent message, opening a preview. A coach-chat file carries its
+ *  own bytes; a team-chat file opens once the server has stored it (has an id
+ *  and a groupId to fetch from). Struck through if it was refused. */
 export function FileChip({ file, groupId, tone = 'light' }) {
   const [open, setOpen] = useState(false)
   const close = useCallback(() => setOpen(false), [])
+  const source = useMemo(() => (file.data ? localSource(file)
+    : file.id && groupId ? teamSource(groupId, file) : null), [file, groupId])
   const name = file.filename || file.name
   const base = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-[6px] border text-[11px] max-w-full'
   if (file.failed) {
@@ -211,7 +264,7 @@ export function FileChip({ file, groupId, tone = 'light' }) {
     )
   }
   const colors = tone === 'dark' ? 'bg-white/15 border-white/30 text-white' : 'bg-white border-[#D8D0C6] text-[#4A4440]'
-  if (!file.id || !groupId) {
+  if (!source) {
     return <span className={`${base} ${colors}`}><ClipIcon className="w-3 h-3" /><span className="truncate">{name}</span></span>
   }
   return (
@@ -220,7 +273,7 @@ export function FileChip({ file, groupId, tone = 'light' }) {
               className={`${base} ${colors} cursor-pointer hover:underline`}>
         <ClipIcon className="w-3 h-3" /><span className="truncate">{name}</span>
       </button>
-      {open && <FilePreview groupId={groupId} file={file} onClose={close} />}
+      {open && <FilePreview source={source} onClose={close} />}
     </>
   )
 }

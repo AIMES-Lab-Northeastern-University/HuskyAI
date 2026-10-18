@@ -139,3 +139,16 @@ def test_a_shared_word_document_can_be_previewed_as_text_by_members(app_ready):
     # Other types are previewed by the browser from the file itself.
     assert preview(txt_meta["id"], t["users"][1]).status_code == 400
     assert preview(docx_meta["id"], t["owner"]).status_code == 403
+
+
+def test_docx_text_extracts_a_file_the_caller_sends_and_needs_sign_in(app_ready):
+    t = asyncio.run(_team())
+    client = TestClient(app_ready)
+    data = base64.b64encode(_docx_bytes("Coach file", "Second line")).decode()
+    r = client.post("/files/docx-text", json={"data": data},
+                    headers={"Authorization": f"Bearer {_token(t['users'][0])}"})
+    assert r.status_code == 200 and r.json() == {"text": "Coach file\nSecond line"}
+    bad = client.post("/files/docx-text", json={"data": base64.b64encode(b"not a docx").decode()},
+                      headers={"Authorization": f"Bearer {_token(t['users'][0])}"})
+    assert bad.status_code == 422
+    assert client.post("/files/docx-text", json={"data": data}).status_code == 401

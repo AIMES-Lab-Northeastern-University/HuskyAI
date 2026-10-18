@@ -4052,6 +4052,26 @@ async def _team_chat_attachment_or_403(db, group_id: str, attachment_id: str, us
     return att
 
 
+class DocxTextBody(BaseModel):
+    data: str  # base64 .docx bytes
+
+
+@app.post("/files/docx-text")
+async def docx_text(body: DocxTextBody, user_id: str = Depends(get_current_user)):
+    """The visible text of a .docx the caller already holds, for previewing a
+    file attached to a coach message (the page has its bytes from the chat).
+    Stateless: nothing is stored, and the caller only learns what is in the
+    file they sent. Capped at the per-file attachment limit."""
+    if (len(body.data) * 3) // 4 > _MAX_ATTACH_BYTES:
+        raise HTTPException(status_code=413, detail="File too large to preview")
+    try:
+        raw = base64.b64decode(body.data, validate=True)
+        text = await asyncio.to_thread(_extract_docx_text, raw)
+    except Exception:
+        raise HTTPException(status_code=422, detail="This document could not be read. Download it instead.")
+    return {"text": text}
+
+
 @app.get("/groups/{group_id}/team-chat/attachments/{attachment_id}/text")
 async def preview_team_chat_docx(
     group_id: str,

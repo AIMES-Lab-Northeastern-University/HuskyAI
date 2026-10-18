@@ -566,7 +566,8 @@ export default function CoachWorkspace() {
           setMessages(data.messages.filter(m => m?.role && typeof m.content === 'string')
             .map(m => ({
               role: m.role, content: m.content,
-              attachments: (m.attachments || []).map(a => ({ name: a.filename || a.name })),
+              // The history carries each file's bytes, so the chip can open a preview.
+              attachments: (m.attachments || []).map(a => ({ name: a.filename || a.name, data: a.data })),
             })))
         }
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
@@ -800,7 +801,7 @@ export default function CoachWorkspace() {
     if ((!content && !files.length) || isStreaming || isTyping || isEvaluating) return
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
     lastSentRef.current = content
-    setMessages(prev => [...prev, { role: 'user', content, attachments: files.map(f => ({ name: f.name })) }])
+    setMessages(prev => [...prev, { role: 'user', content, attachments: files.map(f => ({ name: f.name, data: f.data })) }])
     wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: coachFiles.toWire() }))
     setInput('')
     coachFiles.clear()
