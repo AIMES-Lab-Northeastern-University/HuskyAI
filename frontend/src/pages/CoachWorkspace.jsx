@@ -319,6 +319,10 @@ export default function CoachWorkspace() {
   const [roster, setRoster]           = useState([])
   const [challengeTitle, setChTitle]  = useState(null)
   const [challengeContext, setCtx]    = useState(null)
+  // The task bar stays pinned above the coach chat for the whole session.
+  // null = not toggled yet: expanded until the first message, then collapsed
+  // to one line so it doesn't push the conversation down.
+  const [taskOpen, setTaskOpen]       = useState(null)
   const [condition, setCondition]     = useState(null)
 
   const [artifact, setArtifact]       = useState(null)
@@ -967,16 +971,34 @@ export default function CoachWorkspace() {
             {turnCount > 0 && <span className="text-[11px] text-[#9A948E] ml-auto">Turn {turnCount}</span>}
           </div>
 
-          <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
-            {challengeContext && messages.length === 0 && (
-              <div className="p-4 rounded-[12px] bg-[#FDFCFB] border border-[#E7E0D8]" style={{ borderWidth: '1.5px' }}>
-                <div className="text-[13px] font-bold text-[#16120E] mb-1">{challengeContext.title}</div>
-                <div className="text-[13px] text-[#4A4440]">{challengeContext.goal}</div>
-                {challengeContext.seed_question && (
-                  <div className="text-[13px] text-[#6B6560] mt-2 italic">{challengeContext.seed_question}</div>
+          {challengeContext && (challengeContext.goal || challengeContext.brief || challengeContext.seed_question) && (() => {
+            const open = taskOpen ?? messages.length === 0
+            return (
+              <div className="px-5 py-3 bg-[#FDFCFB] border-b border-[#E7E0D8] flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+                <button type="button" onClick={() => setTaskOpen(!open)} aria-expanded={open}
+                  className="w-full flex items-center gap-2 text-left bg-transparent border-0 p-0 cursor-pointer">
+                  <span className="text-[11px] font-bold text-[#C8102E] uppercase tracking-[0.7px] flex-shrink-0">Task</span>
+                  <span className={`text-[13px] text-[#16120E] font-semibold min-w-0 ${open ? '' : 'truncate'}`}>
+                    {challengeContext.title}{!open && challengeContext.goal ? ` · ${challengeContext.goal}` : ''}
+                  </span>
+                  <span className="text-[11px] text-[#9A948E] ml-auto flex-shrink-0">{open ? 'Hide' : 'Show'}</span>
+                </button>
+                {open && (
+                  <div className="mt-2 flex flex-col gap-1.5 text-[13px] leading-relaxed">
+                    {challengeContext.goal && (
+                      <div className="text-[#4A4440]"><strong className="text-[#16120E]">Goal:</strong> {challengeContext.goal}</div>
+                    )}
+                    {challengeContext.brief && <div className="text-[#4A4440]">{challengeContext.brief}</div>}
+                    {challengeContext.seed_question && (
+                      <div className="text-[#6B6560] italic">Starter question: {challengeContext.seed_question}</div>
+                    )}
+                  </div>
                 )}
               </div>
-            )}
+            )
+          })()}
+
+          <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
             {messages.map((m, i) => (
               <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-[80%] px-4 py-2.5 rounded-[14px] text-[14px] leading-relaxed ${
