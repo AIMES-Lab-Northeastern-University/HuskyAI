@@ -27,6 +27,7 @@ from database import (
     Classroom,
     ClassroomChallenge,
     ClassroomMembership,
+    Conversation,
     EvalResult,
     GroupChallenge,
     GroupMember,
@@ -1217,6 +1218,113 @@ async def my_husky_score(
         "turns_counted": int(session_count or 0),
         "sessions_counted": int(session_count or 0),
     }
+
+
+_PROGRESS_DIMS = ("psq", "ccm", "tsi", "clm", "ras")
+
+
+def _session_feed_enabled(ch: Challenge | None, session_number: int) -> bool:
+    """Mirrors main._resolve_solo_study_config: a session index outside
+    sessions_data, or a missing flag, means the feed was on."""
+    data = (ch.sessions_data if ch else None) or []
+    idx = session_number - 1
+    return bool(data[idx].get("feed_enabled", True)) if 0 <= idx < len(data) else True
+
+
+@router.get("/me/progress")
+async def my_progress(
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The student's score over time: one point per ended challenge session,
+    oldest first, with the session's average PEI and per-dimension averages.
+
+    Solo sessions read the student's own conversation. Team sessions read only
+    the student's private-coach conversation, so the point is their own average
+    (the per-student figure in _coach_session_summary), not the team's.
+
+    Sessions run with the feed off are left out: the study withholds those
+    scores from the student, and a progress chart would show them anyway.
+    Sessions with no scored turn are left out too — there is nothing to plot.
+    """
+    # (challenge_id, session_number, mode, completed_at, conversation_id)
+    candidates: list[tuple[str, int, str, datetime | None, str]] = []
+
+    solo = (await db.execute(
+        select(UserChallengeSession).where(
+            UserChallengeSession.user_id == user_id,
+            UserChallengeSession.status == "completed",
+            UserChallengeSession.conversation_id.is_not(None),
+        )
+    )).scalars().all()
+    for s in solo:
+        candidates.append((s.challenge_id, s.session_number, "solo", s.completed_at, s.conversation_id))
+
+    team = (await db.execute(
+        select(GroupSession, Conversation.id)
+        .join(Conversation, Conversation.group_session_id == GroupSession.id)
+        .where(
+            Conversation.user_id == user_id,
+            Conversation.kind == "coach_private",
+            GroupSession.status == "completed",
+        )
+    )).all()
+    for gs, conv_id in team:
+        candidates.append((gs.challenge_id, gs.session_number, "team", gs.completed_at, conv_id))
+
+    if not candidates:
+        return {"sessions": []}
+
+    challenges = {
+        ch.id: ch for ch in (await db.execute(
+            select(Challenge).where(Challenge.id.in_({c[0] for c in candidates}))
+        )).scalars().all()
+    }
+    candidates = [c for c in candidates if _session_feed_enabled(challenges.get(c[0]), c[1])]
+
+    # Same rows session_avg_pei averages: every turn with a PEI. Unscored turns
+    # (pending/failed) have a NULL PEI and drop out here.
+    scores = {
+        row[0]: row[1:] for row in (await db.execute(
+            select(
+                EvalResult.conversation_id,
+                func.count(EvalResult.pei),
+                func.avg(EvalResult.pei),
+                *(func.avg(getattr(EvalResult, d)) for d in _PROGRESS_DIMS),
+            )
+            .where(
+                EvalResult.conversation_id.in_({c[4] for c in candidates}),
+                EvalResult.pei.is_not(None),
+            )
+            .group_by(EvalResult.conversation_id)
+        )).all()
+    } if candidates else {}
+
+    def _r(v):
+        return round(float(v), 1) if v is not None else None
+
+    out = []
+    for challenge_id, session_number, mode, completed_at, conv_id in candidates:
+        row = scores.get(conv_id)
+        if not row or not row[0]:
+            continue
+        turns, avg_pei, *dims = row
+        ch = challenges.get(challenge_id)
+        out.append({
+            "challenge_id": challenge_id,
+            "title": ch.title if ch else "",
+            "week": ch.week if ch else None,
+            "session_number": session_number,
+            "mode": mode,
+            "completed_at": completed_at.isoformat() if completed_at else None,
+            "avg_pei": _r(avg_pei),
+            "turns": int(turns),
+            "dimensions": {d: _r(v) for d, v in zip(_PROGRESS_DIMS, dims)},
+        })
+    # Completed sessions always carry completed_at; the fallback only keeps a
+    # malformed row from breaking the sort.
+    out.sort(key=lambda p: (p["completed_at"] or "", p["title"], p["session_number"]))
+    return {"sessions": out}
 
 
 @router.post("", status_code=201)

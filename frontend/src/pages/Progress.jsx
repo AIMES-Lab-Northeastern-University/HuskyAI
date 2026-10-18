@@ -38,7 +38,7 @@ function PeiRing({ score }) {
   )
 }
 
-function ProgBar({ label, pct, color }) {
+function ProgBar({ label, pct, color, delta }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
       <div style={{ fontSize: '12px', color: '#4A4440', fontWeight: 500, width: '40px', flexShrink: 0 }}>{label}</div>
@@ -47,7 +47,61 @@ function ProgBar({ label, pct, color }) {
         <div style={{ width: `${pct}%`, height: '100%', borderRadius: '999px', background: color, transition: 'width 0.5s ease' }} />
       </div>
       <div style={{ fontSize: '12px', fontWeight: 700, color: '#4A4440', width: '32px', textAlign: 'right' }}>{pct}</div>
+      {delta !== undefined && (
+        <div style={{ fontSize: '11px', fontWeight: 700, width: '34px', textAlign: 'right', color: delta > 0 ? '#16A34A' : delta < 0 ? '#C8102E' : '#9A948E' }}>
+          {delta == null ? '' : delta > 0 ? `+${delta}` : delta}
+        </div>
+      )}
     </div>
+  )
+}
+
+const signed = n => (n > 0 ? `+${n}` : `${n}`)
+
+// PEI per ended session, oldest first, on a fixed 0–100 scale with the
+// Novice/Intermediate/Advanced band edges (40, 70) drawn in.
+function ScoreTrend({ sessions }) {
+  const W = 260
+  const H = 110
+  const padX = 20
+  const padY = 8
+  const hasTeam = sessions.some(s => s.mode === 'team')
+  const x = i => (sessions.length === 1 ? W / 2 : padX + (i * (W - 2 * padX)) / (sessions.length - 1))
+  const y = v => padY + ((100 - v) * (H - 2 * padY)) / 100
+  const points = sessions.map((s, i) => `${x(i)},${y(s.avg_pei)}`).join(' ')
+  const first = sessions[0].avg_pei
+  const latest = sessions[sessions.length - 1].avg_pei
+  const change = Math.round((latest - first) * 10) / 10
+  return (
+    <>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', marginBottom: '8px' }}>
+        {[40, 70].map(b => (
+          <g key={b}>
+            <line x1={16} x2={W} y1={y(b)} y2={y(b)} stroke="#E7E0D8" strokeDasharray="3 3" />
+            <text x={0} y={y(b) + 3} fontSize="9" fill="#9A948E">{b}</text>
+          </g>
+        ))}
+        {sessions.length > 1 && (
+          <polyline points={points} fill="none" stroke="#F97316" strokeWidth="2" strokeLinejoin="round" />
+        )}
+        {sessions.map((s, i) => (
+          <circle key={i} cx={x(i)} cy={y(s.avg_pei)} r="3.5" fill={s.mode === 'team' ? '#0D9488' : '#F97316'} stroke="#FDFCFB" strokeWidth="1.5">
+            <title>{`${s.title} · Session ${s.session_number}${s.mode === 'team' ? ' (team)' : ''}\n${s.completed_at ? new Date(s.completed_at).toLocaleDateString() : ''} · PEI ${s.avg_pei}`}</title>
+          </circle>
+        ))}
+      </svg>
+      <div style={{ fontSize: '12px', color: '#9A948E', textAlign: 'center' }}>
+        {sessions.length === 1
+          ? 'Your first scored session. End another to see your trend.'
+          : <>First {first} → latest {latest} <span style={{ fontWeight: 700, color: change > 0 ? '#16A34A' : change < 0 ? '#C8102E' : '#9A948E' }}>({signed(change)})</span> over {sessions.length} sessions</>}
+      </div>
+      {hasTeam && (
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '12px', fontSize: '11px', color: '#9A948E', marginTop: '6px' }}>
+          <span><span style={{ color: '#F97316' }}>●</span> Solo</span>
+          <span><span style={{ color: '#0D9488' }}>●</span> Team (your turns)</span>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -89,6 +143,7 @@ export default function Progress() {
   const [challenges, setChallenges] = useState([])
   const [loading, setLoading] = useState(!isDemo)
   const [huskyScore, setHuskyScore] = useState(null)
+  const [progressSessions, setProgressSessions] = useState([])
 
   useEffect(() => {
     if (isDemo) return
@@ -100,15 +155,18 @@ export default function Progress() {
     let cancelled = false
     ;(async () => {
       try {
-        const [challengesResp, huskyResp] = await Promise.all([
+        const [challengesResp, huskyResp, progressResp] = await Promise.all([
           fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() } }),
-          fetch(`${API_URL}/me/husky-score`, { headers: { ...authHeaders() } }),
+          fetch(`${API_URL}/challenges/me/husky-score`, { headers: { ...authHeaders() } }),
+          fetch(`${API_URL}/challenges/me/progress`, { headers: { ...authHeaders() } }),
         ])
         const challengeData = await challengesResp.json().catch(() => [])
         const huskyData = await huskyResp.json().catch(() => ({}))
+        const progressData = await progressResp.json().catch(() => ({}))
         if (!cancelled) {
           if (Array.isArray(challengeData)) setChallenges(challengeData)
           setHuskyScore(huskyData)
+          if (Array.isArray(progressData?.sessions)) setProgressSessions(progressData.sessions)
         }
       } catch {
         if (!cancelled) setChallenges([])
@@ -133,6 +191,27 @@ export default function Progress() {
       }))
     return { bestPei, history }
   }, [challenges])
+
+  // Latest session's dimension scores, with the change since the first
+  // session once there are two to compare.
+  const dimBars = useMemo(() => {
+    if (!progressSessions.length) return []
+    const first = progressSessions[0].dimensions || {}
+    const latest = progressSessions[progressSessions.length - 1].dimensions || {}
+    const compare = progressSessions.length > 1
+    return Object.keys(DIM_META)
+      .filter(label => latest[label.toLowerCase()] != null)
+      .map(label => {
+        const now = latest[label.toLowerCase()]
+        const then = first[label.toLowerCase()]
+        return {
+          label,
+          color: DIM_META[label].color,
+          pct: Math.round(now),
+          delta: compare ? (then != null ? Math.round(now - then) : null) : undefined,
+        }
+      })
+  }, [progressSessions])
 
   const handleLogout = () => {
     if (isDemo) {
@@ -205,9 +284,16 @@ export default function Progress() {
               <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '14px' }}>Dimension breakdown</div>
               {isDemo ? (
                 DEMO_BAR_DATA.map(b => <ProgBar key={b.label} {...b} />)
+              ) : dimBars.length ? (
+                <>
+                  {dimBars.map(b => <ProgBar key={b.label} {...b} />)}
+                  <div style={{ fontSize: '12px', color: '#9A948E', textAlign: 'center', marginTop: '4px' }}>
+                    {progressSessions.length > 1 ? 'Latest session · change since your first' : 'From your latest session'}
+                  </div>
+                </>
               ) : (
                 <p style={{ fontSize: '14px', color: '#6B6560', lineHeight: 1.6, margin: 0 }}>
-                  Per-dimension scores (PSQ, CCM, TSI, …) will show here once we surface your latest evaluation breakdown from the API.
+                  {loading ? 'Loading…' : 'End a scored session to see how you do on each dimension.'}
                 </p>
               )}
             </div>
@@ -226,9 +312,11 @@ export default function Progress() {
                   </div>
                   <div style={{ fontSize: '12px', color: '#9A948E', textAlign: 'center' }}>Weeks 1 – 5</div>
                 </>
+              ) : progressSessions.length ? (
+                <ScoreTrend sessions={progressSessions} />
               ) : (
                 <p style={{ fontSize: '14px', color: '#6B6560', lineHeight: 1.6, margin: 0 }}>
-                  A week-by-week chart will appear after more scored sessions are recorded.
+                  {loading ? 'Loading…' : 'Your score after each session will be charted here once you end a scored session.'}
                 </p>
               )}
             </div>
