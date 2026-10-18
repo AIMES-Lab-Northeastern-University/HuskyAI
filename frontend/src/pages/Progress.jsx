@@ -58,6 +58,87 @@ function ProgBar({ label, pct, color, delta }) {
 
 const signed = n => (n > 0 ? `+${n}` : `${n}`)
 
+// One ended team session on a 0–100 track: the shaded band spans the lowest to
+// highest student average, the dark marker is the team score and the orange
+// one is this student's own average.
+function TeamSessionTrack({ s }) {
+  const pct = v => `${Math.max(0, Math.min(100, v))}%`
+  return (
+    <div style={{ position: 'relative', flex: 1, height: '14px', minWidth: '80px' }}>
+      <div style={{ position: 'absolute', top: '6px', left: 0, right: 0, height: '2px', background: '#E7E0D8', borderRadius: '2px' }} />
+      {[40, 70].map(b => (
+        <div key={b} style={{ position: 'absolute', top: '2px', left: pct(b), width: '1px', height: '10px', background: '#E7E0D8' }} />
+      ))}
+      {s.pei_range && (
+        <div style={{ position: 'absolute', top: '4px', height: '6px', borderRadius: '3px', background: '#CCEFEC',
+                      left: pct(s.pei_range.min), width: `${Math.max(1, s.pei_range.max - s.pei_range.min)}%` }} />
+      )}
+      {s.my_pei != null && (
+        <div title={`You: ${s.my_pei}`} style={{ position: 'absolute', top: '2px', left: `calc(${pct(s.my_pei)} - 5px)`, width: '10px', height: '10px', borderRadius: '50%', background: '#F97316', border: '2px solid #FDFCFB' }} />
+      )}
+      {s.team_pei != null && (
+        <div title={`Team: ${s.team_pei}`} style={{ position: 'absolute', top: '1px', left: `calc(${pct(s.team_pei)} - 6px)`, width: '12px', height: '12px', borderRadius: '50%', background: '#0D9488', border: '2px solid #FDFCFB' }} />
+      )}
+    </div>
+  )
+}
+
+function TeamProgress({ team, onOpen }) {
+  const pct = team.total_sessions > 0 ? Math.round((team.sessions_completed / team.total_sessions) * 100) : 0
+  const scored = team.sessions.filter(s => s.team_pei != null)
+  const change = scored.length > 1 ? Math.round((scored[scored.length - 1].team_pei - scored[0].team_pei) * 10) / 10 : null
+  return (
+    <div style={{ padding: '16px 0', borderTop: '1px solid #F7F3EE' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+        <button type="button" onClick={onOpen}
+                style={{ fontSize: '14px', fontWeight: 600, color: '#16120E', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
+          {team.title}
+        </button>
+        <span style={{ fontSize: '12px', color: '#9A948E' }}>
+          {team.team_name ? `${team.team_name} · ` : ''}
+          {team.teammates.length ? `with ${team.teammates.join(', ')}` : 'just you so far'}
+        </span>
+        {change != null && (
+          <span style={{ marginLeft: 'auto', fontSize: '12px', fontWeight: 700, color: change > 0 ? '#16A34A' : change < 0 ? '#C8102E' : '#9A948E' }}>
+            Team {signed(change)} since session {scored[0].session_number}
+          </span>
+        )}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+        <div style={{ flex: 1, height: '7px', background: '#F7F3EE', borderRadius: '999px', border: '1px solid #E7E0D8', overflow: 'hidden' }}>
+          <div style={{ width: `${pct}%`, height: '100%', borderRadius: '999px', background: pct === 100 ? '#16A34A' : '#0D9488', transition: 'width 0.5s ease' }} />
+        </div>
+        <span style={{ fontSize: '12px', color: '#4A4440', fontWeight: 600, whiteSpace: 'nowrap' }}>
+          {team.sessions_completed}/{team.total_sessions} sessions
+        </span>
+      </div>
+      {team.sessions.length === 0 ? (
+        <div style={{ fontSize: '12px', color: '#9A948E' }}>Your team hasn't started yet.</div>
+      ) : team.sessions.map(s => (
+        <div key={s.session_number} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '5px 0' }}>
+          <span style={{ fontSize: '12px', color: '#4A4440', fontWeight: 600, width: '64px', flexShrink: 0 }}>Session {s.session_number}</span>
+          {s.status !== 'completed' ? (
+            <span style={{ fontSize: '12px', color: '#9A948E' }}>In progress</span>
+          ) : s.scores_hidden ? (
+            <span style={{ fontSize: '12px', color: '#9A948E' }}>Scores are hidden for this session</span>
+          ) : s.team_pei == null ? (
+            <span style={{ fontSize: '12px', color: '#9A948E' }}>No scored turns</span>
+          ) : (
+            <>
+              <TeamSessionTrack s={s} />
+              <span style={{ fontSize: '12px', color: '#4A4440', whiteSpace: 'nowrap', width: '190px', textAlign: 'right' }}>
+                <strong style={{ color: '#0D9488' }}>Team {s.team_pei}</strong>
+                {s.pei_range && <span style={{ color: '#9A948E' }}> ({s.pei_range.min}–{s.pei_range.max})</span>}
+                {s.my_pei != null && <> · <strong style={{ color: '#F97316' }}>You {s.my_pei}</strong></>}
+              </span>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // PEI per ended session, oldest first, on a fixed 0–100 scale with the
 // Novice/Intermediate/Advanced band edges (40, 70) drawn in.
 function ScoreTrend({ sessions }) {
@@ -144,6 +225,7 @@ export default function Progress() {
   const [loading, setLoading] = useState(!isDemo)
   const [huskyScore, setHuskyScore] = useState(null)
   const [progressSessions, setProgressSessions] = useState([])
+  const [teams, setTeams] = useState([])
 
   useEffect(() => {
     if (isDemo) return
@@ -155,18 +237,21 @@ export default function Progress() {
     let cancelled = false
     ;(async () => {
       try {
-        const [challengesResp, huskyResp, progressResp] = await Promise.all([
+        const [challengesResp, huskyResp, progressResp, teamResp] = await Promise.all([
           fetch(`${API_URL}/challenges`, { headers: { ...authHeaders() } }),
           fetch(`${API_URL}/challenges/me/husky-score`, { headers: { ...authHeaders() } }),
           fetch(`${API_URL}/challenges/me/progress`, { headers: { ...authHeaders() } }),
+          fetch(`${API_URL}/challenges/me/team-progress`, { headers: { ...authHeaders() } }),
         ])
         const challengeData = await challengesResp.json().catch(() => [])
         const huskyData = await huskyResp.json().catch(() => ({}))
         const progressData = await progressResp.json().catch(() => ({}))
+        const teamData = await teamResp.json().catch(() => ({}))
         if (!cancelled) {
           if (Array.isArray(challengeData)) setChallenges(challengeData)
           setHuskyScore(huskyData)
           if (Array.isArray(progressData?.sessions)) setProgressSessions(progressData.sessions)
+          if (Array.isArray(teamData?.teams)) setTeams(teamData.teams)
         }
       } catch {
         if (!cancelled) setChallenges([])
@@ -321,6 +406,22 @@ export default function Progress() {
               )}
             </div>
           </div>
+
+          {!isDemo && teams.length > 0 && (
+            <div className="bg-[#FDFCFB] rounded-[14px] p-5" style={{ borderWidth: '1.5px', borderStyle: 'solid', borderColor: '#E7E0D8', marginBottom: '24px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap', marginBottom: '2px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.7px' }}>Team progress</div>
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: '12px', fontSize: '11px', color: '#9A948E' }}>
+                  <span><span style={{ color: '#0D9488' }}>●</span> Team score</span>
+                  <span><span style={{ color: '#F97316' }}>●</span> You</span>
+                  <span><span style={{ display: 'inline-block', width: '14px', height: '6px', borderRadius: '3px', background: '#CCEFEC', verticalAlign: 'middle' }} /> Range of student averages</span>
+                </div>
+              </div>
+              {teams.map(t => (
+                <TeamProgress key={t.group_id} team={t} onOpen={() => navigate(`${pathPrefix}/challenges/${t.challenge_id}`)} />
+              ))}
+            </div>
+          )}
 
           <div className="bg-[#FDFCFB] rounded-[14px] p-5" style={{ borderWidth: '1.5px', borderStyle: 'solid', borderColor: '#E7E0D8', marginBottom: '24px' }}>
             <div style={{ fontSize: '11px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: '14px' }}>Badges earned</div>

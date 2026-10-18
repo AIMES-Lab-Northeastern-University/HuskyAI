@@ -1327,6 +1327,109 @@ async def my_progress(
     return {"sessions": out}
 
 
+@router.get("/me/team-progress")
+async def my_team_progress(
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Each team this student is on, with how far it has got and, per ended
+    session, the team score, its spread and the student's own average.
+
+    The team score is the equal-weight mean of each student's own average PEI —
+    the same figure the end-of-session summary shows (main._coach_session_summary,
+    docs/metrics-codebook.md "Team PEI") — and `pei_range` is the lowest and
+    highest of those averages. Teammates' individual averages are deliberately
+    not returned: a running per-person chart invites comparison the study has
+    not decided to show. A legacy shared-chat team (one conversation for the
+    whole team) has no per-student split, so it gets its pooled turn average and
+    no range or personal figure.
+
+    A session run with the feed off is listed with `scores_hidden` and no
+    numbers, for the same reason as /me/progress.
+    """
+    teams = (await db.execute(
+        select(GroupChallenge, Challenge)
+        .join(GroupMember, GroupMember.group_id == GroupChallenge.id)
+        .join(Challenge, Challenge.id == GroupChallenge.challenge_id)
+        .where(GroupMember.user_id == user_id)
+    )).all()
+    if not teams:
+        return {"teams": []}
+    group_ids = [gc.id for gc, _ in teams]
+
+    names_by_group: dict[str, list[str]] = {}
+    for gid, uid, name in (await db.execute(
+        select(GroupMember.group_id, GroupMember.user_id, User.name)
+        .join(User, User.id == GroupMember.user_id)
+        .where(GroupMember.group_id.in_(group_ids))
+        .order_by(User.name)
+    )).all():
+        if uid != user_id:
+            names_by_group.setdefault(gid, []).append(name)
+
+    sessions_by_group: dict[str, list[GroupSession]] = {}
+    for gs in (await db.execute(
+        select(GroupSession).where(GroupSession.group_id.in_(group_ids))
+        .order_by(GroupSession.session_number)
+    )).scalars().all():
+        sessions_by_group.setdefault(gs.group_id, []).append(gs)
+
+    ended_ids = [gs.id for ss in sessions_by_group.values() for gs in ss if gs.status == "completed"]
+    # Average PEI per conversation, for every conversation in an ended session:
+    # (conversation id, owner, kind, average), so the student's own private
+    # coach and the team's shared conversation can each be picked out.
+    conv_avgs: dict[str, list[tuple[str, str, str, float]]] = {}
+    if ended_ids:
+        for conv_id, gs_id, conv_user, kind, avg in (await db.execute(
+            select(Conversation.id, Conversation.group_session_id, Conversation.user_id,
+                   Conversation.kind, func.avg(EvalResult.pei))
+            .join(EvalResult, EvalResult.conversation_id == Conversation.id)
+            .where(Conversation.group_session_id.in_(ended_ids), EvalResult.pei.is_not(None))
+            .group_by(Conversation.id, Conversation.group_session_id, Conversation.user_id, Conversation.kind)
+        )).all():
+            conv_avgs.setdefault(gs_id, []).append((conv_id, conv_user, kind, float(avg)))
+
+    def _r(v):
+        return round(v, 1) if v is not None else None
+
+    out = []
+    for gc, ch in teams:
+        rows = []
+        for gs in sessions_by_group.get(gc.id, []):
+            row = {"session_number": gs.session_number, "status": gs.status,
+                   "completed_at": gs.completed_at.isoformat() if gs.completed_at else None,
+                   "team_pei": None, "pei_range": None, "my_pei": None, "scores_hidden": False}
+            if gs.status == "completed":
+                if not _session_feed_enabled(ch, gs.session_number):
+                    row["scores_hidden"] = True
+                else:
+                    avgs = conv_avgs.get(gs.id, [])
+                    private = [(u, a) for _, u, k, a in avgs if k == "coach_private"]
+                    if private:
+                        means = [a for _, a in private]
+                        row["team_pei"] = _r(sum(means) / len(means))
+                        row["pei_range"] = {"min": _r(min(means)), "max": _r(max(means))}
+                        row["my_pei"] = _r(next((a for u, a in private if u == user_id), None))
+                    else:
+                        # The team's one conversation. Matched by id, not kind:
+                        # legacy shared conversations are stored as "solo".
+                        shared = [a for c, _, _, a in avgs if c == gs.conversation_id]
+                        row["team_pei"] = _r(shared[0]) if shared else None
+            rows.append(row)
+        out.append({
+            "group_id": gc.id,
+            "challenge_id": ch.id,
+            "title": ch.title,
+            "team_name": gc.name,
+            "teammates": names_by_group.get(gc.id, []),
+            "total_sessions": ch.total_sessions,
+            "sessions_completed": sum(1 for r in rows if r["status"] == "completed"),
+            "sessions": rows,
+        })
+    out.sort(key=lambda t: t["title"])
+    return {"teams": out}
+
+
 @router.post("", status_code=201)
 async def create_challenge(
     body: CreateChallengeBody,

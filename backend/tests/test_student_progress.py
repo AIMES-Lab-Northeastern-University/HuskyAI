@@ -178,3 +178,96 @@ def test_a_student_with_no_sessions_gets_an_empty_list(app_ready):
 
 def test_progress_requires_sign_in(app_ready):
     assert TestClient(app_ready).get("/challenges/me/progress").status_code == 401
+
+
+def _get_teams(app, uid):
+    r = TestClient(app).get("/challenges/me/team-progress",
+                            headers={"Authorization": f"Bearer {_token(uid)}"})
+    assert r.status_code == 200, r.text
+    return r.json()["teams"]
+
+
+async def _team_with_sessions(feed_flags=(True, True, True)):
+    """Two students on one team. Session 1 ended: Me 2 turns at 30/50 (avg 40),
+    Mate 1 turn at 90 — pooled would be 56.7, equal-weight is 65. Session 2 is
+    still running. Session 3 ended with the feed off."""
+    from database import AsyncSessionLocal, GroupChallenge, GroupMember, GroupSession
+    async with AsyncSessionLocal() as db:
+        me = await _user(db, "Me")
+        mate = await _user(db, "Zed Mate")
+        ch = await _challenge(db, "Team Arc", feed_flags=feed_flags)
+        team = GroupChallenge(challenge_id=ch.id, created_by=me.id, status="active", name="Team 4")
+        db.add(team)
+        await db.flush()
+        db.add_all([GroupMember(group_id=team.id, user_id=me.id),
+                    GroupMember(group_id=team.id, user_id=mate.id)])
+        s1 = GroupSession(group_id=team.id, challenge_id=ch.id, session_number=1,
+                          status="completed", started_at=T0, completed_at=T0)
+        s2 = GroupSession(group_id=team.id, challenge_id=ch.id, session_number=2,
+                          status="in_progress", started_at=T0)
+        s3 = GroupSession(group_id=team.id, challenge_id=ch.id, session_number=3,
+                          status="completed", started_at=T0, completed_at=T0)
+        db.add_all([s1, s2, s3])
+        await db.flush()
+        await _scored_conversation(db, me.id, [30, 50], kind="coach_private", group_session_id=s1.id)
+        await _scored_conversation(db, mate.id, [90], kind="coach_private", group_session_id=s1.id)
+        await _scored_conversation(db, me.id, [70], kind="coach_private", group_session_id=s2.id)
+        await _scored_conversation(db, me.id, [99], kind="coach_private", group_session_id=s3.id)
+        await db.commit()
+        return me.id, mate.id
+
+
+def test_team_progress_shows_the_equal_weight_team_score_its_range_and_my_own(app_ready):
+    me, mate = asyncio.run(_team_with_sessions(feed_flags=(True, True, False)))
+    (team,) = _get_teams(app_ready, me)
+    assert team["title"] == "Team Arc" and team["team_name"] == "Team 4"
+    assert team["teammates"] == ["Zed Mate"]
+    assert (team["sessions_completed"], team["total_sessions"]) == (2, 3)
+
+    s1, s2, s3 = team["sessions"]
+    assert s1["team_pei"] == 65.0 and s1["pei_range"] == {"min": 40.0, "max": 90.0}
+    assert s1["my_pei"] == 40.0
+    # Teammates' own averages are never returned.
+    assert set(s1) == {"session_number", "status", "completed_at", "team_pei",
+                       "pei_range", "my_pei", "scores_hidden"}
+    # A running session has no scores yet, even though turns were scored.
+    assert s2["status"] == "in_progress" and s2["team_pei"] is None and s2["my_pei"] is None
+    # The feed-off session is listed, but its scores stay hidden.
+    assert s3["scores_hidden"] is True and s3["team_pei"] is None and s3["my_pei"] is None
+
+    (theirs,) = _get_teams(app_ready, mate)
+    assert theirs["sessions"][0]["team_pei"] == 65.0 and theirs["sessions"][0]["my_pei"] == 90.0
+
+
+def test_a_legacy_shared_chat_team_gets_its_pooled_score_and_no_split(app_ready):
+    async def setup():
+        from database import AsyncSessionLocal, GroupChallenge, GroupMember, GroupSession
+        async with AsyncSessionLocal() as db:
+            me = await _user(db)
+            ch = await _challenge(db, "Shared Chat", feed_flags=(True,))
+            team = GroupChallenge(challenge_id=ch.id, created_by=me.id, status="active")
+            db.add(team)
+            await db.flush()
+            db.add(GroupMember(group_id=team.id, user_id=me.id))
+            gs = GroupSession(group_id=team.id, challenge_id=ch.id, session_number=1,
+                              status="completed", started_at=T0, completed_at=T0)
+            db.add(gs)
+            await db.flush()
+            # Stored as "solo", as main.py creates legacy shared conversations.
+            conv = await _scored_conversation(db, me.id, [60, 80], group_session_id=gs.id)
+            gs.conversation_id = conv.id
+            await db.commit()
+            return me.id
+    (team,) = _get_teams(app_ready, asyncio.run(setup()))
+    (s1,) = team["sessions"]
+    assert s1["team_pei"] == 70.0 and s1["pei_range"] is None and s1["my_pei"] is None
+
+
+def test_a_student_on_no_team_gets_no_teams(app_ready):
+    async def setup():
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            u = await _user(db)
+            await db.commit()
+            return u.id
+    assert _get_teams(app_ready, asyncio.run(setup())) == []
