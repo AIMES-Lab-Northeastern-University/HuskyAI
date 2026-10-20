@@ -38,6 +38,11 @@ function scoreColor(pei) {
   if (pei <= 80) return '#0D9488'
   return '#16A34A'
 }
+function fmtClock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
 function timeAgo(iso) {
   if (!iso) return 'never'
   const s = Math.floor((Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime()) / 1000)
@@ -269,6 +274,22 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
 
 /* ───────────────────────────── The page ───────────────────────────── */
 
+// Below this width the two panes cannot sit side by side: the artifact pane
+// becomes a full-screen overlay opened and closed by its existing toggle.
+const NARROW_QUERY = '(max-width: 640px)'
+
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia?.(NARROW_QUERY).matches ?? false)
+  useEffect(() => {
+    const mq = window.matchMedia?.(NARROW_QUERY)
+    if (!mq) return
+    const onChange = (e) => setNarrow(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return narrow
+}
+
 export default function CoachWorkspace() {
   const navigate = useNavigate()
   const { id: groupId } = useParams()
@@ -278,6 +299,7 @@ export default function CoachWorkspace() {
   const token = localStorage.getItem('token')
   const user = JSON.parse(localStorage.getItem('user') || 'null')
   const myName = user?.name || 'You'
+  const narrow = useNarrow()
 
   const [messages, setMessages]       = useState([])
   const [streaming, setStreaming]     = useState('')
@@ -292,6 +314,10 @@ export default function CoachWorkspace() {
   const [input, setInput]             = useState('')
   const [connStatus, setConn]         = useState('disconnected')
   const [members, setMembers]         = useState([])
+  // The whole team, online or not. Presence (`members`) only lists who is
+  // connected, so names for edits and the end summary come from here.
+  const [roster, setRoster]           = useState([])
+  const [challengeTitle, setChTitle]  = useState(null)
   const [challengeContext, setCtx]    = useState(null)
   const [condition, setCondition]     = useState(null)
 
@@ -316,6 +342,13 @@ export default function CoachWorkspace() {
   const [ending, setEnding]           = useState(false)
   const [endError, setEndError]       = useState('')
   const [summary, setSummary]         = useState(null)
+  // { reason, byName } — why the session ended, for every teammate, not just
+  // the one who pressed End.
+  const [endInfo, setEndInfo]         = useState(null)
+  // Timed sessions: the countdown runs from the server's remaining_seconds.
+  // The server decides and enforces the end; this only displays it.
+  const [deadlineMs, setDeadlineMs]   = useState(null)
+  const [remainingMs, setRemainingMs] = useState(null)
   const [groupSessionId, setGsId]     = useState(null)
   const [inbox, setInbox]             = useState([])
   const [pairs, setPairs]             = useState([])
@@ -506,6 +539,13 @@ export default function CoachWorkspace() {
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         if (data.condition) setCondition(data.condition)
         if (data.group_session_id) setGsId(data.group_session_id)
+        if (typeof data.remaining_seconds === 'number') {
+          setDeadlineMs(Date.now() + data.remaining_seconds * 1000)
+          setRemainingMs(data.remaining_seconds * 1000)
+        } else {
+          setDeadlineMs(null)
+          setRemainingMs(null)
+        }
         break
       case 'challenge_context': setCtx(data.data); break
       case 'history':
@@ -619,6 +659,12 @@ export default function CoachWorkspace() {
         flushAllDwell('session_end')
         endedRef.current = true
         setEnded(true)
+        // The same figures the student who ended it sees. A bare frame (a
+        // refused late turn) keeps what is already shown.
+        if (data.summary) setSummary(data.summary)
+        if (data.end_reason) {
+          setEndInfo({ reason: data.end_reason, byName: data.ended_by_name || null })
+        }
         break
       case 'busy':
         // This student's coach already has a turn running (another tab, or a
@@ -725,7 +771,9 @@ export default function CoachWorkspace() {
       // session stayed open on the server for everyone else.
       if (!r.ok) { setEndError(await readApiError(r, 'Could not end the session')); return }
       flushAllDwell('session_end')
-      setSummary(await r.json().catch(() => null))
+      const s = await r.json().catch(() => null)
+      setSummary(s)
+      if (s?.end_reason) setEndInfo(prev => prev || { reason: s.end_reason, byName: myName })
       endedRef.current = true
       setEnded(true)
     } catch (e) {
@@ -734,7 +782,38 @@ export default function CoachWorkspace() {
     } finally {
       setEnding(false)
     }
-  }, [groupId, sessionNum, flushAllDwell])
+  }, [groupId, sessionNum, flushAllDwell, myName])
+
+  // Countdown tick. Display only: the server ends the session at the deadline
+  // (and refuses anything after it) whether or not this tab is open.
+  useEffect(() => {
+    if (!deadlineMs || sessionEnded) return
+    const tick = () => setRemainingMs(deadlineMs - Date.now())
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [deadlineMs, sessionEnded])
+
+  // Team roster and the challenge's title. Plain GETs for display only — they
+  // record nothing, and the socket stays the source of everything measured.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const g = await fetch(`${API_URL}/groups/${groupId}`, { headers: authHeaders() })
+        if (!g.ok || cancelled) return
+        const group = await g.json()
+        if (cancelled) return
+        if (Array.isArray(group.members)) setRoster(group.members)
+        if (!group.challenge_id) return
+        const c = await fetch(`${API_URL}/challenges/${group.challenge_id}`, { headers: authHeaders() })
+        if (c.ok && !cancelled) setChTitle((await c.json()).title || null)
+      } catch (e) {
+        console.error('could not load team details', e)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [groupId])
 
   // Review inbox and contested pairs. Polled on change rather than pushed:
   // both are low-frequency, and a dedicated socket message for each would add
@@ -773,6 +852,11 @@ export default function CoachWorkspace() {
     // the choice is recorded.
     stopDwell(`o:${pairId}:a`, 'collapse')
     stopDwell(`o:${pairId}:b`, 'collapse')
+    // The server judges inspection and dwell from those socket events, but the
+    // choice goes over HTTP; wait for them to be acked or the choice can be
+    // recorded first, with no dwell and possibly "uninspected". Bounded, so a
+    // dead socket delays the choice rather than blocking it.
+    await reader.current.settled((ev) => ev.pair_id === pairId)
     try {
       const r = await fetch(`${API_URL}/contested/pairs/${pairId}/adopt`, {
         method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
@@ -784,7 +868,7 @@ export default function CoachWorkspace() {
 
   const nameFor = (uidStr) => {
     if (uidStr && user?.id === uidStr) return 'You'
-    return members.find(m => m.user_id === uidStr)?.name
+    return (members.find(m => m.user_id === uidStr) || roster.find(m => m.user_id === uidStr))?.name
   }
 
   const coachReplies = messages.filter(m => m.role === 'assistant').map(m => m.content)
@@ -799,12 +883,12 @@ export default function CoachWorkspace() {
                 className="text-[12px] font-bold text-[#6B6560] hover:text-[#16120E] cursor-pointer">← Challenges</button>
         <div className="flex-1 min-w-0">
           <div className="text-[14px] font-bold text-[#16120E] truncate">
-            {challengeContext?.title || 'Collaborative session'}
+            {challengeTitle || challengeContext?.title || 'Collaborative session'}
           </div>
-          <div className="text-[11px] text-[#9A948E]">
+          <div className="text-[11px] text-[#9A948E] truncate">
             {/* The study condition is deliberately NOT shown: a student who can
                 read their arm or prominence knows what is being measured. */}
-            Session {sessionNum} · Your coach is private to you
+            Session {sessionNum}{challengeTitle && challengeContext?.title && !/^session \d+$/i.test(challengeContext.title.trim()) ? `: ${challengeContext.title}` : ''} · Your coach is private to you
           </div>
         </div>
         <div className="flex items-center gap-1.5">
@@ -826,6 +910,12 @@ export default function CoachWorkspace() {
             <div className="text-[9px] font-bold text-[#9A948E] uppercase tracking-[0.5px]">Your PEI</div>
           </div>
         )}
+        {!sessionEnded && remainingMs != null && (
+          <div className={`flex items-center gap-1 px-2 py-1 rounded-[8px] border text-[12px] font-bold tabular-nums ${remainingMs <= 60000 ? 'bg-[#FEF3E8] text-[#C2410C] border-[#FED7AA]' : 'bg-[#F7F3EE] text-[#6B6560] border-[#E7E0D8]'}`}
+               title={remainingMs <= 60000 ? 'Session ends soon' : 'Time remaining in this team session'}>
+            <span aria-hidden>⏱</span>{fmtClock(remainingMs)}
+          </div>
+        )}
         {!sessionEnded && endError && (
           <span role="alert" className="text-[12px] text-[#C8102E] max-w-[260px]">{endError}</span>
         )}
@@ -840,13 +930,17 @@ export default function CoachWorkspace() {
 
       {sessionEnded && (
         <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex items-center gap-4 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
-          <span className="text-[13px] font-bold text-[#0D9488]">Session ended.</span>
+          <span className="text-[13px] font-bold text-[#0D9488]">
+            {endInfo?.reason === 'timer_expired' ? 'Time is up — session ended.'
+              : endInfo?.byName ? `Session ended by ${endInfo.byName}.`
+              : 'Session ended.'}
+          </span>
           {summary && (
             <span className="text-[12px] text-[#4A4440]">
               Team mean PEI {summary.session_avg_pei ?? '—'} across {summary.turns} turn{summary.turns === 1 ? '' : 's'}
               {summary.per_student && Object.keys(summary.per_student).length > 1 && (
                 <> · {Object.entries(summary.per_student)
-                  .map(([uidStr, v]) => `${nameFor(uidStr) || 'member'}: ${v.avg_pei ?? '—'} (${v.turns})`)
+                  .map(([uidStr, v]) => `${v.name || nameFor(uidStr) || 'member'}: ${v.avg_pei ?? '—'} (${v.turns} turn${v.turns === 1 ? '' : 's'})`)
                   .join(' · ')}</>
               )}
             </span>
@@ -954,7 +1048,11 @@ export default function CoachWorkspace() {
         </div>
 
         {/* ── Shared artifact ── */}
-        <div className="flex flex-col flex-shrink-0 bg-[#F7F3EE]" style={{ width: artifactOpen ? 460 : 52 }}>
+        {/* On a phone the open pane covers the screen instead of squeezing the
+            coach column to nothing; the same toggle opens and closes it, so the
+            open/close events are exactly those of the desktop panel. */}
+        <div className={`flex flex-col flex-shrink-0 bg-[#F7F3EE] ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
+             style={{ width: narrow && artifactOpen ? '100%' : artifactOpen ? 460 : 52 }}>
           {!artifactOpen ? (
             <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-l border-[#E7E0D8]" style={{ borderLeftWidth: '1.5px' }}>
               <button onClick={togglePanel} title="Open shared artifact" aria-label="Open shared artifact"
@@ -1082,14 +1180,22 @@ export default function CoachWorkspace() {
               </div>
 
               {/* Team backchannel: student-to-student only. Firewalled by design
-                  from the coach prompt and the evaluator, and currently emits no
-                  study event — whether human deliberation enters the research
-                  record is an open question for the PI. Messages are persisted
-                  in group_chat_messages either way, so deciding later is free. */}
+                  from the coach prompt and the evaluator. Whether it enters the
+                  research record is the assignment's team_chat_logging setting
+                  (off | metadata | content, delivered in session_init's
+                  condition), so the header says so rather than implying privacy
+                  when it is logged. Messages are persisted in
+                  group_chat_messages either way. */}
               <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: 240 }}>
                 <div className="px-4 py-2 flex items-center gap-2 flex-shrink-0">
                   <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Team chat</span>
-                  <span className="text-[10px] text-[#9A948E]">· not seen by any coach</span>
+                  <span className="text-[10px] text-[#9A948E]">
+                    · not seen by any coach{condition?.team_chat_logging === 'content'
+                      ? ' · recorded for research'
+                      : condition?.team_chat_logging === 'metadata'
+                        ? ' · timing logged for research, not text'
+                        : ''}
+                  </span>
                 </div>
                 <div className="flex-1 overflow-y-auto px-4 pb-2 flex flex-col gap-2">
                   {teamChat.length === 0 && (

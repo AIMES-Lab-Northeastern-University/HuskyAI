@@ -114,10 +114,10 @@ def main() -> int:
         print("\nSKIP: evaluate_conversation (VERIFY_SKIP_EVAL set)")
         return 0
 
-    print("\n--- Husky evaluate_conversation() (2-stage, file search) ---")
+    print("\n--- Husky evaluate_conversation_v3() (live five-judge panel, file search) ---")
     try:
         sys.path.insert(0, str(_backend))
-        from evaluator import evaluate_conversation
+        from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 
         history = [
             {"role": "user", "content": "I need to debug a 500 error on login. I checked the server logs."},

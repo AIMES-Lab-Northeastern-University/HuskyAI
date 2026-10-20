@@ -9,8 +9,10 @@ interesting one. It is detectable only because Phase 1 logs reads as
 first-class events with a shared sequence.
 
 So `VerificationResponse` has no "did you read it?" field, and `status` on the
-assignment is only ever `pending`, `expired` or `reassigned` (the last is an
-instructor action, not reviewer behaviour). Everything else is computed.
+assignment is only ever `pending`, `responded`, `expired` or `reassigned` (the
+last is an instructor action, not reviewer behaviour). `responded` says only
+that a verdict row exists — never that a check happened. Everything else is
+computed.
 """
 
 from __future__ import annotations
@@ -241,7 +243,9 @@ async def outcomes_for_session(db: AsyncSession, group_session_id: str) -> list[
             "author_user_id": a.author_user_id,
             "reviewer_user_id": a.reviewer_user_id,
             "routing_policy": a.routing_policy,
-            "status": a.status,
+            # A row answered before "responded" was stored still reads as
+            # pending in the database; report what the response row says.
+            "status": "responded" if resp is not None and a.status == "pending" else a.status,
             "replaces_assignment_id": a.replaces_assignment_id,
             "assigned_at": a.assigned_at.isoformat() if a.assigned_at else None,
             "outcome": outcome,
@@ -343,6 +347,10 @@ async def respond(
         submitted_at=datetime.utcnow(),
     )
     db.add(resp)
+    # The fact that a verdict exists, nothing more: whether the reviewer read
+    # the work is still derived from the log (classify). Left pending, the
+    # export showed "pending" beside a verdict.
+    a.status = "responded"
     await db.commit()
 
     gs = await db.get(GroupSession, a.group_session_id)
@@ -409,6 +417,10 @@ async def reassign(
         raise HTTPException(status_code=404, detail="Team not found")
     await _assert_user_manages_classroom(db, user_id, team.classroom_id)
 
+    if gs.status == "completed":
+        # The review window was the session. A reviewer added afterwards could
+        # no longer read or answer anything that counts.
+        raise HTTPException(status_code=409, detail="This session has ended, so its reviews cannot be reassigned")
     if a.status != "pending":
         raise HTTPException(status_code=409, detail=f"This review is {a.status}, not pending")
     answered = (await db.execute(

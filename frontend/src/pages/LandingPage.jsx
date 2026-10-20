@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 /* ─── Inline keyframes injected once ─── */
@@ -161,8 +161,18 @@ const MARQUEE_ITEMS = [
   'AI Literacy Scoring',
 ]
 
+const NARROW_QUERY = '(max-width: 760px)'
+
 export default function LandingPage() {
   const navigate = useNavigate()
+  const [narrow, setNarrow] = useState(() => window.matchMedia(NARROW_QUERY).matches)
+
+  useEffect(() => {
+    const mq = window.matchMedia(NARROW_QUERY)
+    const onChange = (e) => setNarrow(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
   /* Inject global styles once */
   useEffect(() => {
@@ -503,6 +513,31 @@ export default function LandingPage() {
     footerLinks: { display: 'flex', gap: 28 },
     footerLink: { fontSize: 12, color: 'var(--ink-3)', textDecoration: 'none', fontWeight: 500, cursor: 'pointer' },
     footerCopy: { fontSize: 12, color: 'var(--ink-3)' },
+  }
+
+  /* Phones: every multi-column section becomes one column, gutters shrink, and
+     the nav keeps only Sign in (the other links are repeated in the page). */
+  if (narrow) {
+    const stacked = (fn, padding) => (...a) => ({ ...fn(...a), borderRadius: 12, padding })
+    s.step = stacked(s.step, '28px 22px')
+    s.feat = stacked(s.feat, '28px 22px')
+    s.featDark = stacked(s.featDark, '28px 22px')
+    s.dimCard = stacked(s.dimCard, '22px 20px')
+    Object.assign(s.nav, { padding: '0 16px' })
+    Object.assign(s.navLink, { display: 'none' })
+    Object.assign(s.hero, { gridTemplateColumns: '1fr', gap: 48, padding: '100px 16px 56px', minHeight: 0 })
+    Object.assign(s.heroStats, { gap: 24, flexWrap: 'wrap', marginTop: 40, paddingTop: 28 })
+    Object.assign(s.section, { padding: '64px 16px' })
+    Object.assign(s.steps, { gridTemplateColumns: '1fr', gap: 10 })
+    Object.assign(s.featGrid, { gridTemplateColumns: '1fr', gap: 10 })
+    Object.assign(s.classroomSection, { padding: '64px 16px' })
+    Object.assign(s.classroomInner, { gridTemplateColumns: '1fr', gap: 40 })
+    Object.assign(s.dimsSection, { padding: '64px 16px' })
+    Object.assign(s.dimsGrid, { gridTemplateColumns: '1fr', gap: 10 })
+    Object.assign(s.ctaSection, { padding: '24px 16px 64px' })
+    Object.assign(s.ctaBox, { gridTemplateColumns: '1fr', gap: 28, padding: '32px 22px' })
+    Object.assign(s.footer, { flexDirection: 'column', gap: 16, padding: '28px 16px', textAlign: 'center' })
+    Object.assign(s.footerLinks, { flexWrap: 'wrap', justifyContent: 'center', gap: 20 })
   }
 
   /* Duplicate marquee items for seamless loop */
@@ -939,9 +974,9 @@ export default function LandingPage() {
           Husky AI
         </div>
         <div style={s.footerLinks}>
-          {['Privacy', 'Terms', 'For Instructors', 'Contact'].map((lbl) => (
-            <span key={lbl} style={s.footerLink} className="lp-footer-link">{lbl}</span>
-          ))}
+          <a onClick={() => navigate('/how-it-works')} style={s.footerLink} className="lp-footer-link">How it works</a>
+          <a onClick={() => navigate('/login#educators-login-info')} style={s.footerLink} className="lp-footer-link">For Instructors</a>
+          <a href="https://aimeslab.org/" target="_blank" rel="noopener noreferrer" style={s.footerLink} className="lp-footer-link">Contact</a>
         </div>
         <div style={s.footerCopy}>&copy; 2025 AIMES Lab, Northeastern University</div>
       </footer>

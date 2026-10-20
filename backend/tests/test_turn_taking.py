@@ -281,7 +281,8 @@ def test_metrics_computed_from_a_real_logged_session(app_ready):
     assert r.status_code == 200, r.text
     m = r.json()
 
-    assert m["schema_version"] == "1.0.0"
+    from main import STUDY_SCHEMA_VERSION
+    assert m["schema_version"] == STUDY_SCHEMA_VERSION
     assert m["metrics_version"] == METRICS_VERSION
     assert m["totals"]["artifact_writes"] == 2
     assert m["contribution_share"] == {users[0]: 0.5, users[1]: 0.5}

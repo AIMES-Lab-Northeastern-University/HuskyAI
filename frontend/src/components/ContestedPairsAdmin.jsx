@@ -33,6 +33,9 @@ const INPUT = {
 
 const MUTED = '#9A948E'
 
+// How often to re-check pairs a student has not yet resolved.
+const POLL_MS = 15000
+
 const ADOPTED_LABEL = {
   a: "Took the teammate's answer",
   b: "Took the coach's answer",
@@ -62,21 +65,36 @@ export default function ContestedPairsAdmin({ baseUrl, team, totalSessions = 1, 
   const nameOf = (uid) => members.find(m => m.user_id === uid)?.name || 'Former member'
   const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }))
 
-  const load = useCallback(async () => {
-    setErr('')
+  // `quiet` is the background refresh: a failed poll keeps the list on screen
+  // rather than replacing it with an error.
+  const load = useCallback(async ({ quiet = false } = {}) => {
+    if (!quiet) setErr('')
     try {
       const r = await fetch(url, { headers: { ...authHeaders() } })
       const d = await r.json().catch(() => ({}))
-      if (!r.ok) setErr(formatApiErrorDetail(d.detail))
-      else setPairs(d.pairs || [])
+      if (r.ok) { setPairs(d.pairs || []); setErr('') }
+      else if (!quiet) setErr(formatApiErrorDetail(d.detail))
     } catch {
-      setErr('Network error')
+      if (!quiet) setErr('Network error')
     } finally {
       setLoading(false)
     }
   }, [url])
 
   useEffect(() => { load() }, [load])
+
+  // A pair is surfaced, and later adopted, by the student's session — nothing
+  // here causes it — so the row's status would sit at "Not shown yet" until a
+  // reload. Re-fetch while any pair is still open, and when the tab regains
+  // focus. Plain GETs: the instructor's view records no study event.
+  const anyOpen = pairs.some(p => !p.adopted)
+  useEffect(() => {
+    if (!anyOpen) return
+    const tick = () => { if (document.visibilityState === 'visible') load({ quiet: true }) }
+    const id = setInterval(tick, POLL_MS)
+    window.addEventListener('focus', tick)
+    return () => { clearInterval(id); window.removeEventListener('focus', tick) }
+  }, [anyOpen, load])
 
   const ready = form.subproblem_key.trim() && form.surfaced_to_user_id
     && form.teammate_answer.trim() && form.coach_answer.trim()

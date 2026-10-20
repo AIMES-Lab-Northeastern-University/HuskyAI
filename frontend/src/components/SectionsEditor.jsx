@@ -70,8 +70,9 @@ export default function SectionsEditor({ sections, onChange, disabled }) {
   return (
     <div style={{ display: 'grid', gap: '8px' }}>
       <div style={{ fontSize: '11px', color: '#9A948E' }}>
-        Shared artifact sections (optional). Teams edit these together, one
-        person per section at a time. Leave empty for no artifact.
+        Shared artifact sections (optional). Anyone on the team can edit any
+        section, even at the same time; if two saves collide, the later one is
+        handed back to merge instead of overwriting. Leave empty for no artifact.
       </div>
 
       {rows.length === 0 && (

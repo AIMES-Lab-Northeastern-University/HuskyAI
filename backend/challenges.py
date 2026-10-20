@@ -30,6 +30,7 @@ from database import (
     EvalResult,
     GroupChallenge,
     GroupMember,
+    GroupSession,
     InstructorTestEnrollment,
     User,
     UserChallengeSession,
@@ -924,16 +925,56 @@ async def _student_group_mode_challenge_ids(db: AsyncSession, user_id: str) -> s
     return {row[0] for row in r.all()}
 
 
+def _group_settings(row) -> dict:
+    """The assignment settings a student's group-challenge page states as fact:
+    which arm, how big a team is, and whether team chat enters the research
+    record. They come from the row, not from copy that assumes one setup."""
+    _, arm, team_min, team_max, logging = row
+    return {
+        "study_arm": arm or "control_solo_feed",
+        "team_min": team_min or 2,
+        "team_max": team_max or 4,
+        "team_chat_logging": logging if logging in ("off", "metadata", "content") else "off",
+    }
+
+
+async def _team_sessions(db: AsyncSession, user_id: str,
+                         challenge_id: str | None = None) -> dict[str, dict[int, GroupSession]]:
+    """The group sessions of every team this student is on, by challenge then
+    session number. A team session never gets a UserChallengeSession, so
+    progress read from those alone showed a finished team session as 0%."""
+    q = (
+        select(GroupSession)
+        .join(GroupMember, GroupMember.group_id == GroupSession.group_id)
+        .where(GroupMember.user_id == user_id)
+    )
+    if challenge_id is not None:
+        q = q.where(GroupSession.challenge_id == challenge_id)
+    out: dict[str, dict[int, GroupSession]] = {}
+    for gs in (await db.execute(q)).scalars().all():
+        prev = out.setdefault(gs.challenge_id, {}).get(gs.session_number)
+        # A student on two teams for one challenge (moved between them) keeps
+        # the furthest-along session.
+        if prev is None or (gs.status == "completed" and prev.status != "completed"):
+            out[gs.challenge_id][gs.session_number] = gs
+    return out
+
+
 async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str):
-    """For a student: (is_group_mode, team_or_None). The team is their prof-assigned
-    GroupChallenge for this challenge in one of their sections, with teammate names.
-    Returns team=None when the challenge is group mode but they aren't assigned yet."""
+    """For a student: (is_group_mode, team_or_None, settings_or_None). The team is
+    their prof-assigned GroupChallenge for this challenge in one of their
+    sections, with teammate names. Returns team=None when the challenge is group
+    mode but they aren't assigned yet. settings are the assignment's group
+    settings (see _group_settings) for the team's section when assigned, else
+    for the first group-mode section the student is in."""
     cids = await _student_classroom_ids(db, user_id)
     if not cids:
-        return False, None
+        return False, None, None
     rows = (
         await db.execute(
-            select(ClassroomChallenge.classroom_id, ClassroomChallenge.study_arm).where(
+            select(ClassroomChallenge.classroom_id, ClassroomChallenge.study_arm,
+                   ClassroomChallenge.team_min, ClassroomChallenge.team_max,
+                   ClassroomChallenge.team_chat_logging).where(
                 ClassroomChallenge.challenge_id == challenge_id,
                 ClassroomChallenge.classroom_id.in_(cids),
                 ClassroomChallenge.mode == "group",
@@ -946,11 +987,12 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
     # point follows configuration rather than offering both and hoping.
     study_arm = next((r[1] for r in rows if r[1]), "control_solo_feed")
     if not group_cids:
-        return False, None
+        return False, None, None
+    settings = _group_settings(rows[0])
 
-    gid = (
+    team = (
         await db.execute(
-            select(GroupChallenge.id)
+            select(GroupChallenge.id, GroupChallenge.classroom_id)
             .join(GroupMember, GroupMember.group_id == GroupChallenge.id)
             .where(
                 GroupChallenge.challenge_id == challenge_id,
@@ -959,9 +1001,13 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
             )
             .limit(1)
         )
-    ).scalar_one_or_none()
-    if not gid:
-        return True, None
+    ).first()
+    if not team:
+        return True, None, settings
+    gid, team_cid = team
+    team_row = next((r for r in rows if r[0] == team_cid), None)
+    if team_row is not None:
+        settings = _group_settings(team_row)
 
     names = [
         n
@@ -974,7 +1020,7 @@ async def _student_group_info(db: AsyncSession, user_id: str, challenge_id: str)
             )
         ).all()
     ]
-    return True, {"group_id": gid, "member_names": names, "study_arm": study_arm}
+    return True, {"group_id": gid, "member_names": names, "study_arm": study_arm}, settings
 
 
 async def _test_enrollment_classroom_ids(db: AsyncSession, user_id: str) -> set[str]:
@@ -1116,11 +1162,15 @@ async def list_challenges(
         sessions_by_challenge.setdefault(s.challenge_id, []).append(s)
 
     group_ids = await _student_group_mode_challenge_ids(db, user_id)
+    team_sessions = await _team_sessions(db, user_id)
 
     out = []
     for ch in challenges:
         user_ch_sessions = sessions_by_challenge.get(ch.id, [])
-        completed = sum(1 for s in user_ch_sessions if s.status == "completed")
+        completed = len(
+            {s.session_number for s in user_ch_sessions if s.status == "completed"}
+            | {n for n, gs in team_sessions.get(ch.id, {}).items() if gs.status == "completed"}
+        )
         best_pei = max((s.best_pei for s in user_ch_sessions if s.best_pei is not None), default=None)
         out.append({
             "id": ch.id,
@@ -1326,10 +1376,29 @@ async def get_challenge(
     )
     user_sessions = sessions_result.scalars().all()
     sessions_map = {s.session_number: s for s in user_sessions}
+    team_map = (await _team_sessions(db, user_id, challenge_id)).get(challenge_id, {})
 
     sessions_out = []
     for i, sd in enumerate(ch.sessions_data, start=1):
         us = sessions_map.get(i)
+        gs = team_map.get(i) if us is None else None
+        if gs is not None:
+            # A team session: its status, timing and end reason are the team's.
+            sessions_out.append({
+                "session_number": i,
+                "title": sd["title"],
+                "goal": sd["goal"],
+                "brief": sd["brief"],
+                "seed_question": sd["seed_question"],
+                "status": gs.status or "not_started",
+                "best_pei": gs.best_pei,
+                "conversation_id": None,
+                "started_at": gs.started_at.isoformat() if gs.started_at else None,
+                "completed_at": gs.completed_at.isoformat() if gs.completed_at else None,
+                "end_reason": gs.end_reason,
+                **(await _finish_hints(db, user_id, challenge_id, None)),
+            })
+            continue
         sessions_out.append({
             "session_number": i,
             "title": sd["title"],
@@ -1348,7 +1417,7 @@ async def get_challenge(
             **(await _finish_hints(db, user_id, challenge_id, us)),
         })
 
-    group_mode, group = await _student_group_info(db, user_id, challenge_id)
+    group_mode, group, group_settings = await _student_group_info(db, user_id, challenge_id)
 
     return {
         "id": ch.id,
@@ -1363,6 +1432,10 @@ async def get_challenge(
         "sessions": sessions_out,
         "group_mode": group_mode,
         "group": group,
+        # Arm, team size and team-chat logging for this student's section, so
+        # the page can describe the setup that will actually run (None when
+        # not a group challenge for this student).
+        "group_settings": group_settings,
         "sections": _sections_of(ch),
     }
 

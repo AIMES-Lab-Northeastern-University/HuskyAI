@@ -94,7 +94,11 @@ export default function GroupTeamManager({ classroomId, challengeId, verificatio
   const btn = {
     padding: '5px 10px',
     borderRadius: '7px',
-    border: '1.5px solid #E7E0D8',
+    // Longhands, not the `border` shorthand: variants below override
+    // borderColor, and React warns when a shorthand and its longhand mix.
+    borderWidth: '1.5px',
+    borderStyle: 'solid',
+    borderColor: '#E7E0D8',
     background: 'transparent',
     color: '#4A4440',
     fontSize: '11px',

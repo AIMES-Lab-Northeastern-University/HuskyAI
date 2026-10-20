@@ -1,7 +1,10 @@
 # Study event schema
 
-**Schema version: 1.0.0** — echoed as `schema_version` in API responses. Any
+**Schema version: 1.1.0** — echoed as `schema_version` in API responses. Any
 change to a field's meaning is a version bump, not a silent edit.
+
+Changes since 1.0.0 (all additive): the `group_chat.message` action, the
+`team_chat_logging` key in `condition`, and the export's `team_chat` section.
 
 One table, `study_events`, holds every action in a collaborative-study session
 in a single total order. It is append-only. Nothing in it is ever updated or
@@ -47,7 +50,7 @@ Three properties follow, and they are structural rather than conventional:
 | `server_ts` | Authoritative wall-clock. |
 | `idempotency_key` | Unique. NULL for server-emitted events, which cannot be double-delivered. |
 | `consent_research` | Snapshotted per row at write time, so the export is immune to a later toggle. |
-| `condition` | Resolved experimental condition (`arm`, `prominence`, `corpus`), written onto every row so an exported log is self-describing. |
+| `condition` | Resolved experimental condition (`arm`, `prominence`, `corpus`, and since 1.1.0 `team_chat_logging`), written onto every row so an exported log is self-describing. |
 
 ## Action vocabulary
 
@@ -117,6 +120,35 @@ that disconnects the instant it receives its score cannot cancel the record.
 | `revision.opened` | The feed was shown for the turn that requires a consequential revision. | `after_turn`, `pei_before` |
 | `revision.submitted` | The student submitted the revision that counts. Its `EvalResult.is_graded_revision` is true; the pre-revision score is kept as its own row so the delta stays measurable. | `turn`, `pei_after` |
 
+### `target = group_chat` (the team backchannel)
+
+Whether team discussion enters the research record is the PI's decision
+(`docs/collab-study-pending.md` #3), so it is a per-assignment setting,
+`ClassroomChallenge.team_chat_logging`, rather than a behaviour:
+
+- `off` (the default) — nothing is emitted. Messages are still stored in
+  `group_chat_messages` for replay, as they always were.
+- `metadata` — one event per message: who and when (`seq`, `server_ts`) and how
+  long. No text.
+- `content` — the same event, marked `content_logged`; the export joins the
+  stored message and includes its scrubbed text in `team_chat`.
+
+| Action | Emitted when | Payload |
+|---|---|---|
+| `message` | A student sends a team-chat message in the collaborative workspace (`/ws/coach`). `ref_id` is the `group_chat_messages.id`. | `chars`, `words`, `content_logged` |
+
+The text never enters `payload`, in either mode. The export pseudonymises ids
+inside payloads but does not scrub them, so text there would leak; it is joined
+and scrubbed at export time instead. And because the mode is written onto each
+event, switching an assignment from `metadata` to `content` later includes only
+messages sent after the switch — earlier ones were sent under a different
+consent and stay text-free. Switching to `content` late still loses nothing
+that was stored; switching to `metadata` late cannot recover the timing of
+messages sent while it was `off`.
+
+Only the collaborative arm's socket emits this. The older shared-coach group
+mode (`/ws/group`) is not part of the study and is unaffected.
+
 ## What is deliberately *not* an event
 
 - **Rendering.** Delivering the artifact on connect, and a teammate's screen
@@ -130,11 +162,8 @@ that disconnects the instant it receives its score cannot cancel the record.
   otherwise count a Save click that changed nothing as a contribution, raising
   that student's share and alternation and asking a teammate to review text they
   have already seen. The stale-version check still applies first.
-- **The team backchannel.** `group_chat` is in the `target` vocabulary but
-  nothing emits it yet: whether human-to-human discussion enters the research
-  record as content, as metadata only, or not at all is an open question for the
-  PI. The messages themselves are stored in `group_chat_messages` regardless, so
-  deciding later loses nothing.
+- **The team backchannel, unless the assignment opts in.** Under the default
+  `team_chat_logging = off` nothing is emitted; see `target = group_chat`.
 
 ## Known limits
 
@@ -151,8 +180,8 @@ that disconnects the instant it receives its score cannot cancel the record.
 
 `GET /research/sessions/{id}/export?format=json|jsonl` — instructor and admin
 only. Returns the ordered event log, artifact revision history, evaluations,
-verification and contested-input outcomes, and the computed turn-taking
-metrics, with schema and metrics versions travelling alongside the data.
+verification and contested-input outcomes, team-chat text logged under
+`content`, and the computed turn-taking metrics, with schema and metrics versions travelling alongside the data.
 
 Three rules the bundle enforces:
 

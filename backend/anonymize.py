@@ -8,7 +8,7 @@ Two jobs:
      ever revealing who they are. Backed by HMAC-SHA256 + a secret salt.
   2. scrub(): redact PII that students type *inside* free text — emails, phone
      numbers, 9-digit NUIDs, SSNs, URLs, and (when known) the author's own name
-     and email. Replaces with placeholders like ``[EMAIL]`` / ``[NAME]``.
+     and email; scrub_people() does the same against a whole team's names. Replaces with placeholders like ``[EMAIL]`` / ``[NAME]``.
 
 IMPORTANT — limits of scrub(): regex/known-term redaction is best-effort, not a
 guarantee. Free text can always carry PII a pattern won't catch (a friend's
@@ -75,18 +75,32 @@ def scrub(text: str | None, known_name: str | None = None, known_email: str | No
     """Redact PII from free text. ``known_name``/``known_email`` are the author's
     own identifiers (from the DB) and are redacted as exact extra terms — this is
     what reliably catches 'Hi, I'm <name>' / their NU email in their own messages."""
+    return scrub_people(text, [(known_name, known_email)])
+
+
+def scrub_people(text: str | None, people) -> str | None:
+    """scrub() against several known people at once: ``people`` is an iterable
+    of (name, email). For text a team wrote together — a shared document or a
+    team chat — where anyone may name anyone, so scrubbing against the author
+    alone leaves every teammate's name in place.
+
+    Every email goes before every name (one person's name can be part of
+    another's address), and the generic patterns run once, at the end."""
     if not text:
         return text
 
     out = text
+    people = [(n, e) for n, e in people if n or e]
 
-    # 1) Author's own email + name first (exact, highest confidence).
-    if known_email:
-        out = re.sub(re.escape(known_email), "[EMAIL]", out, flags=re.IGNORECASE)
-    if known_name:
-        for part in str(known_name).split():
-            if len(part) >= 2:  # skip single initials to avoid over-redaction
-                out = re.sub(rf"\b{re.escape(part)}\b", "[NAME]", out, flags=re.IGNORECASE)
+    # 1) Known emails, then known names (exact, highest confidence).
+    for _, email in people:
+        if email:
+            out = re.sub(re.escape(email), "[EMAIL]", out, flags=re.IGNORECASE)
+    parts = {part for name, _ in people if name for part in str(name).split()
+             if len(part) >= 2}  # skip single initials to avoid over-redaction
+    # Longest first, so a part never pre-empts a longer one that contains it.
+    for part in sorted(parts, key=len, reverse=True):
+        out = re.sub(rf"\b{re.escape(part)}\b", "[NAME]", out, flags=re.IGNORECASE)
 
     # 2) Generic patterns.
     out = _URL_RE.sub("[URL]", out)

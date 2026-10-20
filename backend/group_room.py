@@ -402,6 +402,9 @@ class GroupRoom:
         # Set while cross-worker publishing is failing, so an outage is logged
         # once rather than once per streamed chunk.
         self._publish_failing = False
+        # The roster the heartbeat last saw, so a change it did not see as a
+        # join or leave (a crashed worker's members ageing out) is pushed.
+        self._last_roster: frozenset[str] | None = None
 
     # -- coach turn locking ------------------------------------------------
 
@@ -573,7 +576,13 @@ class GroupRoom:
         socket_id = uuid.uuid4().hex
         self.connections[ws] = {"user_id": user_id, "name": name, "socket_id": socket_id}
         if self._fanout is not None:
-            await self._fanout.register(self.group_session_id, socket_id, user_id, name)
+            try:
+                await self._fanout.register(self.group_session_id, socket_id, user_id, name)
+            except BaseException:
+                # The caller refuses the socket and never reaches its cleanup,
+                # so a failed add must leave nothing behind for the heartbeat.
+                self.connections.pop(ws, None)
+                raise
             if self._heartbeat_task is None:
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -609,12 +618,27 @@ class GroupRoom:
                     continue
                 try:
                     await self.heartbeat()
+                    await self._push_roster_if_changed()
                 except Exception as e:
                     # Logged, not fatal: one missed refresh is survivable, and
                     # raising here would kill the loop and lose every later one.
                     log.error(f"[room] heartbeat loop error: {type(e).__name__}: {e}")
         except asyncio.CancelledError:
             raise
+
+    async def _push_roster_if_changed(self) -> None:
+        """Re-send presence when the roster changed without a join or leave.
+
+        Joins and leaves broadcast presence themselves; a worker that crashes
+        does neither, and its members only age out of the shared set. Without
+        this, teammates elsewhere would show them online until the next join.
+        Local delivery only: every worker runs its own heartbeat, so each one
+        updates its own sockets and nothing is published twice."""
+        members = await self.members_snapshot()
+        roster = frozenset(m["user_id"] for m in members)
+        if self._last_roster is not None and roster != self._last_roster:
+            await self.deliver_local({"type": "presence", "members": members})
+        self._last_roster = roster
 
     async def members_snapshot(self) -> list[dict]:
         """Distinct connected users across every worker (a user may have

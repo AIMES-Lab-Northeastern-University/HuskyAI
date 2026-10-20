@@ -196,7 +196,9 @@ function SessionBlock({ s, nameById, first }) {
                 <InfoIcon text="How often the artifact changed hands between consecutive writes. 1.0 means every write came from a different member than the one before it; 0 means one member wrote a whole block uninterrupted." />
               </div>
               {s.alternation_rate == null ? (
-                <NoValue reason="Needs at least two writes — one write has no pair to compare." />
+                <NoValue reason={writes === 0
+                  ? 'No writes yet, so there is no hand-off to measure.'
+                  : 'Needs at least two writes — one write has no pair to compare.'} />
               ) : (
                 <Figure
                   value={s.alternation_rate.toFixed(2)}
@@ -211,7 +213,9 @@ function SessionBlock({ s, nameById, first }) {
                 <InfoIcon text="Of the writes made when a teammate's section already existed, how many came after that student had actually expanded a teammate-authored section. Writes made when there was nothing of a teammate's to read are excluded from the denominator, not counted as failures." />
               </div>
               {rbw.ratio == null ? (
-                <NoValue reason="No write yet had a teammate's section available to read." />
+                <NoValue reason={writes === 0
+                  ? 'No writes yet.'
+                  : "No write yet had a teammate's section available to read."} />
               ) : (
                 <>
                   <Figure
@@ -246,7 +250,9 @@ function SessionBlock({ s, nameById, first }) {
                 <InfoIcon text="Median time from a section write to the first time a DIFFERENT member expanded that same section. Contributions nobody else opened are counted separately rather than folded into the median." />
               </div>
               {s.median_write_to_read_ms == null ? (
-                <NoValue reason="No contribution has been read by a teammate yet." />
+                <NoValue reason={writes === 0
+                  ? 'No writes yet, so there is nothing for a teammate to read.'
+                  : 'No contribution has been read by a teammate yet.'} />
               ) : (
                 <Figure
                   value={latencyText(s.median_write_to_read_ms)}
@@ -260,10 +266,18 @@ function SessionBlock({ s, nameById, first }) {
                 Coach reliance
                 <InfoIcon text="Among writes made when a teammate's work was available to adopt: coach-copied text versus text the student typed after reading a teammate. Coach-copied includes text inserted with Copy to document and text pasted from the student's own coach replies. Both are adoption; the question is adoption of whose work." />
               </div>
-              {reliance.measured === false ? (
+              {/* Three different nulls (docs/metrics-codebook.md): nothing written
+                  at all; writes from a client that could not tell coach text
+                  from typed text (`measured: false`); or measured, but no write
+                  that adopted anyone's work while a teammate's was available. */}
+              {writes === 0 ? (
+                <NoValue reason="No writes yet, so there is nothing to attribute to the coach or a teammate." />
+              ) : reliance.measured === false ? (
                 <NoValue reason="Not measured: this session's writes could not record whether text came from the coach." />
               ) : reliance.ratio == null ? (
-                <NoValue reason="No coach-copied or teammate-informed write yet." />
+                <NoValue reason={rbw.eligible_writes === 0
+                  ? "No write yet had a teammate's work available to adopt."
+                  : 'No coach-copied or teammate-informed write yet.'} />
               ) : (
                 <>
                   <Figure

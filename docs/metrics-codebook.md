@@ -1,11 +1,23 @@
 # Turn-taking metrics codebook
 
-**Metrics version: 1.1.0** (`METRICS_VERSION` in `backend/analysis/turn_taking.py`,
+**Metrics version: 1.2.0** (`METRICS_VERSION` in `backend/analysis/turn_taking.py`,
 echoed as `metrics_version` in every response.)
 
-Changes since 1.0.0: `coach_reliance.ratio` now draws both of its terms from
-eligible writes only (see below). No other definition changed, so every other
-number is comparable across the two versions.
+Changes in 1.2.0:
+- `read_before_write`: a read only qualifies if a teammate's text was in that
+  section **when it was read**. Before, any earlier expand of a section that was
+  teammate-authored at write time counted, including expanding it while it was
+  still empty or held only the reader's own text. 1.2.0 ratios can only be
+  lower than or equal to 1.1.0 ratios on the same log.
+- `coach_reliance`: writes with `origin` `coach_pasted` (coach text pasted
+  into the editor) now count as coach adoption alongside `coach_copied`
+  ("Copy to document"). Before, a paste counted as `student_typed`.
+
+Changes in 1.1.0: `coach_reliance.ratio` draws both of its terms from eligible
+writes only (see below).
+
+Every other definition is unchanged since 1.0.0. Compare a metric across
+versions only if its definition did not change between them.
 
 Changing any definition here is a **version bump plus a codebook edit**, never a
 silent fix. A number in a paper must be traceable to the definition that
@@ -61,8 +73,10 @@ contributions were never opened can show a perfectly healthy latency.
 
 ### `read_before_write.ratio`
 **The study's central measure.** Of writes that were *eligible*, the proportion
-where the author had already expanded a teammate-authored section earlier in the
-session.
+where the author had already expanded a section **while it held a teammate's
+text**, earlier in the session. Reading an earlier version of a teammate's text
+still counts; expanding a section that was empty, or held only the reader's own
+text, does not (since 1.2.0).
 
 `eligible_writes` counts only writes made when a teammate-authored section
 actually existed to be read. A write cannot be "informed by a teammate" if no
@@ -74,8 +88,10 @@ turns look like students ignoring each other. `null` when nothing was eligible.
 `coach_copied_eligible_writes ÷ (coach_copied_eligible_writes + teammate_informed_writes)`.
 
 Both terms are adoption; the question is adoption of *whose* work. `origin` on
-each write distinguishes text a student typed from text they copied out of their
-coach. `null` when neither occurred.
+each write distinguishes text a student typed from text they took from their
+coach: `coach_copied` (the "Copy to document" button) and, since 1.2.0,
+`coach_pasted` (coach text pasted into the editor) both count as the coach's.
+`null` when neither occurred.
 
 **Both terms are restricted to eligible writes** — writes made when a
 teammate-authored section already existed — so the ratio answers "when a
@@ -133,3 +149,47 @@ is not a student failure, so it must not be recorded as a low score.
 exactly as defined above, so scores from corpus-bearing and corpus-free
 assignments remain directly comparable — and so every score computed before
 Phase 2 stays valid.
+
+## Team PEI (collaborative-coach arm)
+
+In the collaborative-coach arm each student has their own coach and their own
+per-turn PEI, so there is no single number that is self-evidently "the team's
+score". We do **not** blend one. Three things are reported separately:
+
+1. **Each student's own average PEI** — in `per_student[user].avg_pei`.
+2. **The team's collaboration measures** — the turn-taking metrics defined above
+   (contribution share, equality, alternation, read-before-write, coach
+   reliance). These describe *how* the team worked, not how well any one student
+   scored.
+3. **Team PEI** — a single convenience figure for instructor views, defined
+   below. It is a summary of (1), never a substitute for reading the parts.
+
+### `session_avg_pei` (team PEI) — equal-weight mean
+
+`session_avg_pei` on a `GroupSession` is the **mean of the per-student average
+PEIs**: each student contributes their own average once, regardless of how many
+turns they took.
+
+```
+session_avg_pei = mean( avg_pei(student) for each student with ≥1 scored turn )
+```
+
+A student who produced no scored turn has no average and is **not counted** —
+they neither raise nor lower the team figure.
+
+It is always reported with its spread, `pei_range = {min, max}`, the lowest and
+highest per-student average on the team. A lone number can hide a split team
+(one strong student, one struggling); the range makes that visible.
+
+**Why not pool every turn.** The previous placeholder averaged *all turns* across
+the team (`sum of every turn's PEI / total turn count`). That weights a student
+by how talkative they were: a student with 20 turns outweighed a teammate with
+3, so the team score tracked participation volume, not shared performance.
+Equal-weight means one student, one vote.
+
+**This is a definition change (bump the metrics version when releasing).** Team
+scores produced by the old pooled formula are **not** comparable with
+equal-weight ones; do not mix them in the same analysis.
+
+Computed once in `_coach_session_summary` (`backend/main.py`). It deliberately
+does **not** touch `best_pei`, which remains the shared-coach arm's concept.
