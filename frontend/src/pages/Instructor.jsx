@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import GroupTeamManager from '../components/GroupTeamManager'
+import TeamSubmissionsPanel from '../components/TeamSubmissionsPanel'
 import CorpusManager from '../components/CorpusManager'
 import SectionsEditor, { sectionsProblem } from '../components/SectionsEditor'
 import { API_URL, authHeaders, formatApiErrorDetail, readApiError, clearSession } from '../lib/api'
@@ -250,6 +251,7 @@ export default function Instructor() {
   const [createTeamMin, setCreateTeamMin] = useState(2)
   const [createTeamMax, setCreateTeamMax] = useState(4)
   const [manageTeamsId, setManageTeamsId] = useState(null)
+  const [submissionsId, setSubmissionsId] = useState(null)
   const [studySettingsId, setStudySettingsId] = useState(null)
   const [createMsg, setCreateMsg] = useState('')
   const [creating, setCreating] = useState(false)
@@ -1718,6 +1720,17 @@ export default function Instructor() {
                                             {manageTeamsId === c.id ? 'Hide teams' : 'Manage teams'}
                                           </button>
                                         )}
+                                        {c.mode === 'group' && !isDemo && (
+                                          <button
+                                            type="button"
+                                            onClick={() => setSubmissionsId(submissionsId === c.id ? null : c.id)}
+                                            style={submissionsId === c.id
+                                              ? { ...btnSm, background: '#16120E', color: '#fff', borderColor: '#16120E' }
+                                              : btnSm}
+                                          >
+                                            {submissionsId === c.id ? 'Hide submissions' : 'Submissions'}
+                                          </button>
+                                        )}
                                       </>
                                     )}
                                     <button
@@ -1750,6 +1763,9 @@ export default function Instructor() {
                                     )}
                                   </div>
                                 </div>
+                                {c.mode === 'group' && !isDemo && submissionsId === c.id && (
+                                  <TeamSubmissionsPanel classroomId={selectedId} challengeId={c.id} />
+                                )}
                                 {c.mode === 'group' && !isDemo && manageTeamsId === c.id && (
                                   <GroupTeamManager classroomId={selectedId} challengeId={c.id}
                                                     verificationPolicy={c.verification_policy} />
