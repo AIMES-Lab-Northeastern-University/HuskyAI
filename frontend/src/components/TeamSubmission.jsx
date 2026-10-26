@@ -20,6 +20,15 @@ export function scoreColor(v) {
 
 export const fmtScore = (v) => (v == null ? '—' : String(Math.round(v * 10) / 10))
 
+/** Students press Enter for a new line and expect one, but markdown joins
+ *  single newlines into a paragraph. Make each one a hard break, outside code
+ *  blocks and list/heading structure, so the document reads as it was typed
+ *  (and as the PDF prints it). */
+export function keepLineBreaks(text = '') {
+  return text.split(/(```[\s\S]*?```)/).map(part => (part.startsWith('```') ? part
+    : part.replace(/([^\n])\n(?!\n|\s*([-*+]|\d+[.)]|#{1,6})\s)/g, '$1  \n'))).join('')
+}
+
 /** Fetch an authenticated file and save it under the server's filename. */
 export async function downloadAuthed(url, fallbackName) {
   const r = await fetch(url, { headers: authHeaders() })
@@ -87,7 +96,7 @@ export function SubmissionDocument({ data }) {
         <div className="mt-4 p-4 rounded-[10px] bg-[#E6F7F6] border border-[#C7E9E6]">
           <div className="text-[11px] font-bold text-[#0D9488] uppercase tracking-[0.7px] mb-1">Instructor feedback</div>
           <div className="prose-chat text-[13px] text-[#16120E]">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{data.instructor_feedback}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(data.instructor_feedback)}</ReactMarkdown>
           </div>
         </div>
       )}
@@ -100,7 +109,7 @@ export function SubmissionDocument({ data }) {
           {s.title && <h2 className="text-[17px] font-bold text-[#16120E]">{s.title}</h2>}
           {s.writers?.length > 0 && <div className="text-[11px] italic text-[#9A948E] mb-1">Written by {s.writers.join(', ')}</div>}
           {(s.content || '').trim()
-            ? <div className="prose-chat text-[14px] text-[#16120E] leading-relaxed"><ReactMarkdown remarkPlugins={[remarkGfm]}>{s.content}</ReactMarkdown></div>
+            ? <div className="prose-chat text-[14px] text-[#16120E] leading-relaxed"><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(s.content)}</ReactMarkdown></div>
             : <div className="text-[13px] italic text-[#B5AFA8]">(left blank)</div>}
         </section>
       ))}

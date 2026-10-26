@@ -33,3 +33,17 @@ describe('final review checklist', () => {
     expect(wordCount('')).toBe(0)
   })
 })
+
+import { keepLineBreaks } from '../src/components/TeamSubmission'
+
+describe('keepLineBreaks', () => {
+  it('turns single newlines into hard breaks', () => {
+    expect(keepLineBreaks('A: one\nB: two')).toBe('A: one  \nB: two')
+  })
+  it('leaves paragraphs, lists, headings and code alone', () => {
+    expect(keepLineBreaks('para one\n\npara two')).toBe('para one\n\npara two')
+    expect(keepLineBreaks('intro\n- a\n- b')).toBe('intro\n- a\n- b')
+    expect(keepLineBreaks('text\n## Head')).toBe('text\n## Head')
+    expect(keepLineBreaks('```\nx\ny\n```')).toBe('```\nx\ny\n```')
+  })
+})

@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { keepLineBreaks } from './TeamSubmission'
 
 /**
  * The team's final review: the whole document exactly as the instructor will
@@ -128,7 +129,7 @@ export default function FinalReview({
                     ))}
                     <div className="mt-2">
                       {c.words
-                        ? <div className="prose-chat text-[14px] text-[#16120E] leading-relaxed"><ReactMarkdown remarkPlugins={[remarkGfm]}>{s.content}</ReactMarkdown></div>
+                        ? <div className="prose-chat text-[14px] text-[#16120E] leading-relaxed"><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(s.content)}</ReactMarkdown></div>
                         : <div className="text-[13px] italic text-[#B5AFA8]">(empty)</div>}
                     </div>
                   </section>

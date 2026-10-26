@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
 import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
-import { StudentSubmissionBar } from '../components/TeamSubmission'
+import { StudentSubmissionBar, keepLineBreaks } from '../components/TeamSubmission'
 import FinalReview, { wordCount } from '../components/FinalReview'
 import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
@@ -287,7 +287,7 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
             <div className="mt-3">
               {empty
                 ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
-                : <div className="prose-chat text-[13px] text-[#16120E]"><ReactMarkdown remarkPlugins={[remarkGfm]}>{section.content}</ReactMarkdown></div>}
+                : <div className="prose-chat text-[13px] text-[#16120E]"><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(section.content)}</ReactMarkdown></div>}
               {/* A finished session is read-only; the server refuses writes too. */}
               {!readOnly && (
                 <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
