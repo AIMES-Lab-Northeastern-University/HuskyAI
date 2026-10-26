@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
 import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
+import { StudentSubmissionBar } from '../components/TeamSubmission'
 import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 import { AttachButton, FileChip, PendingFiles, usePendingFiles } from '../components/Attachments'
@@ -991,7 +992,7 @@ export default function CoachWorkspace() {
       </div>
 
       {sessionEnded && (
-        <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex items-center gap-4 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+        <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex flex-wrap items-center gap-x-4 gap-y-2 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <span className="text-[13px] font-bold text-[#0D9488]">
             {endInfo?.reason === 'timer_expired' ? 'Time is up — session ended.'
               : endInfo?.byName ? `Session ended by ${endInfo.byName}.`
@@ -1007,6 +1008,7 @@ export default function CoachWorkspace() {
               )}
             </span>
           )}
+          <StudentSubmissionBar groupId={groupId} sessionNum={sessionNum} />
           <button onClick={() => navigate('/challenges')}
                   className="ml-auto text-[12px] font-bold text-[#0D9488] underline cursor-pointer">
             Back to challenges
