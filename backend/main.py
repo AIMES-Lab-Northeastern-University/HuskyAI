@@ -20,10 +20,10 @@ from google.genai import types
 import openai
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, delete, func
 from sqlalchemy.exc import IntegrityError
 
-from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership, GroupChatAttachment
+from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership, GroupChatAttachment, ReviewReadyMark
 from group_room import RedisUnavailable, rooms
 from events import log_event
 import artifacts
@@ -3001,6 +3001,7 @@ async def coach_websocket_endpoint(
             "deadline": deadline.isoformat() + "Z" if deadline else None,
             "remaining_seconds": (max(0, int((deadline - datetime.utcnow()).total_seconds()))
                                   if deadline else None),
+            "review": await _review_state_for(group_session_id),
         }))
         if session_data:
             await websocket.send_text(json.dumps({
@@ -3024,6 +3025,12 @@ async def coach_websocket_endpoint(
         # the panel is actually opened.
         snap = await artifacts.snapshot(group_session_id)
         await websocket.send_text(json.dumps({"type": "artifact", "data": snap}))
+        # What each section should contain and roughly how long it should be,
+        # as the instructor wrote it. Display only; keyed like the sections.
+        guides = {d["key"]: {"prompt": d.get("prompt") or None, "target_words": d.get("target_words")}
+                  for d in (section_defs or []) if isinstance(d, dict) and d.get("key")}
+        if guides:
+            await websocket.send_text(json.dumps({"type": "section_guides", "data": guides}))
 
         team_chat = await _load_team_chat(group_id)
         if team_chat:
@@ -3161,6 +3168,7 @@ async def coach_websocket_endpoint(
                     res = await artifacts.log_section_expand(
                         group_session_id, user_id, key,
                         idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
+                        via=data.get("via"),
                     )
                     await _ack_read(data, res)
                 continue
@@ -3277,6 +3285,7 @@ async def coach_websocket_endpoint(
                     },
                     exclude=websocket,
                 )
+                await _reset_review_marks(group_session_id, my_name, key)
                 continue
 
             if mtype == "typing_indicator":
@@ -3992,6 +4001,154 @@ async def end_group_session(
         "analysis_status": (gs.session_analysis or {}).get("status"),
         "end_reason": gs.end_reason,
     }
+
+
+# ---- Final review -----------------------------------------------------------
+# Finishing a team session is a step, not a button. A member asks to finish; the
+# team sees the whole document as it will be submitted, with a checklist, and
+# each participant marks it ready. The session ends when all of them are ready,
+# when a member submits without waiting (the existing End), or at the deadline.
+
+
+async def _review_state(db, gs) -> dict:
+    """Who has to be ready and who is. Required = the members who opened this
+    session (have a coach conversation in it); a member who never joined cannot
+    hold the team up. Falls back to every member if somehow nobody has."""
+    members = (await db.execute(
+        select(User.id, User.name).join(GroupMember, GroupMember.user_id == User.id)
+        .where(GroupMember.group_id == gs.group_id).order_by(GroupMember.joined_at)
+    )).all()
+    joined = {c.user_id for c in await _private_coach_conversations(db, gs.id)}
+    required = [(uid, name) for uid, name in members if uid in joined] or list(members)
+    marks = set((await db.execute(
+        select(ReviewReadyMark.user_id).where(ReviewReadyMark.group_session_id == gs.id)
+    )).scalars().all())
+    required_ids = {uid for uid, _ in required}
+    return {
+        "started_at": gs.review_started_at.isoformat() + "Z" if gs.review_started_at else None,
+        "required": [{"user_id": uid, "name": name} for uid, name in required],
+        "ready_user_ids": [uid for uid, _ in required if uid in marks],
+        "all_ready": bool(required_ids) and required_ids <= marks,
+    }
+
+
+async def _review_state_for(group_session_id: str) -> dict | None:
+    try:
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            return await _review_state(db, gs) if gs else None
+    except Exception as e:
+        log.error(f"[REVIEW] could not read review state for {group_session_id[:8]}: {e}")
+        return None
+
+
+async def _notify_review(group_session_id: str, state: dict, **extra) -> None:
+    try:
+        await rooms.notify(group_session_id, {"type": "review_state", **state, **extra})
+    except Exception as e:
+        log.error(f"[REVIEW] could not announce review state for {group_session_id[:8]}: {e}")
+
+
+async def _begin_review(db, gs) -> bool:
+    """Start the review once; True for the call that started it."""
+    res = await db.execute(
+        update(GroupSession)
+        .where(GroupSession.id == gs.id, GroupSession.review_started_at.is_(None),
+               GroupSession.status != "completed")
+        .values(review_started_at=datetime.utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    await db.refresh(gs)
+    return res.rowcount == 1
+
+
+async def _reset_review_marks(group_session_id: str, by_name: str, section_key: str) -> None:
+    """A write during review changes what everyone approved, so every ready
+    mark is withdrawn and the team is told who changed what. Never raises: the
+    write it follows is already committed."""
+    try:
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            if gs is None or gs.review_started_at is None:
+                return
+            res = await db.execute(
+                delete(ReviewReadyMark).where(ReviewReadyMark.group_session_id == group_session_id)
+            )
+            await db.commit()
+            if res.rowcount:
+                await _notify_review(group_session_id, await _review_state(db, gs),
+                                     reset_by_name=by_name, reset_section=section_key)
+    except Exception as e:
+        log.error(f"[REVIEW] could not reset ready marks for {group_session_id[:8]}: {e}")
+
+
+async def _review_gs_or_409(db, group_id: str, session_num: int, user_id: str):
+    gs = await _group_session_or_403(db, group_id, session_num, user_id)
+    if gs.status == "completed":
+        raise HTTPException(status_code=409, detail="This session has already ended")
+    if not await _private_coach_conversations(db, gs.id):
+        raise HTTPException(status_code=409, detail="This session has no final review")
+    return gs
+
+
+@app.post("/groups/{group_id}/sessions/{session_num}/review")
+async def start_group_review(
+    group_id: str,
+    session_num: int,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """A member asks to finish. Idempotent: the team is told once, by name."""
+    gs = await _review_gs_or_409(db, group_id, session_num, user_id)
+    started = await _begin_review(db, gs)
+    state = await _review_state(db, gs)
+    if started:
+        me = await db.get(User, user_id)
+        await _notify_review(gs.id, state, started_by_name=me.name if me else None)
+    return state
+
+
+class ReadyBody(BaseModel):
+    ready: bool
+
+
+@app.post("/groups/{group_id}/sessions/{session_num}/ready")
+async def set_review_ready(
+    group_id: str,
+    session_num: int,
+    body: ReadyBody,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Mark (or unmark) yourself ready to submit. The last participant to mark
+    ready ends the session and submits the document."""
+    gs = await _review_gs_or_409(db, group_id, session_num, user_id)
+    deadline = _group_deadline(gs)
+    if deadline is not None and datetime.utcnow() >= deadline:
+        private = await _private_coach_conversations(db, gs.id)
+        return {"ended": True, "summary": await _end_coach_session(db, gs, private, end_reason="timer_expired")}
+
+    started = await _begin_review(db, gs)
+    if body.ready:
+        db.add(ReviewReadyMark(group_session_id=gs.id, user_id=user_id))
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()  # already marked
+    else:
+        await db.execute(delete(ReviewReadyMark).where(
+            ReviewReadyMark.group_session_id == gs.id, ReviewReadyMark.user_id == user_id))
+        await db.commit()
+
+    state = await _review_state(db, gs)
+    if state["all_ready"]:
+        private = await _private_coach_conversations(db, gs.id)
+        summary = await _end_coach_session(db, gs, private, end_reason="team_ready")
+        return {**state, "ended": True, "summary": summary}
+    me = await db.get(User, user_id)
+    await _notify_review(gs.id, state, **({"started_by_name": me.name if me else None} if started else {}))
+    return state
 
 
 async def _team_chat_attachment_or_403(db, group_id: str, attachment_id: str, user_id: str):

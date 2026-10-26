@@ -775,7 +775,11 @@ class SectionBody(BaseModel):
     key: str = Field(..., min_length=1, max_length=64,
                      pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     title: str = Field(..., min_length=1, max_length=200)
+    # What the section should contain, shown to students as the section's brief.
     prompt: str = Field(default="", max_length=2000)
+    # Roughly how long a finished section should be. Guidance only: it drives
+    # the "too short" check on the team's final review, nothing is refused.
+    target_words: Optional[int] = Field(default=None, ge=10, le=5000)
 
 
 def _normalize_sections(sections: list[SectionBody] | None) -> list[dict]:
@@ -803,7 +807,10 @@ def _normalize_sections(sections: list[SectionBody] | None) -> list[dict]:
                        "within a challenge (every event is attributed by key)",
             )
         seen.add(key)
-        out.append({"key": key, "title": sec.title.strip(), "prompt": sec.prompt.strip()})
+        row = {"key": key, "title": sec.title.strip(), "prompt": sec.prompt.strip()}
+        if sec.target_words:
+            row["target_words"] = sec.target_words
+        out.append(row)
     return out
 
 

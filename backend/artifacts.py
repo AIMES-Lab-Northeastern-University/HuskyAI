@@ -64,6 +64,9 @@ ORIGIN_TRACKING = {"copy+paste"}
 
 MAX_SECTION_KEY_LEN = 64
 
+# How a section came to be on someone's screen, when it was not their own click.
+READ_VIAS = {"review"}
+
 # Longest a section may be. Every save stores the whole section as a revision
 # and, outside the isolated arm, the document rides along with every coach
 # turn, so an unbounded paste grows both the database and the prompt bill.
@@ -587,12 +590,20 @@ async def log_section_expand(
     role_label: str | None = None,
     idempotency_key: str | None = None,
     client_ts: datetime | None = None,
+    via: str | None = None,
 ) -> EventResult:
     """A person expanded one section — the finest-grained read, and the one that
-    makes "did they look at Sam's step 2?" answerable."""
+    makes "did they look at Sam's step 2?" answerable.
+
+    `via="review"`: the section was in front of them on the team's final review,
+    which shows the whole document at once. Still a read, since the text was on
+    their screen, but marked so analysis can tell it from a deliberate click."""
+    payload = {"section_key": section_key}
+    if via in READ_VIAS:
+        payload["via"] = via
     return await _log_read(
         group_session_id, "section_expand", user_id, "student",
-        {"section_key": section_key}, role_label, idempotency_key, client_ts,
+        payload, role_label, idempotency_key, client_ts,
     )
 
 

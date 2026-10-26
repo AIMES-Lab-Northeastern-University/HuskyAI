@@ -362,7 +362,8 @@ def render_submission_pdf(d: dict) -> bytes:
     row("Team", d["team_name"])
     row("Members", ", ".join(d["members"]) or "-")
     if d.get("submitted_at"):
-        ended = {"timer_expired": " (time ran out)", "manual": " (ended by the team)"}.get(d.get("end_reason"), "")
+        ended = {"timer_expired": " (time ran out)", "manual": " (ended by the team)",
+                 "team_ready": " (the whole team marked it ready)"}.get(d.get("end_reason"), "")
         row("Submitted", datetime.fromisoformat(d["submitted_at"]).strftime("%Y-%m-%d %H:%M UTC") + ended)
     pdf.ln(3)
 

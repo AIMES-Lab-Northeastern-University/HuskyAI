@@ -125,6 +125,14 @@ as a raw count in `totals`.
 `dwell` alone — `section_expand` carries the read signal — so an expired
 heartbeat degrades precision, not validity.
 
+**Final-review reads carry `payload.via = "review"`.** The end-of-session review
+shows every section's full text at once, so opening it logs a `section_expand`
+for each non-empty section, marked with `via: "review"`. These are currently
+counted like any other read. They cluster at the end of a session, so whether
+they should feed `read_before_write` and `median_write_to_read_ms` is a PI
+decision; excluding them is a filter on `payload.via`, and doing so is a
+definition change (version bump).
+
 **Null is not zero.** Every ratio returns `null` when its denominator is empty,
 rather than `0.0`. "No eligible writes" and "nobody read anything" are different
 findings and must not be collapsed.

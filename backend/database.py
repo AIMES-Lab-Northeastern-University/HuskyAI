@@ -505,6 +505,30 @@ class GroupSession(Base):
     min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Post-session analysis blob; same shape as UserChallengeSession.session_analysis.
     session_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # When a member first asked to finish: the team then reviews the whole
+    # document and each member marks it ready (ReviewReadyMark). Editing stays
+    # open during review; the session ends when every participant is ready, a
+    # member submits anyway, or the timer runs out.
+    review_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ReviewReadyMark(Base):
+    """One member's "ready to submit" on a group session's final review.
+
+    A row per member rather than a list on GroupSession, so teammates marking
+    ready at the same moment cannot overwrite each other. Every accepted write
+    to the document during review deletes them all: a mark approves the text
+    the member saw, not whatever a teammate changes afterwards."""
+
+    __tablename__ = "review_ready_marks"
+    __table_args__ = (UniqueConstraint("group_session_id", "user_id", name="uq_review_ready_mark"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class GroupChatMessage(Base):
@@ -1020,6 +1044,7 @@ _SQLITE_ADDED_COLUMNS = [
     ("users", "research_ack_version", "INTEGER"),
     ("eval_results", "score_status", "VARCHAR(16)"),
     ("eval_results", "scored_at", "DATETIME"),
+    ("group_sessions", "review_started_at", "DATETIME"),
 ]
 
 
@@ -1123,6 +1148,8 @@ async def init_db():
                 "scored_at TIMESTAMP WITHOUT TIME ZONE",
                 "CREATE INDEX IF NOT EXISTS ix_eval_results_score_status "
                 "ON eval_results (score_status)",
+                "ALTER TABLE group_sessions ADD COLUMN IF NOT EXISTS "
+                "review_started_at TIMESTAMP WITHOUT TIME ZONE",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens
