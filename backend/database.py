@@ -960,6 +960,43 @@ class ArtifactRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TeamSubmission(Base):
+    """What a team hands in at the end of a group session: the shared document
+    frozen as it stood when the session ended, the AI's team score at that
+    moment, and the instructor's grade.
+
+    Created automatically when the session ends, by whichever path ends it
+    (End button, timer, lazy expiry), so there is no separate "submit" step a
+    team could forget. The document is a snapshot, not a pointer to the live
+    artifact: the grade must stay attached to the text that was graded.
+
+    The AI score is never overwritten by grading. `instructor_score` sits beside
+    it, and the score that counts is the instructor's when set, else the AI's."""
+
+    __tablename__ = "team_submissions"
+    __table_args__ = (UniqueConstraint("group_session_id", name="uq_team_submission_session"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    challenge_id: Mapped[str] = mapped_column(String, ForeignKey("challenges.id"), nullable=False, index=True)
+    session_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # [{"key", "title", "content", "updated_by_user_id"}] in document order.
+    sections: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Team PEI (equal-weight mean in the private-coach arm), its spread, and
+    # each member's own average, as the session ended.
+    ai_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_score_range: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    per_student: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    instructor_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    instructor_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graded_by_user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
+    graded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 # Columns added to already-existing tables, as (table, column, DDL type).
 # `create_all` creates missing TABLES but never missing COLUMNS, and Alembic does
 # not run against SQLite here — so without this, adding a column to an existing

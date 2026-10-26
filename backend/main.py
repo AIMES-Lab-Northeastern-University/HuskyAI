@@ -28,6 +28,14 @@ from group_room import RedisUnavailable, rooms
 from events import log_event
 import artifacts
 import coordination
+from pdf_render import pdf_safe as _pdf_safe, pei_rgb as _pei_rgb, render_message_body as _render_message_body
+from submissions import (
+    coach_session_summary as _coach_session_summary,
+    private_coach_conversations as _private_coach_conversations,
+    router as submissions_router,
+    team_router as submissions_team_router,
+    record_submission,
+)
 from rate_limit import close_rate_limit_clients
 from study_policy import resolve_for_group_session
 
@@ -261,6 +269,8 @@ app.include_router(verification_router)
 app.include_router(contested_router)
 app.include_router(research_export_router)
 app.include_router(group_teams_router)
+app.include_router(submissions_router)
+app.include_router(submissions_team_router)
 
 BASE_SYSTEM_PROMPT = (
     "You are an expert AI tutor helping students develop their AI prompting and reasoning skills. "
@@ -3782,75 +3792,6 @@ async def get_turn_taking(
     }
 
 
-async def _coach_session_summary(db, gs, private_conversations: list) -> tuple[dict, float | None]:
-    """The end-of-session figures for the private-coach arm, and the unrounded
-    team mean. Read-only, so the ender, every teammate's session_ended frame
-    and a tab reopening a finished session all see the same numbers.
-
-    The team score is an EQUAL-WEIGHT mean: the average of each student's own
-    average PEI, so every student counts once no matter how many turns they
-    took. The earlier placeholder pooled every turn (sum of all turns / turn
-    count), which let the most active student dominate — a student with 20 turns
-    outweighed a teammate with 3. It is returned with the range (min/max of the
-    per-student averages) so a single number can never hide a split team, and
-    each student's own average is still exposed in `per_student`. See
-    docs/metrics-codebook.md ("Team PEI") for the definition.
-    """
-    per_student: dict[str, dict] = {}
-    student_means: list[float] = []  # one value per student, unrounded — equal weight
-    total_turns = 0
-    user_ids = [c.user_id for c in private_conversations]
-    names = {}
-    if user_ids:
-        names = {u.id: u.name for u in (await db.execute(
-            select(User).where(User.id.in_(user_ids))
-        )).scalars().all()}
-
-    for conv in private_conversations:
-        peis = (await db.execute(
-            select(EvalResult.pei).where(
-                EvalResult.conversation_id == conv.id, EvalResult.pei.is_not(None)
-            )
-        )).scalars().all()
-        if peis:
-            student_means.append(sum(float(p) for p in peis) / len(peis))
-        total_turns += len(peis)
-        per_student[conv.user_id] = {
-            "avg_pei": round(sum(peis) / len(peis), 1) if peis else None,
-            "turns": len(peis),
-            # Teammates may be offline when the frame arrives, so the client
-            # cannot always name them from presence.
-            "name": names.get(conv.user_id),
-        }
-
-    # Equal-weight mean of the per-student averages (not of raw turns), plus the
-    # spread. A student with no scored turn has no average and is simply not
-    # counted — they do not drag the team mean toward zero.
-    team_mean = round(sum(student_means) / len(student_means), 2) if student_means else None
-    pei_range = (
-        {"min": round(min(student_means), 1), "max": round(max(student_means), 1)}
-        if student_means else None
-    )
-    return {
-        "arm": "collab_coach_artifact",
-        "session_avg_pei": round(team_mean, 1) if team_mean is not None else None,
-        "pei_range": pei_range,
-        "turns": total_turns,
-        "per_student": per_student,
-        "analysis_status": None,
-        "end_reason": gs.end_reason,
-    }, team_mean
-
-
-async def _private_coach_conversations(db, group_session_id: str) -> list:
-    return (await db.execute(
-        select(Conversation).where(
-            Conversation.group_session_id == group_session_id,
-            Conversation.kind == "coach_private",
-        )
-    )).scalars().all()
-
-
 async def _end_coach_session(db, gs, private_conversations: list, *,
                              end_reason: str = "manual",
                              ended_by: tuple[str, str] | None = None) -> dict:
@@ -3895,6 +3836,7 @@ async def _end_coach_session(db, gs, private_conversations: list, *,
     summary["end_reason"] = gs.end_reason
 
     if won:
+        await _hand_in(db, gs)
         # notify, not peek+broadcast: under Redis the team's sockets may be on
         # other workers, and a worker that holds no room for this session would
         # otherwise tell nobody. Every teammate's tab must lock, wherever it is,
@@ -3907,6 +3849,17 @@ async def _end_coach_session(db, gs, private_conversations: list, *,
         })
 
     return summary
+
+
+async def _hand_in(db, gs) -> None:
+    """Submit the team's document to the instructor as the session ends. A
+    failure here must not undo or block the end itself: the instructor's
+    submissions view records any ended session that is missing one."""
+    try:
+        await record_submission(db, gs)
+    except Exception as e:
+        log.error(f"could not record the submission for {gs.id[:8]}: {e}", exc_info=True)
+        await db.rollback()
 
 
 def _group_deadline(gs) -> datetime | None:
@@ -4025,6 +3978,7 @@ async def end_group_session(
         schedule_analysis = True
 
     await db.commit()
+    await _hand_in(db, gs)
 
     if schedule_analysis:
         _spawn_group_analysis(gs.id)
@@ -4129,69 +4083,8 @@ async def get_group_session_analysis(
 
 
 # --- Chat export → PDF ------------------------------------------------------
-# Rendered with fpdf2 (pure-Python, no system deps — safe on Railway). Core
-# fonts are latin-1 only, so text is normalized first; message bodies get a
-# light markdown cleanup and fenced code blocks render in a monospace box.
-
-def _pdf_safe(s: str) -> str:
-    """Make text safe for fpdf2 core (latin-1) fonts."""
-    if not s:
-        return ""
-    repl = {
-        "‘": "'", "’": "'", "“": '"', "”": '"',
-        "–": "-", "—": "-", "…": "...", "•": "-",
-        " ": " ", "→": "->", "←": "<-", "✓": "[x]",
-    }
-    for k, v in repl.items():
-        s = s.replace(k, v)
-    return s.encode("latin-1", "replace").decode("latin-1")
-
-
-def _pei_rgb(pei):
-    if pei is None:
-        return (107, 101, 96)
-    if pei <= 40:
-        return (200, 16, 46)
-    if pei <= 65:
-        return (249, 115, 22)
-    if pei <= 80:
-        return (13, 148, 136)
-    return (22, 163, 74)
-
-
-def _md_inline_clean(s: str) -> str:
-    """Strip inline markdown markers so prose reads cleanly without artifacts."""
-    s = re.sub(r"`([^`]*)`", r"\1", s)          # inline code
-    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)    # bold
-    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)  # italic
-    s = re.sub(r"__([^_]+)__", r"\1", s)        # underline/bold
-    s = re.sub(r"^\s{0,3}#{1,6}\s*", "", s, flags=re.M)  # headings
-    return s
-
-
-def _render_message_body(pdf, text: str):
-    """Write a message body, rendering fenced code blocks in a monospace box."""
-    from fpdf.enums import XPos, YPos
-
-    text = text or ""
-    for part in re.split(r"(```.*?```)", text, flags=re.DOTALL):
-        if not part:
-            continue
-        if part.startswith("```"):
-            code = re.sub(r"^```[a-zA-Z0-9_+\-]*\n?", "", part)
-            code = re.sub(r"```$", "", code).rstrip()
-            pdf.set_font("Courier", "", 8.5)
-            pdf.set_text_color(40, 40, 40)
-            pdf.set_fill_color(244, 244, 246)
-            pdf.multi_cell(0, 4.3, _pdf_safe(code), fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.ln(0.5)
-        else:
-            clean = _md_inline_clean(part).strip("\n")
-            if clean.strip():
-                pdf.set_font("Helvetica", "", 10)
-                pdf.set_text_color(30, 30, 30)
-                pdf.multi_cell(0, 5, _pdf_safe(clean), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
+# Rendered with fpdf2; the text helpers live in pdf_render.py, shared with the
+# team submission PDF.
 
 def _render_export_pdf(title: str, started_at, turns: list, avg_pei) -> bytes:
     from fpdf import FPDF
