@@ -567,6 +567,7 @@ export default function Instructor() {
             key: (s.key || '').trim(),
             title: (s.title || '').trim(),
             prompt: (s.prompt || '').trim(),
+            target_words: s.target_words === '' || s.target_words == null ? null : Number(s.target_words),
           })),
           ...(editFeed.length ? { feed_enabled_by_session: editFeed } : {}),
         }),
@@ -673,6 +674,7 @@ export default function Instructor() {
             key: (s.key || '').trim(),
             title: (s.title || '').trim(),
             prompt: (s.prompt || '').trim(),
+            target_words: s.target_words === '' || s.target_words == null ? null : Number(s.target_words),
           })),
         }),
       })

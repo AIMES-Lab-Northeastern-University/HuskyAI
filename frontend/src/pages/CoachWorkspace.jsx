@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
 import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
 import { StudentSubmissionBar } from '../components/TeamSubmission'
+import FinalReview, { wordCount } from '../components/FinalReview'
 import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 import { AttachButton, FileChip, PendingFiles, usePendingFiles } from '../components/Attachments'
@@ -85,7 +86,7 @@ export function originFor(draft, copied, pasted) {
 
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen, guide, focusRequest, onFocusSeen }) {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(section.content || '')
@@ -108,6 +109,7 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // closing an editor "Copy to document" just opened, or reopening an empty one
   // under an old error. Only answers to our own sends apply.
   const awaitingSave = useRef(false)
+  const rootRef = useRef(null)
 
 
   // Follow the server's copy while not actively editing, so a teammate's edit
@@ -143,6 +145,19 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
     // Consumed: cleared in the parent so a later remount cannot apply it again.
     onInsertSeen?.(insertRequest.n)
   }, [insertRequest]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // "Edit" on the final review: open this section's editor and bring it into
+  // view. Not a read event — the review screen already logged that one.
+  useEffect(() => {
+    if (!focusRequest) return
+    setOpen(true)
+    if (!readOnly) {
+      if (!editing) setBaseVersion(section.version)
+      setEditing(true)
+    }
+    setTimeout(() => rootRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+    onFocusSeen?.(focusRequest.n)
+  }, [focusRequest]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle = () => {
     const next = !open
@@ -184,9 +199,12 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   }
 
   const empty = !(section.content || '').trim()
+  const target = guide?.target_words || null
+  const words = wordCount(section.content || '')
+  const draftWords = wordCount(draft)
 
   return (
-    <div className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden flex-shrink-0" style={{ borderWidth: '1.5px' }}>
+    <div ref={rootRef} className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden flex-shrink-0" style={{ borderWidth: '1.5px' }}>
       <button
         onClick={toggle}
         className="w-full px-4 py-3 flex items-center gap-3 hover:bg-[#F7F3EE] cursor-pointer text-left"
@@ -196,7 +214,8 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
         <div className="flex-1 min-w-0">
           <div className="text-[13px] font-bold text-[#16120E] truncate">{section.title || section.key}</div>
           <div className="text-[11px] text-[#9A948E] mt-0.5">
-            {empty ? 'Empty' : `v${section.version} · ${editorName || 'someone'} · ${timeAgo(section.updated_at)}`}
+            {empty ? (target ? `Empty · aim for ~${target} words` : 'Empty')
+              : `${words}${target ? ` / ~${target}` : ''} words · ${editorName || 'someone'} · ${timeAgo(section.updated_at)}`}
           </div>
         </div>
         {justUpdatedBy && (
@@ -211,6 +230,11 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
 
       {open && (
         <div className="px-4 pb-4 border-t border-[#E7E0D8]" style={{ borderTopWidth: '1.5px' }}>
+          {guide?.prompt && (
+            <div className="mt-3 px-3 py-2 rounded-[8px] bg-[#F7F3EE] text-[12px] text-[#4A4440]">
+              <span className="font-bold text-[#6B6560]">What goes here: </span>{guide.prompt}
+            </div>
+          )}
           {conflict && (
             <div className="mt-3 p-3 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]" style={{ borderWidth: '1.5px' }}>
               <div className="text-[12px] font-bold text-[#C8102E] mb-1">A teammate saved first</div>
@@ -239,10 +263,10 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
                 rows={8}
                 className="w-full p-3 text-[13px] text-[#16120E] bg-white border border-[#E7E0D8] rounded-[10px] resize-y font-mono leading-relaxed focus:outline-none focus:border-[#C8102E]"
                 style={{ borderWidth: '1.5px' }}
-                placeholder="Write the team's work for this section…"
+                placeholder={guide?.prompt ? `${guide.prompt}\n\nWrite it as the team's finished answer. Discuss in team chat.` : "Write the team's finished answer for this section. Discuss in team chat."}
               />
               <div className={`mt-1 text-right text-[11px] ${draft.length > SECTION_MAX_CHARS ? 'text-[#C8102E] font-bold' : 'text-[#9A948E]'}`}>
-                {draft.length.toLocaleString()} / {SECTION_MAX_CHARS.toLocaleString()} characters
+                {draftWords}{target ? ` / ~${target}` : ''} words · {draft.length.toLocaleString()} / {SECTION_MAX_CHARS.toLocaleString()} characters
                 {draft.length > SECTION_MAX_CHARS && ' · shorten this section to save'}
               </div>
               {saveError && (
@@ -368,6 +392,17 @@ export default function CoachWorkspace() {
   const [pairs, setPairs]             = useState([])
   const [inboxDirty, setInboxDirty]   = useState(0)
   const [recentEdits, setRecentEdits] = useState({})
+  // The instructor's brief and target length per section, by key.
+  const [guides, setGuides]           = useState({})
+  // Final review: { started_at, required, ready_user_ids, all_ready } from the server.
+  const [review, setReview]           = useState(null)
+  const [reviewOpen, setReviewOpen]   = useState(false)
+  const [reviewNotice, setRevNotice]  = useState('')
+  const [readyBusy, setReadyBusy]     = useState(false)
+  const [reviewError, setReviewError] = useState('')
+  const [focusReq, setFocusReq]       = useState(null)   // { key, n } from the review's Edit
+  const [timeLimit, setTimeLimit]     = useState(null)
+  const autoReviewRef = useRef(false)
 
   const wsRef        = useRef(null)
   const reconnectRef = useRef(null)
@@ -551,6 +586,8 @@ export default function CoachWorkspace() {
     switch (data.type) {
       case 'session_init':
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
+        if (data.review) setReview(data.review)
+        setTimeLimit(data.time_limit_minutes ?? null)
         if (data.condition) setCondition(data.condition)
         if (data.group_session_id) setGsId(data.group_session_id)
         if (typeof data.remaining_seconds === 'number') {
@@ -576,6 +613,20 @@ export default function CoachWorkspace() {
       case 'artifact':
         setArtifact(data.data)
         break
+      case 'section_guides':
+        setGuides(data.data || {})
+        break
+      case 'review_state': {
+        const { type: _t, started_by_name, reset_by_name, reset_section, ...state } = data
+        setReview(state)
+        if (started_by_name && started_by_name !== myName) {
+          setRevNotice(`${started_by_name} wants to finish. Read the whole document, fix anything flagged, then mark yourself ready.`)
+          setReviewOpen(true)
+        } else if (reset_by_name) {
+          setRevNotice(`${reset_by_name === myName ? 'You' : reset_by_name} changed the document, so everyone's "ready" was cleared. Check the change and mark ready again.`)
+        }
+        break
+      }
       case 'artifact_updated': {
         // A teammate's live edit. Updates the text; deliberately emits nothing.
         setArtifact(prev => prev && ({
@@ -714,6 +765,7 @@ export default function CoachWorkspace() {
         flushAllDwell('session_end')
         endedRef.current = true
         setEnded(true)
+        setReviewOpen(false)
         // The same figures the student who ended it sees. A bare frame (a
         // refused late turn) keeps what is already shown.
         if (data.summary) setSummary(data.summary)
@@ -745,7 +797,7 @@ export default function CoachWorkspace() {
         break
       default: break
     }
-  }, [markRecentEdit, settleSave, flushAllDwell, user?.id])
+  }, [markRecentEdit, settleSave, flushAllDwell, user?.id, myName])
 
   const connect = useCallback(() => {
     if (!token || !groupId) return
@@ -822,8 +874,49 @@ export default function CoachWorkspace() {
     teamFiles.clear()
   }, [teamInput, teamFiles, myName])
 
+  const startReview = useCallback(async () => {
+    setReviewError('')
+    try {
+      const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/review`,
+        { method: 'POST', headers: authHeaders() })
+      if (!r.ok) { setEndError(await readApiError(r, 'Could not start the final review')); return }
+      setReview(await r.json())
+      setRevNotice('')
+      setReviewOpen(true)
+    } catch {
+      setEndError('Could not reach the server. Try again.')
+    }
+  }, [groupId, sessionNum])
+
+  const setReady = useCallback(async (ready) => {
+    setReadyBusy(true)
+    setReviewError('')
+    try {
+      const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/ready`, {
+        method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ready }),
+      })
+      if (!r.ok) { setReviewError(await readApiError(r, 'Could not save that')); return }
+      const d = await r.json()
+      if (d.ended) {
+        flushAllDwell('session_end')
+        if (d.summary) setSummary(d.summary)
+        setEndInfo({ reason: d.summary?.end_reason || 'team_ready' })
+        endedRef.current = true
+        setEnded(true)
+        setReviewOpen(false)
+      } else {
+        setReview(d)
+      }
+    } catch {
+      setReviewError('Could not reach the server. Try again.')
+    } finally {
+      setReadyBusy(false)
+    }
+  }, [groupId, sessionNum, flushAllDwell])
+
   const endSession = useCallback(async () => {
-    if (!window.confirm('End this session for the whole team? Everyone will be disconnected.')) return
+    if (!window.confirm('Submit the document now and end the session for the whole team? Everyone will be disconnected.')) return
     setEnding(true)
     setEndError('')
     try {
@@ -839,6 +932,7 @@ export default function CoachWorkspace() {
       if (s?.end_reason) setEndInfo(prev => prev || { reason: s.end_reason, byName: myName })
       endedRef.current = true
       setEnded(true)
+      setReviewOpen(false)
     } catch (e) {
       console.error('could not end session', e)
       setEndError('Could not reach the server, so the session is still open. Try again.')
@@ -846,6 +940,33 @@ export default function CoachWorkspace() {
       setEnding(false)
     }
   }, [groupId, sessionNum, flushAllDwell, myName])
+
+  // The review shows every section's full text at once, so opening it is a
+  // read of each one that has text, marked as such (see artifacts.READ_VIAS).
+  useEffect(() => {
+    if (!reviewOpen) return
+    for (const s of artifact?.sections || []) {
+      if ((s.content || '').trim()) emit({ type: 'artifact_expand', section_key: s.key, via: 'review' })
+    }
+  }, [reviewOpen]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Five minutes before a timed session ends, start the review for everyone,
+  // so the team finishes the document instead of being cut off mid-edit.
+  useEffect(() => {
+    if (sessionEnded || autoReviewRef.current || remainingMs == null || !timeLimit || timeLimit < 10) return
+    if (remainingMs > 0 && remainingMs <= 5 * 60000) {
+      autoReviewRef.current = true
+      if (!review?.started_at) {
+        startReview().then(() => setRevNotice('Five minutes left. Finish the document and mark yourself ready.'))
+      }
+    }
+  }, [remainingMs, timeLimit, sessionEnded, review, startReview])
+
+  const editFromReview = useCallback((key) => {
+    setReviewOpen(false)
+    if (!artifactOpen) togglePanel()
+    setFocusReq({ key, n: Date.now() })
+  }, [artifactOpen, togglePanel])
 
   // Countdown tick. Display only: the server ends the session at the deadline
   // (and refuses anything after it) whether or not this tab is open.
@@ -982,19 +1103,26 @@ export default function CoachWorkspace() {
         {!sessionEnded && endError && (
           <span role="alert" className="text-[12px] text-[#C8102E] max-w-[260px]">{endError}</span>
         )}
-        {!sessionEnded && (
-          <button onClick={endSession} disabled={ending}
-                  className="px-3 py-1.5 text-[12px] font-bold text-[#C8102E] bg-[#FDFCFB] border border-[#E7E0D8] rounded-[8px] hover:bg-[#FDE8EC] disabled:opacity-50 cursor-pointer"
-                  style={{ borderWidth: '1.5px' }}>
-            {ending ? 'Ending…' : 'End session'}
+        {!sessionEnded && (review?.started_at ? (
+          <button onClick={() => { setRevNotice(''); setReviewOpen(true) }}
+                  className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#0D9488] rounded-[8px] border-0 cursor-pointer">
+            Final review · {review.ready_user_ids?.length || 0}/{review.required?.length || 0} ready
           </button>
-        )}
+        ) : (
+          <button onClick={startReview} disabled={ending || connStatus !== 'connected'}
+                  className="px-3 py-1.5 text-[12px] font-bold text-[#C8102E] bg-[#FDFCFB] border border-[#E7E0D8] rounded-[8px] hover:bg-[#FDE8EC] disabled:opacity-50 cursor-pointer"
+                  style={{ borderWidth: '1.5px' }}
+                  title="Review the whole document with your team, then submit it">
+            Finish &amp; review
+          </button>
+        ))}
       </div>
 
       {sessionEnded && (
         <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex flex-wrap items-center gap-x-4 gap-y-2 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <span className="text-[13px] font-bold text-[#0D9488]">
             {endInfo?.reason === 'timer_expired' ? 'Time is up — session ended.'
+              : endInfo?.reason === 'team_ready' ? 'Everyone marked the document ready — submitted.'
               : endInfo?.byName ? `Session ended by ${endInfo.byName}.`
               : 'Session ended.'}
           </span>
@@ -1014,6 +1142,25 @@ export default function CoachWorkspace() {
             Back to challenges
           </button>
         </div>
+      )}
+
+      {reviewOpen && !sessionEnded && artifact && (
+        <FinalReview
+          sections={artifact.sections || []}
+          guides={guides}
+          review={review}
+          myId={user?.id}
+          nameFor={nameFor}
+          teamNames={roster.map(m => m.name)}
+          notice={reviewNotice}
+          onClose={() => setReviewOpen(false)}
+          onEdit={editFromReview}
+          onReady={setReady}
+          readyBusy={readyBusy}
+          onSubmitNow={endSession}
+          ending={ending}
+          error={reviewError || endError}
+        />
       )}
 
       {connStatus === 'error' && (
@@ -1167,8 +1314,15 @@ export default function CoachWorkspace() {
                 </button>
                 <div>
                   <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Shared Artifact</div>
-                  <div className="text-[11px] text-[#9A948E] mt-0.5">Everyone on your team writes here</div>
+                  <div className="text-[11px] text-[#9A948E] mt-0.5">Your team's final answer — this is what your instructor receives</div>
                 </div>
+                {/* On a phone this pane covers the header, so finishing lives here too. */}
+                {narrow && !sessionEnded && (
+                  <button onClick={() => (review?.started_at ? (setRevNotice(''), setReviewOpen(true)) : startReview())}
+                          className="ml-auto px-2.5 py-1.5 text-[11px] font-bold text-white bg-[#0D9488] rounded-[8px] border-0 cursor-pointer flex-shrink-0">
+                    {review?.started_at ? `Review · ${review.ready_user_ids?.length || 0}/${review.required?.length || 0}` : 'Finish & review'}
+                  </button>
+                )}
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3 min-h-0">
@@ -1265,6 +1419,9 @@ export default function CoachWorkspace() {
                     coachReplies={coachReplies}
                     insertRequest={insertReq?.key === s.key ? insertReq : null}
                     onInsertSeen={(n) => setInsertReq(r => (r && r.n === n ? null : r))}
+                    guide={guides[s.key]}
+                    focusRequest={focusReq?.key === s.key ? focusReq : null}
+                    onFocusSeen={(n) => setFocusReq(r => (r && r.n === n ? null : r))}
                   />
                 ))}
               </div>
