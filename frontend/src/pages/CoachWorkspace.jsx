@@ -86,7 +86,11 @@ export function originFor(draft, copied, pasted) {
 
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen, guide, focusRequest, onFocusSeen }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen, guide, focusRequest, onFocusSeen, variant }) {
+  const page = variant === 'page'
+  // Page view: Write / Preview, so a student sees the formatted result before
+  // it goes into the document everyone reads.
+  const [preview, setPreview] = useState(false)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(section.content || '')
@@ -203,6 +207,127 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   const words = wordCount(section.content || '')
   const draftWords = wordCount(draft)
 
+  const conflictBox = conflict && (
+    <div className="mt-3 p-3 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]" style={{ borderWidth: '1.5px' }}>
+      <div className="text-[12px] font-bold text-[#C8102E] mb-1">A teammate saved first</div>
+      <div className="text-[12px] text-[#4A4440] mb-2">
+        Their version (v{conflict.version}) is below. Your draft was not lost — it is in the editor; fold in their changes and save again.
+      </div>
+      <div className="mb-2 p-2 rounded-[8px] bg-white border border-[#F5C2CC] text-[12px] text-[#16120E] whitespace-pre-wrap">
+        {section.content}
+      </div>
+      <button onClick={() => onDismissConflict(section.key)}
+              className="text-[11px] font-bold text-[#C8102E] underline cursor-pointer">Got it</button>
+    </div>
+  )
+
+  const editor = (
+    <div className="mt-3">
+      <textarea
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onPaste={e => {
+          // Only the student's OWN coach replies are matched: this
+          // page never holds a teammate's private coaching.
+          const text = e.clipboardData?.getData('text') || ''
+          if (isCoachText(text, coachReplies)) pastedChunks.current.push(text)
+        }}
+        rows={page ? 14 : 8}
+        className={`w-full p-3 text-[#16120E] bg-white border border-[#E7E0D8] rounded-[10px] resize-y leading-relaxed focus:outline-none focus:border-[#C8102E] ${page ? 'text-[14px]' : 'text-[13px] font-mono'}`}
+        style={{ borderWidth: '1.5px' }}
+        placeholder={guide?.prompt ? `${guide.prompt}\n\nWrite it as the team's finished answer. Discuss in team chat.` : "Write the team's finished answer for this section. Discuss in team chat."}
+      />
+      <div className={`mt-1 text-right text-[11px] ${draft.length > SECTION_MAX_CHARS ? 'text-[#C8102E] font-bold' : 'text-[#9A948E]'}`}>
+        {draftWords}{target ? ` / ~${target}` : ''} words · {draft.length.toLocaleString()} / {SECTION_MAX_CHARS.toLocaleString()} characters
+        {draft.length > SECTION_MAX_CHARS && ' · shorten this section to save'}
+      </div>
+      {saveError && (
+        <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>
+      )}
+      <div className="flex gap-2 mt-2">
+        <button onClick={save} disabled={saving || draft.length > SECTION_MAX_CHARS}
+                className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button onClick={() => { setEditing(false); setSaving(false); setSaveError(null); setDraft(section.content || ''); copiedChunks.current = []; pastedChunks.current = [] }}
+                className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+
+  const view = (
+    <div className="mt-3">
+      {empty
+        ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
+        : <div className={`prose-chat text-[#16120E] ${page ? 'text-[15px] leading-relaxed' : 'text-[13px]'}`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(section.content)}</ReactMarkdown></div>}
+      {/* A finished session is read-only; the server refuses writes too. */}
+      {!readOnly && (
+        <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
+                className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
+                style={{ borderWidth: '1.5px' }}>
+          {empty ? 'Write this section' : 'Edit'}
+        </button>
+      )}
+    </div>
+  )
+
+  if (page) {
+    return (
+      <section ref={rootRef} className="scroll-mt-4">
+        <div className="flex items-baseline gap-3 flex-wrap">
+          <h2 className="text-[19px] font-bold text-[#16120E] m-0">{section.title || 'Document'}</h2>
+          <span className="text-[11px] text-[#9A948E]">
+            {empty ? (target ? `Empty · aim for ~${target} words` : 'Empty')
+              : `${words}${target ? ` / ~${target}` : ''} words · ${editorName || 'someone'} · ${timeAgo(section.updated_at)}`}
+          </span>
+          {justUpdatedBy && (
+            <span className="text-[10px] font-bold px-2 py-0.5 rounded-[6px] bg-[#FEF3E8] text-[#D97706]">{justUpdatedBy} edited</span>
+          )}
+        </div>
+        {guide?.prompt && <div className="text-[12px] text-[#9A948E] italic mt-1">{guide.prompt}</div>}
+        {conflictBox}
+        {editing ? (
+          <div className="mt-3">
+            <div className="flex gap-1 mb-2" role="tablist">
+              {[['write', 'Write'], ['preview', 'Preview']].map(([k, label]) => (
+                <button key={k} type="button" role="tab" aria-selected={(k === 'preview') === preview}
+                        onClick={() => setPreview(k === 'preview')}
+                        className={`px-3 py-1 text-[12px] font-bold rounded-[7px] cursor-pointer border ${(k === 'preview') === preview ? 'bg-[#16120E] text-white border-[#16120E]' : 'bg-white text-[#6B6560] border-[#E7E0D8]'}`}>
+                  {label}
+                </button>
+              ))}
+              <span className="ml-auto self-center text-[11px] text-[#9A948E] hidden sm:inline">**bold** · - list · 1. numbered · ## heading</span>
+            </div>
+            {preview ? (
+              <>
+                <div className="min-h-[200px] p-4 rounded-[10px] border border-[#E7E0D8] bg-[#FDFCFB]">
+                  {draft.trim()
+                    ? <div className="prose-chat text-[14px] text-[#16120E] leading-relaxed"><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(draft)}</ReactMarkdown></div>
+                    : <div className="text-[13px] italic text-[#B5AFA8]">Nothing written yet.</div>}
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={save} disabled={saving || draft.length > SECTION_MAX_CHARS}
+                          className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
+                    {saving ? 'Saving…' : 'Save'}
+                  </button>
+                  <button onClick={() => setPreview(false)}
+                          className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
+                    Keep writing
+                  </button>
+                </div>
+                {saveError && <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>}
+              </>
+            ) : editor}
+          </div>
+        ) : (
+          <div className="text-[14px] leading-relaxed">{view}</div>
+        )}
+      </section>
+    )
+  }
+
   return (
     <div ref={rootRef} className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden flex-shrink-0" style={{ borderWidth: '1.5px' }}>
       <button
@@ -235,69 +360,9 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
               <span className="font-bold text-[#6B6560]">What goes here: </span>{guide.prompt}
             </div>
           )}
-          {conflict && (
-            <div className="mt-3 p-3 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]" style={{ borderWidth: '1.5px' }}>
-              <div className="text-[12px] font-bold text-[#C8102E] mb-1">A teammate saved first</div>
-              <div className="text-[12px] text-[#4A4440] mb-2">
-                Their version (v{conflict.version}) is below. Your draft was not lost — it is in the editor; fold in their changes and save again.
-              </div>
-              <div className="mb-2 p-2 rounded-[8px] bg-white border border-[#F5C2CC] text-[12px] text-[#16120E] whitespace-pre-wrap">
-                {section.content}
-              </div>
-              <button onClick={() => onDismissConflict(section.key)}
-                      className="text-[11px] font-bold text-[#C8102E] underline cursor-pointer">Got it</button>
-            </div>
-          )}
+          {conflictBox}
 
-          {editing ? (
-            <div className="mt-3">
-              <textarea
-                value={draft}
-                onChange={e => setDraft(e.target.value)}
-                onPaste={e => {
-                  // Only the student's OWN coach replies are matched: this
-                  // page never holds a teammate's private coaching.
-                  const text = e.clipboardData?.getData('text') || ''
-                  if (isCoachText(text, coachReplies)) pastedChunks.current.push(text)
-                }}
-                rows={8}
-                className="w-full p-3 text-[13px] text-[#16120E] bg-white border border-[#E7E0D8] rounded-[10px] resize-y font-mono leading-relaxed focus:outline-none focus:border-[#C8102E]"
-                style={{ borderWidth: '1.5px' }}
-                placeholder={guide?.prompt ? `${guide.prompt}\n\nWrite it as the team's finished answer. Discuss in team chat.` : "Write the team's finished answer for this section. Discuss in team chat."}
-              />
-              <div className={`mt-1 text-right text-[11px] ${draft.length > SECTION_MAX_CHARS ? 'text-[#C8102E] font-bold' : 'text-[#9A948E]'}`}>
-                {draftWords}{target ? ` / ~${target}` : ''} words · {draft.length.toLocaleString()} / {SECTION_MAX_CHARS.toLocaleString()} characters
-                {draft.length > SECTION_MAX_CHARS && ' · shorten this section to save'}
-              </div>
-              {saveError && (
-                <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>
-              )}
-              <div className="flex gap-2 mt-2">
-                <button onClick={save} disabled={saving || draft.length > SECTION_MAX_CHARS}
-                        className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
-                  {saving ? 'Saving…' : 'Save'}
-                </button>
-                <button onClick={() => { setEditing(false); setSaving(false); setSaveError(null); setDraft(section.content || ''); copiedChunks.current = []; pastedChunks.current = [] }}
-                        className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="mt-3">
-              {empty
-                ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
-                : <div className="prose-chat text-[13px] text-[#16120E]"><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(section.content)}</ReactMarkdown></div>}
-              {/* A finished session is read-only; the server refuses writes too. */}
-              {!readOnly && (
-                <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
-                        className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
-                        style={{ borderWidth: '1.5px' }}>
-                  {empty ? 'Write this section' : 'Edit'}
-                </button>
-              )}
-            </div>
-          )}
+          {editing ? editor : view}
         </div>
       )}
     </div>
@@ -402,6 +467,16 @@ export default function CoachWorkspace() {
   const [reviewError, setReviewError] = useState('')
   const [focusReq, setFocusReq]       = useState(null)   // { key, n } from the review's Edit
   const [timeLimit, setTimeLimit]     = useState(null)
+  // Full-document view: the document takes the main area as pages, the coach
+  // shrinks to a side column (or a rail). Off by default, so opening the
+  // workspace still shows no teammate's text until someone chooses to read.
+  const [docMode, setDocMode]         = useState(false)
+  const [coachHidden, setCoachHidden] = useState(false)
+  const docReadKeys = useRef(new Set())
+  // Team chat can fold down to its header to give the document the height.
+  // `seenChat` is how many messages there were when it was folded.
+  const [chatOpen, setChatOpen]       = useState(true)
+  const [seenChat, setSeenChat]       = useState(0)
   const autoReviewRef = useRef(false)
 
   const wsRef        = useRef(null)
@@ -537,6 +612,8 @@ export default function CoachWorkspace() {
       setOpenOptions({})
       // Open drafts unmount with the panel, so a conflict about one is moot.
       setConflicts({})
+      setDocMode(false)
+      setCoachHidden(false)
     }
     setArtOpen(next)
     emit({ type: next ? 'artifact_open' : 'artifact_close' })
@@ -962,6 +1039,30 @@ export default function CoachWorkspace() {
     }
   }, [remainingMs, timeLimit, sessionEnded, review, startReview])
 
+  const openDocMode = useCallback(() => {
+    if (!artifactOpen) togglePanel()
+    docReadKeys.current = new Set()
+    setDocMode(true)
+  }, [artifactOpen, togglePanel])
+
+  const closeDocMode = useCallback(() => {
+    setDocMode(false)
+    setCoachHidden(false)
+  }, [])
+
+  // The full view puts every section's text on screen, so each one with text
+  // is a read, marked via "document" (see artifacts.READ_VIAS). A section a
+  // teammate fills in while the view is open is logged when it appears.
+  useEffect(() => {
+    if (!docMode || !artifactOpen) return
+    for (const s of artifact?.sections || []) {
+      if ((s.content || '').trim() && !docReadKeys.current.has(s.key)) {
+        docReadKeys.current.add(s.key)
+        emit({ type: 'artifact_expand', section_key: s.key, via: 'document' })
+      }
+    }
+  }, [docMode, artifactOpen, artifact, emit])
+
   const editFromReview = useCallback((key) => {
     setReviewOpen(false)
     if (!artifactOpen) togglePanel()
@@ -1056,6 +1157,7 @@ export default function CoachWorkspace() {
   }
 
   const coachReplies = messages.filter(m => m.role === 'assistant').map(m => m.content)
+  const docWide = docMode && artifactOpen && !narrow
   const pei = evalData?.scores?.PEI ?? 0
   const busy = isStreaming || isTyping || isEvaluating || sessionEnded
 
@@ -1171,11 +1273,33 @@ export default function CoachWorkspace() {
 
       <div className="flex-1 flex min-h-0">
         {/* ── Private coach ── */}
-        <div className="flex-1 flex flex-col min-w-0 border-r border-[#E7E0D8]" style={{ borderRightWidth: '1.5px' }}>
+        {docWide && coachHidden && (
+          <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-r border-[#E7E0D8] flex-shrink-0" style={{ width: 52, borderRightWidth: '1.5px' }}>
+            <button onClick={() => setCoachHidden(false)} title="Show your coach" aria-label="Show your coach"
+                    className="w-8 h-8 rounded-[8px] bg-[#F7F3EE] hover:bg-[#EDEAE4] border border-[#E7E0D8] flex items-center justify-center cursor-pointer"
+                    style={{ borderWidth: '1.5px' }}>
+              <svg className="w-4 h-4 stroke-[#6B6560] fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+            </button>
+            <div className="flex-1" />
+            <div className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[0.7px]"
+                 style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>
+              Your coach
+            </div>
+          </div>
+        )}
+        {/* Kept mounted while hidden, so the chat and any reply in progress survive. */}
+        <div className={`${docWide ? 'flex-shrink-0' : 'flex-1'} ${docWide && coachHidden ? 'hidden' : 'flex'} flex-col min-w-0 border-r border-[#E7E0D8]`}
+             style={{ borderRightWidth: '1.5px', width: docWide ? 400 : undefined }}>
           <div className="px-5 py-2.5 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center gap-2 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
             <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Your private coach</span>
             <span className="text-[10px] text-[#9A948E]">· teammates cannot see this</span>
             {turnCount > 0 && <span className="text-[11px] text-[#9A948E] ml-auto">Turn {turnCount}</span>}
+            {docWide && (
+              <button onClick={() => setCoachHidden(true)} title="Hide your coach to give the document more room"
+                      className={`${turnCount > 0 ? '' : 'ml-auto'} text-[11px] font-bold text-[#6B6560] underline cursor-pointer bg-transparent border-0`}>
+                Hide
+              </button>
+            )}
           </div>
 
           {challengeContext && (challengeContext.goal || challengeContext.brief || challengeContext.seed_question) && (() => {
@@ -1288,8 +1412,8 @@ export default function CoachWorkspace() {
         {/* On a phone the open pane covers the screen instead of squeezing the
             coach column to nothing; the same toggle opens and closes it, so the
             open/close events are exactly those of the desktop panel. */}
-        <div className={`flex flex-col flex-shrink-0 bg-[#F7F3EE] ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
-             style={{ width: narrow && artifactOpen ? '100%' : artifactOpen ? 460 : 52 }}>
+        <div className={`flex flex-col bg-[#F7F3EE] ${docWide ? 'flex-1 min-w-0' : 'flex-shrink-0'} ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
+             style={{ width: narrow && artifactOpen ? '100%' : docWide ? undefined : artifactOpen ? 460 : 52 }}>
           {!artifactOpen ? (
             <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-l border-[#E7E0D8]" style={{ borderLeftWidth: '1.5px' }}>
               <button onClick={togglePanel} title="Open shared artifact" aria-label="Open shared artifact"
@@ -1312,10 +1436,15 @@ export default function CoachWorkspace() {
                         style={{ borderWidth: '1.5px' }}>
                   <svg className="w-3.5 h-3.5 stroke-[#6B6560] fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
                 </button>
-                <div>
-                  <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Shared Artifact</div>
-                  <div className="text-[11px] text-[#9A948E] mt-0.5">Your team's final answer — this is what your instructor receives</div>
+                <div className="min-w-0">
+                  <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">{docMode ? 'Team document' : 'Shared Artifact'}</div>
+                  {!narrow && <div className="text-[11px] text-[#9A948E] mt-0.5">Your team's final answer — this is what your instructor receives</div>}
                 </div>
+                <button onClick={docMode ? closeDocMode : openDocMode}
+                        title={docMode ? 'Back to the side panel' : 'Open the whole document as pages'}
+                        className={`${narrow ? '' : 'ml-auto'} px-2.5 py-1.5 text-[11px] font-bold rounded-[8px] cursor-pointer flex-shrink-0 border ${docMode ? 'text-[#4A4440] bg-[#F7F3EE] border-[#E7E0D8]' : 'text-white bg-[#16120E] border-[#16120E]'}`}>
+                  {docMode ? 'Exit full view' : '⤢ Full document'}
+                </button>
                 {/* On a phone this pane covers the header, so finishing lives here too. */}
                 {narrow && !sessionEnded && (
                   <button onClick={() => (review?.started_at ? (setRevNotice(''), setReviewOpen(true)) : startReview())}
@@ -1402,7 +1531,65 @@ export default function CoachWorkspace() {
                 ))}
 
                 {!artifact && <div className="text-[13px] text-[#9A948E]">Loading…</div>}
-                {artifact?.sections?.map(s => (
+                {docMode && artifact && (() => {
+                  const secs = artifact.sections || []
+                  const total = secs.reduce((n, s) => n + wordCount(s.content || ''), 0)
+                  const done = secs.filter(s => (s.content || '').trim()).length
+                  return (
+                    <div className="w-full max-w-[800px] mx-auto flex-shrink-0">
+                      <div className="flex flex-wrap items-center gap-1.5 mb-3">
+                        {secs.map(s => {
+                          const filled = !!(s.content || '').trim()
+                          return (
+                            <button key={s.key} type="button"
+                                    onClick={() => document.getElementById(`doc-sec-${s.key}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-white border border-[#E7E0D8] text-[#4A4440] cursor-pointer hover:bg-[#F7F3EE]">
+                              <span className="w-1.5 h-1.5 rounded-full" style={{ background: filled ? '#0D9488' : '#D6CFC7' }} />
+                              {s.title || 'Document'}
+                            </button>
+                          )
+                        })}
+                        <span className="ml-auto text-[11px] text-[#9A948E]">{done}/{secs.length} sections written · {total} words</span>
+                      </div>
+                      <div className="bg-white rounded-[14px] border border-[#E7E0D8] px-6 sm:px-10 py-8 flex flex-col gap-9"
+                           style={{ borderWidth: '1.5px', boxShadow: '0 1px 3px rgba(22,18,14,0.05)' }}>
+                        <header className="border-b border-[#EFE8DF] pb-5">
+                          <div className="text-[11px] font-bold text-[#C8102E] uppercase tracking-[0.8px]">Team document</div>
+                          <h1 className="text-[24px] font-bold text-[#16120E] leading-tight mt-1 mb-0">{challengeTitle || challengeContext?.title || 'Collaborative session'}</h1>
+                          <div className="text-[13px] text-[#6B6560] mt-1">
+                            Session {sessionNum}{challengeContext?.title && challengeContext.title !== challengeTitle ? `: ${challengeContext.title}` : ''}
+                            {roster.length > 0 && <> · {roster.map(m => m.name).join(', ')}</>}
+                          </div>
+                        </header>
+                        {secs.map(s => (
+                          <div key={s.key} id={`doc-sec-${s.key}`} className="scroll-mt-4">
+                            <Section
+                              variant="page"
+                              section={s}
+                              isMine={s.updated_by_user_id === user?.id}
+                              editorName={nameFor(s.updated_by_user_id)}
+                              onExpand={onExpand}
+                              onCollapse={onCollapse}
+                              onSave={saveSection}
+                              conflict={conflicts[s.key]}
+                              onDismissConflict={(k) => setConflicts(p => { const n = { ...p }; delete n[k]; return n })}
+                              justUpdatedBy={recentEdits[s.key]}
+                              saveResult={saveResults[s.key]}
+                              readOnly={sessionEnded}
+                              coachReplies={coachReplies}
+                              insertRequest={insertReq?.key === s.key ? insertReq : null}
+                              onInsertSeen={(n) => setInsertReq(r => (r && r.n === n ? null : r))}
+                              guide={guides[s.key]}
+                              focusRequest={focusReq?.key === s.key ? focusReq : null}
+                              onFocusSeen={(n) => setFocusReq(r => (r && r.n === n ? null : r))}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
+                {!docMode && artifact?.sections?.map(s => (
                   <Section
                     key={s.key}
                     section={s}
@@ -1433,9 +1620,12 @@ export default function CoachWorkspace() {
                   condition), so the header says so rather than implying privacy
                   when it is logged. Messages are persisted in
                   group_chat_messages either way. */}
-              <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: 240 }}>
+              <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: chatOpen ? 240 : 'auto' }}>
                 <div className="px-4 py-2 flex items-center gap-2 flex-shrink-0">
                   <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Team chat</span>
+                  {!chatOpen && teamChat.length > seenChat && (
+                    <span className="text-[10px] font-bold text-white bg-[#7C3AED] rounded-full px-1.5">{teamChat.length - seenChat} new</span>
+                  )}
                   <span className="text-[10px] text-[#9A948E]">
                     · not seen by any coach{condition?.team_chat_logging === 'content'
                       ? ' · recorded for research'
@@ -1443,7 +1633,13 @@ export default function CoachWorkspace() {
                         ? ' · timing logged for research, not text'
                         : ''}
                   </span>
+                  <button type="button" onClick={() => { if (chatOpen) setSeenChat(teamChat.length); setChatOpen(!chatOpen) }}
+                          aria-expanded={chatOpen}
+                          className="ml-auto text-[11px] font-bold text-[#6B6560] underline cursor-pointer bg-transparent border-0 flex-shrink-0">
+                    {chatOpen ? 'Hide' : 'Show'}
+                  </button>
                 </div>
+                {chatOpen && (<>
                 <div className="flex-1 overflow-y-auto px-4 pb-2 flex flex-col gap-2">
                   {teamChat.length === 0 && (
                     <div className="text-[12px] text-[#9A948E] italic">Talk to your teammates here.</div>
@@ -1486,6 +1682,7 @@ export default function CoachWorkspace() {
                     Send
                   </button>
                 </div>
+                </>)}
               </div>
             </div>
           )}

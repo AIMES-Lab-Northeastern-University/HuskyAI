@@ -125,10 +125,15 @@ as a raw count in `totals`.
 `dwell` alone — `section_expand` carries the read signal — so an expired
 heartbeat degrades precision, not validity.
 
-**Final-review reads carry `payload.via = "review"`.** The end-of-session review
-shows every section's full text at once, so opening it logs a `section_expand`
-for each non-empty section, marked with `via: "review"`. These are currently
-counted like any other read. They cluster at the end of a session, so whether
+**Whole-document reads carry `payload.via`.** Two views show every section's
+full text at once: the end-of-session final review (`via: "review"`) and the
+full-document view a student can switch to while writing (`via: "document"`).
+Opening either logs a `section_expand` for each non-empty section, marked with
+its `via`; in the full-document view a section a teammate fills in while it is
+open is logged when it appears. No `dwell` is recorded in these views.
+
+These are currently counted like any other read. Review reads cluster at the end of a session and
+document-view reads say less about attention than a deliberate click, so whether
 they should feed `read_before_write` and `median_write_to_read_ms` is a PI
 decision; excluding them is a filter on `payload.via`, and doing so is a
 definition change (version bump).

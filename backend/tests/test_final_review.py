@@ -134,3 +134,24 @@ def test_an_instructor_saves_each_sections_brief_and_target(team):
     bad = {"sections": [{"key": "a", "title": "A", "target_words": 3}]}
     assert client.patch(f"/challenges/{ch}", json=bad, headers=_h(inst)).status_code == 422
 
+
+def test_the_full_document_view_is_logged_as_a_read_and_other_vias_are_dropped(team):
+    client, room, ch, team_id, inst, students = team
+    with client.websocket_connect(f"/ws/coach?token={_token(students[1])}&group_id={team_id}&session_num=1") as ws:
+        _until(ws, {"artifact"})
+        for i, via in enumerate(("document", "made-up")):
+            ws.send_text(json.dumps({"type": "artifact_expand", "section_key": "answer",
+                                     "via": via, "event_id": f"dv-{i}"}))
+            _until(ws, {"read_ack"})
+
+    async def payloads():
+        from database import AsyncSessionLocal, StudyEvent
+        from sqlalchemy import select
+        async with AsyncSessionLocal() as db:
+            return [e.payload for e in (await db.execute(
+                select(StudyEvent).where(StudyEvent.actor_user_id == students[1],
+                                         StudyEvent.action == "section_expand"))).scalars().all()]
+    got = asyncio.run(payloads())
+    assert {"section_key": "answer", "via": "document"} in got
+    # An unknown via is recorded as a plain read, never stored as given.
+    assert {"section_key": "answer"} in got

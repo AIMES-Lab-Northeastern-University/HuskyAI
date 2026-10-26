@@ -64,8 +64,10 @@ ORIGIN_TRACKING = {"copy+paste"}
 
 MAX_SECTION_KEY_LEN = 64
 
-# How a section came to be on someone's screen, when it was not their own click.
-READ_VIAS = {"review"}
+# How a section came to be on someone's screen, when it was not their own click:
+# the final review, or the full-document view, each of which shows every
+# section's text at once.
+READ_VIAS = {"review", "document"}
 
 # Longest a section may be. Every save stores the whole section as a revision
 # and, outside the isolated arm, the document rides along with every coach
@@ -595,9 +597,10 @@ async def log_section_expand(
     """A person expanded one section — the finest-grained read, and the one that
     makes "did they look at Sam's step 2?" answerable.
 
-    `via="review"`: the section was in front of them on the team's final review,
-    which shows the whole document at once. Still a read, since the text was on
-    their screen, but marked so analysis can tell it from a deliberate click."""
+    `via` ("review" or "document"): the section was in front of them on the
+    team's final review or in the full-document view, both of which show the
+    whole document at once. Still a read, since the text was on their screen,
+    but marked so analysis can tell it from a deliberate click."""
     payload = {"section_key": section_key}
     if via in READ_VIAS:
         payload["via"] = via
