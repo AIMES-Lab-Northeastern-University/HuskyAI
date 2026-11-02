@@ -152,3 +152,18 @@ def test_docx_text_extracts_a_file_the_caller_sends_and_needs_sign_in(app_ready)
                       headers={"Authorization": f"Bearer {_token(t['users'][0])}"})
     assert bad.status_code == 422
     assert client.post("/files/docx-text", json={"data": data}).status_code == 401
+
+
+def test_docx_text_refuses_a_file_that_expands_past_the_limit(app_ready):
+    import io
+    import zipfile
+    t = asyncio.run(_team())
+    client = TestClient(app_ready)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        # ~60 MB of zeros compresses to well under the upload cap.
+        z.writestr("word/document.xml", b"\0" * (60 * 1024 * 1024))
+    assert len(buf.getvalue()) < 1024 * 1024
+    r = client.post("/files/docx-text", json={"data": base64.b64encode(buf.getvalue()).decode()},
+                    headers={"Authorization": f"Bearer {_token(t['users'][0])}"})
+    assert r.status_code == 422

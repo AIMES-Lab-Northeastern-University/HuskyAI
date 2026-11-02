@@ -28,7 +28,7 @@ import difflib
 import logging
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import (
@@ -38,6 +38,7 @@ from database import (
     AsyncSessionLocal,
     GroupChallenge,
     GroupSession,
+    ReviewReadyMark,
     User,
 )
 from events import EventResult, add_event_in, record_event
@@ -368,6 +369,22 @@ async def _write_once(
     alternation and read-before-write are all computed from the log, so that
     write silently did not happen as far as the analysis was concerned."""
     async with AsyncSessionLocal() as db:
+        # Claim the session row for this transaction. The end path's conditional
+        # UPDATE takes the same row, so a write and the end cannot interleave:
+        # either the write commits first and the submitted snapshot includes it,
+        # or the session is already completed and the write is refused. The
+        # caller's own ended check runs before this and cannot close that gap.
+        open_session = await db.execute(
+            update(GroupSession)
+            .where(GroupSession.id == group_session_id, GroupSession.status != "completed")
+            .values(status=GroupSession.status)
+            .returning(GroupSession.review_started_at)
+        )
+        claimed = open_session.first()
+        if claimed is None:
+            return {"ok": False, "error": "session_ended",
+                    "message": "This session has ended, so the document can no longer be changed."}
+
         section = (
             await db.execute(
                 select(ArtifactSection).where(
@@ -441,6 +458,15 @@ async def _write_once(
             artifact.updated_at = now
             artifact.updated_by_user_id = author_user_id
 
+        # A write during final review changes what everyone approved, so the
+        # ready marks go in the same transaction: no teammate can complete the
+        # review on the old text while this write is in flight.
+        marks_cleared = 0
+        if claimed.review_started_at is not None:
+            marks_cleared = (await db.execute(
+                delete(ReviewReadyMark).where(ReviewReadyMark.group_session_id == group_session_id)
+            )).rowcount or 0
+
         try:
             scope = await _scope(db, group_session_id)
             await add_event_in(
@@ -485,6 +511,7 @@ async def _write_once(
         # Returned so the caller can route this contribution for review (Phase 5)
         # without re-querying for the revision it just created.
         "revision_id": revision_id,
+        "ready_marks_cleared": marks_cleared,
     }
 
 

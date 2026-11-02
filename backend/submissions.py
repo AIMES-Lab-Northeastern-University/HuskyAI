@@ -101,7 +101,7 @@ async def coach_session_summary(db, gs, private_conversations: list) -> tuple[di
     # Equal-weight mean of the per-student averages (not of raw turns), plus the
     # spread. A student with no scored turn has no average and is simply not
     # counted — they do not drag the team mean toward zero.
-    team_mean = round(sum(student_means) / len(student_means), 2) if student_means else None
+    team_mean = sum(student_means) / len(student_means) if student_means else None
     pei_range = (
         {"min": round(min(student_means), 1), "max": round(max(student_means), 1)}
         if student_means else None
@@ -179,9 +179,24 @@ async def record_submission(db, gs: GroupSession) -> TeamSubmission | None:
         await db.commit()
     except IntegrityError:
         # A teammate's end path recorded it between our check and our insert.
+        # The rollback expired gs, which the caller may still read.
         await db.rollback()
+        await db.refresh(gs)
         return await _find(db, gs.id)
     return sub
+
+
+async def refresh_ai_score(db, gs: GroupSession) -> None:
+    """Recompute a submission's AI score after a turn in its session is scored
+    late (the evaluator failed on time and a retry landed after the end). The
+    end summary and the Progress page recompute live, so without this the
+    submission would be the one place still missing that turn. The document and
+    the instructor's score are untouched. Commits on `db`."""
+    sub = await _find(db, gs.id)
+    if sub is None:
+        return
+    sub.ai_score, sub.ai_score_range, sub.per_student = await team_score(db, gs)
+    await db.commit()
 
 
 def final_score(sub: TeamSubmission) -> float | None:

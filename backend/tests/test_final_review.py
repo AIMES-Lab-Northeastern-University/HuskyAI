@@ -155,3 +155,165 @@ def test_the_full_document_view_is_logged_as_a_read_and_other_vias_are_dropped(t
     assert {"section_key": "answer", "via": "document"} in got
     # An unknown via is recorded as a plain read, never stored as given.
     assert {"section_key": "answer"} in got
+
+
+# --- Ending, submitting and editing must not race ----------------------------
+
+async def _group_session(team_id):
+    from database import AsyncSessionLocal, GroupSession
+    from sqlalchemy import select
+    async with AsyncSessionLocal() as db:
+        return (await db.execute(select(GroupSession).where(GroupSession.group_id == team_id))).scalar_one()
+
+
+async def _ready_marks(gs_id):
+    from database import AsyncSessionLocal, ReviewReadyMark
+    from sqlalchemy import select
+    async with AsyncSessionLocal() as db:
+        return set((await db.execute(select(ReviewReadyMark.user_id).where(
+            ReviewReadyMark.group_session_id == gs_id))).scalars().all())
+
+
+def test_marking_ready_twice_is_harmless(team):
+    client, room, ch, team_id, inst, students = team
+    _ready(client, team_id, students[0])
+    # A double click, a second tab or a retried request: same answer, not a 500.
+    assert _ready(client, team_id, students[0])["ready_user_ids"] == [students[0]]
+
+
+def test_a_failed_hand_in_still_ends_the_session_and_tells_the_team(team, monkeypatch):
+    client, room, ch, team_id, inst, students = team
+    import main
+
+    async def boom(db, gs):
+        raise RuntimeError("snapshot failed")
+
+    told = []
+    real_notify = main._notify_session_ended
+
+    async def spy(*a, **kw):
+        told.append(a)
+        return await real_notify(*a, **kw)
+
+    monkeypatch.setattr(main, "record_submission", boom)
+    monkeypatch.setattr(main, "_notify_session_ended", spy)
+    r = client.post(f"/groups/{team_id}/sessions/1/end", headers=_h(students[0]))
+    assert r.status_code == 200, r.text
+    assert len(told) == 1
+    assert asyncio.run(_group_session(team_id)).status == "completed"
+
+
+def test_a_submission_recorded_by_a_teammate_mid_insert_is_returned(team, monkeypatch):
+    client, room, ch, team_id, inst, students = team
+    assert client.post(f"/groups/{team_id}/sessions/1/end", headers=_h(students[0])).status_code == 200
+    import submissions
+    from database import AsyncSessionLocal
+
+    real_find = submissions._find
+    calls = []
+
+    async def first_miss(db, gs_id):
+        calls.append(gs_id)
+        return None if len(calls) == 1 else await real_find(db, gs_id)
+
+    monkeypatch.setattr(submissions, "_find", first_miss)
+
+    from database import GroupSession
+    gs_id = asyncio.run(_group_session(team_id)).id
+
+    async def go():
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, gs_id)
+            sub = await submissions.record_submission(db, gs)
+            # The insert lost to the existing row; both the submission and the
+            # session (expired by the rollback) must still be readable.
+            return sub.group_session_id, gs.status
+    assert asyncio.run(go()) == (gs_id, "completed")
+
+
+def test_a_write_cannot_land_after_the_session_ends(team):
+    client, room, ch, team_id, inst, students = team
+    assert client.post(f"/groups/{team_id}/sessions/1/end", headers=_h(students[0])).status_code == 200
+    import artifacts
+    gs = asyncio.run(_group_session(team_id))
+    # Straight to the write, past the socket's own ended check: the write
+    # itself must refuse, or text can land after the snapshot was taken.
+    res = asyncio.run(artifacts.write_section(
+        group_session_id=gs.id, section_key="answer", content="too late",
+        author_user_id=students[0], expected_version=0))
+    assert res == {"ok": False, "error": "session_ended",
+                   "message": "This session has ended, so the document can no longer be changed."}
+    sub = client.get(f"/groups/{team_id}/sessions/1/submission", headers=_h(students[0])).json()
+    assert "too late" not in json.dumps(sub)
+
+
+def test_a_write_withdraws_ready_marks_in_its_own_transaction(team):
+    client, room, ch, team_id, inst, students = team
+    _ready(client, team_id, students[0])
+    import artifacts
+    gs = asyncio.run(_group_session(team_id))
+    res = asyncio.run(artifacts.write_section(
+        group_session_id=gs.id, section_key="answer", content="changed under review",
+        author_user_id=students[1], expected_version=0))
+    assert res["ok"] and res["ready_marks_cleared"] == 1
+    # Already gone when the write returns, before any announcement: a teammate
+    # marking ready now cannot complete the review on the old text.
+    assert asyncio.run(_ready_marks(gs.id)) == set()
+    assert not _ready(client, team_id, students[1]).get("ended")
+
+
+def test_a_write_outside_review_clears_nothing(team):
+    client, room, ch, team_id, inst, students = team
+    import artifacts
+    gs = asyncio.run(_group_session(team_id))
+    res = asyncio.run(artifacts.write_section(
+        group_session_id=gs.id, section_key="answer", content="draft",
+        author_user_id=students[0], expected_version=0))
+    assert res["ok"] and res["ready_marks_cleared"] == 0
+
+
+def test_a_turn_scored_after_the_end_updates_the_submitted_ai_score(team):
+    client, room, ch, team_id, inst, students = team
+    assert client.post(f"/groups/{team_id}/sessions/1/end", headers=_h(students[0])).status_code == 200
+    before = client.get(f"/groups/{team_id}/sessions/1/submission", headers=_h(students[0])).json()
+    assert before["ai_score"] == 60.0
+
+    import main
+    from database import AsyncSessionLocal, Conversation, EvalResult
+    from sqlalchemy import select
+
+    async def pending_turn():
+        async with AsyncSessionLocal() as db:
+            conv = (await db.execute(select(Conversation).where(
+                Conversation.user_id == students[0], Conversation.kind == "coach_private"))).scalar_one()
+            ev = EvalResult(conversation_id=conv.id, turn_number=2, score_status="pending")
+            db.add(ev)
+            await db.commit()
+            return ev.id
+    eval_id = asyncio.run(pending_turn())
+    asyncio.run(main._apply_late_score(eval_id, {"scores": {"PEI": 90.0}}))
+
+    after = client.get(f"/groups/{team_id}/sessions/1/submission", headers=_h(students[0])).json()
+    # Student 0 now averages (60 + 90) / 2 = 75, student 1 is 60: equal weight, 67.5.
+    assert after["ai_score"] == 67.5
+
+
+def test_the_team_score_is_rounded_once(team):
+    """Rounding the mean to 2 places and then to 1 gave 72.7 here, while the
+    Progress page, which rounds once, showed 72.6."""
+    client, room, ch, team_id, inst, students = team
+    from database import AsyncSessionLocal, Conversation, EvalResult
+    from sqlalchemy import select, update
+    from submissions import coach_session_summary, private_coach_conversations
+
+    async def go():
+        async with AsyncSessionLocal() as db:
+            for uid, pei in zip(students, (72.646, 72.65)):
+                conv_id = (await db.execute(select(Conversation.id).where(
+                    Conversation.user_id == uid, Conversation.kind == "coach_private"))).scalar_one()
+                await db.execute(update(EvalResult).where(EvalResult.conversation_id == conv_id).values(pei=pei))
+            await db.commit()
+            gs = await _group_session(team_id)
+            summary, _ = await coach_session_summary(db, gs, await private_coach_conversations(db, gs.id))
+            return summary["session_avg_pei"]
+    assert asyncio.run(go()) == 72.6

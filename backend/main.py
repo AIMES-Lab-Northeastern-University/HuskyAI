@@ -1,5 +1,6 @@
 import os
 import io
+import zipfile
 import re
 import json
 import base64
@@ -35,6 +36,7 @@ from submissions import (
     router as submissions_router,
     team_router as submissions_team_router,
     record_submission,
+    refresh_ai_score,
 )
 from rate_limit import close_rate_limit_clients
 from study_policy import resolve_for_group_session
@@ -338,10 +340,20 @@ def _att_field(att: dict, *keys: str) -> str:
     return ""
 
 
+# A .docx is a zip, and only its compressed size is capped on upload. A
+# crafted one can expand to gigabytes when python-docx unpacks it, so the
+# uncompressed sizes are checked first. zipfile stops reading at the declared
+# size, so an entry that lies about it fails its CRC check instead of growing.
+_MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+
+
 def _extract_docx_text(raw: bytes) -> str:
     """Pull visible text (paragraphs + tables) from .docx bytes via python-docx."""
     import docx  # imported lazily so the dep is only needed when a .docx arrives
 
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        if sum(i.file_size for i in z.infolist()) > _MAX_DOCX_UNCOMPRESSED_BYTES:
+            raise ValueError("document expands beyond the size limit")
     document = docx.Document(io.BytesIO(raw))
     parts = [p.text for p in document.paragraphs if p.text.strip()]
     for table in document.tables:
@@ -1210,6 +1222,13 @@ async def _apply_late_score(eval_id: str, result: dict) -> None:
                 if ucs and ucs.status != "completed" and (ucs.best_pei is None or pei > ucs.best_pei):
                     ucs.best_pei = float(pei)
         await db.commit()
+        if conv is not None and pei is not None and conv.kind == "coach_private":
+            gs = await db.get(GroupSession, conv.group_session_id)
+            if gs is not None and gs.status == "completed":
+                try:
+                    await refresh_ai_score(db, gs)
+                except Exception as e:
+                    log.error(f"[RESCORE] could not refresh the submission score: {e}")
     log.info(f"[RESCORE] turn {turn} of {conversation_id[:8]} scored late: PEI={pei}")
     await _deliver_late_score(conversation_id, turn, result)
 
@@ -3285,7 +3304,8 @@ async def coach_websocket_endpoint(
                     },
                     exclude=websocket,
                 )
-                await _reset_review_marks(group_session_id, my_name, key)
+                if result.get("ready_marks_cleared"):
+                    await _announce_review_reset(group_session_id, my_name, key)
                 continue
 
             if mtype == "typing_indicator":
@@ -3869,6 +3889,8 @@ async def _hand_in(db, gs) -> None:
     except Exception as e:
         log.error(f"could not record the submission for {gs.id[:8]}: {e}", exc_info=True)
         await db.rollback()
+        # The rollback expired gs, and the end path reads it straight after.
+        await db.refresh(gs)
 
 
 def _group_deadline(gs) -> datetime | None:
@@ -4063,24 +4085,13 @@ async def _begin_review(db, gs) -> bool:
     return res.rowcount == 1
 
 
-async def _reset_review_marks(group_session_id: str, by_name: str, section_key: str) -> None:
-    """A write during review changes what everyone approved, so every ready
-    mark is withdrawn and the team is told who changed what. Never raises: the
-    write it follows is already committed."""
-    try:
-        async with AsyncSessionLocal() as db:
-            gs = await db.get(GroupSession, group_session_id)
-            if gs is None or gs.review_started_at is None:
-                return
-            res = await db.execute(
-                delete(ReviewReadyMark).where(ReviewReadyMark.group_session_id == group_session_id)
-            )
-            await db.commit()
-            if res.rowcount:
-                await _notify_review(group_session_id, await _review_state(db, gs),
-                                     reset_by_name=by_name, reset_section=section_key)
-    except Exception as e:
-        log.error(f"[REVIEW] could not reset ready marks for {group_session_id[:8]}: {e}")
+async def _announce_review_reset(group_session_id: str, by_name: str, section_key: str) -> None:
+    """A write during review withdrew every ready mark (artifacts.write_section
+    does that in the write's own transaction); tell the team who changed what.
+    Never raises: the write it follows is already committed."""
+    state = await _review_state_for(group_session_id)
+    if state is not None:
+        await _notify_review(group_session_id, state, reset_by_name=by_name, reset_section=section_key)
 
 
 async def _review_gs_or_409(db, group_id: str, session_num: int, user_id: str):
@@ -4136,12 +4147,19 @@ async def set_review_ready(
             await db.commit()
         except IntegrityError:
             await db.rollback()  # already marked
+            await db.refresh(gs)
     else:
         await db.execute(delete(ReviewReadyMark).where(
             ReviewReadyMark.group_session_id == gs.id, ReviewReadyMark.user_id == user_id))
         await db.commit()
 
     state = await _review_state(db, gs)
+    if state["all_ready"]:
+        # Re-check under the session row lock that a document write also takes
+        # (artifacts._write_once), so a write still in flight either lands
+        # first and withdraws the marks, or waits for the end and is refused.
+        await db.execute(select(GroupSession.id).where(GroupSession.id == gs.id).with_for_update())
+        state = await _review_state(db, gs)
     if state["all_ready"]:
         private = await _private_coach_conversations(db, gs.id)
         summary = await _end_coach_session(db, gs, private, end_reason="team_ready")
