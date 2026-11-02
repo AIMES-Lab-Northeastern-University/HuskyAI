@@ -505,6 +505,30 @@ class GroupSession(Base):
     min_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Post-session analysis blob; same shape as UserChallengeSession.session_analysis.
     session_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # When a member first asked to finish: the team then reviews the whole
+    # document and each member marks it ready (ReviewReadyMark). Editing stays
+    # open during review; the session ends when every participant is ready, a
+    # member submits anyway, or the timer runs out.
+    review_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ReviewReadyMark(Base):
+    """One member's "ready to submit" on a group session's final review.
+
+    A row per member rather than a list on GroupSession, so teammates marking
+    ready at the same moment cannot overwrite each other. Every accepted write
+    to the document during review deletes them all: a mark approves the text
+    the member saw, not whatever a teammate changes afterwards."""
+
+    __tablename__ = "review_ready_marks"
+    __table_args__ = (UniqueConstraint("group_session_id", "user_id", name="uq_review_ready_mark"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class GroupChatMessage(Base):
@@ -521,6 +545,26 @@ class GroupChatMessage(Base):
     sender_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class GroupChatAttachment(Base):
+    """A file a student shared in the team backchannel, for teammates to open.
+
+    Same isolation as GroupChatMessage: never sent to a coach, never scored, and
+    never copied into study_events — the event for its message carries only the
+    count, size and type of what was attached. Served back only to members of
+    the team (GET /groups/{group_id}/team-chat/attachments/{id})."""
+
+    __tablename__ = "group_chat_attachments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    message_id: Mapped[str] = mapped_column(String, ForeignKey("group_chat_messages.id"), nullable=False, index=True)
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class ContestedPair(Base):
@@ -940,6 +984,43 @@ class ArtifactRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TeamSubmission(Base):
+    """What a team hands in at the end of a group session: the shared document
+    frozen as it stood when the session ended, the AI's team score at that
+    moment, and the instructor's grade.
+
+    Created automatically when the session ends, by whichever path ends it
+    (End button, timer, lazy expiry), so there is no separate "submit" step a
+    team could forget. The document is a snapshot, not a pointer to the live
+    artifact: the grade must stay attached to the text that was graded.
+
+    The AI score is never overwritten by grading. `instructor_score` sits beside
+    it, and the score that counts is the instructor's when set, else the AI's."""
+
+    __tablename__ = "team_submissions"
+    __table_args__ = (UniqueConstraint("group_session_id", name="uq_team_submission_session"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    group_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("group_sessions.id"), nullable=False, index=True
+    )
+    group_id: Mapped[str] = mapped_column(String, ForeignKey("group_challenges.id"), nullable=False, index=True)
+    challenge_id: Mapped[str] = mapped_column(String, ForeignKey("challenges.id"), nullable=False, index=True)
+    session_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # [{"key", "title", "content", "updated_by_user_id"}] in document order.
+    sections: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Team PEI (equal-weight mean in the private-coach arm), its spread, and
+    # each member's own average, as the session ended.
+    ai_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_score_range: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    per_student: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    instructor_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    instructor_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graded_by_user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
+    graded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 # Columns added to already-existing tables, as (table, column, DDL type).
 # `create_all` creates missing TABLES but never missing COLUMNS, and Alembic does
 # not run against SQLite here — so without this, adding a column to an existing
@@ -963,6 +1044,7 @@ _SQLITE_ADDED_COLUMNS = [
     ("users", "research_ack_version", "INTEGER"),
     ("eval_results", "score_status", "VARCHAR(16)"),
     ("eval_results", "scored_at", "DATETIME"),
+    ("group_sessions", "review_started_at", "DATETIME"),
 ]
 
 
@@ -1066,6 +1148,8 @@ async def init_db():
                 "scored_at TIMESTAMP WITHOUT TIME ZONE",
                 "CREATE INDEX IF NOT EXISTS ix_eval_results_score_status "
                 "ON eval_results (score_status)",
+                "ALTER TABLE group_sessions ADD COLUMN IF NOT EXISTS "
+                "review_started_at TIMESTAMP WITHOUT TIME ZONE",
             ):
                 await conn.execute(text(_ddl))
             # NULL for accounts that predate password-reset support: those tokens

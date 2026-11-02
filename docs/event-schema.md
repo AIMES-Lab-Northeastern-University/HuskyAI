@@ -1,10 +1,14 @@
 # Study event schema
 
-**Schema version: 1.1.0** — echoed as `schema_version` in API responses. Any
+**Schema version: 1.2.0** — echoed as `schema_version` in API responses. Any
 change to a field's meaning is a version bump, not a silent edit.
 
 Changes since 1.0.0 (all additive): the `group_chat.message` action, the
 `team_chat_logging` key in `condition`, and the export's `team_chat` section.
+
+Changes in 1.2.0 (additive): `group_chat.message` events for a message that
+carried files add `attachments`, `attachment_bytes` and `attachment_types`.
+Text-only messages log exactly as in 1.1.0.
 
 One table, `study_events`, holds every action in a collaborative-study session
 in a single total order. It is append-only. Nothing in it is ever updated or
@@ -135,9 +139,10 @@ Whether team discussion enters the research record is the PI's decision
 
 | Action | Emitted when | Payload |
 |---|---|---|
-| `message` | A student sends a team-chat message in the collaborative workspace (`/ws/coach`). `ref_id` is the `group_chat_messages.id`. | `chars`, `words`, `content_logged` |
+| `message` | A student sends a team-chat message in the collaborative workspace (`/ws/coach`). `ref_id` is the `group_chat_messages.id`. | `chars`, `words`, `content_logged`; since 1.2.0, when files were shared with the message, also `attachments` (count), `attachment_bytes` (total) and `attachment_types` (sorted MIME types) |
 
-The text never enters `payload`, in either mode. The export pseudonymises ids
+The text never enters `payload`, in either mode, and neither do shared files:
+their bytes stay in `group_chat_attachments`, which the export does not read. The export pseudonymises ids
 inside payloads but does not scrub them, so text there would leak; it is joined
 and scrubbed at export time instead. And because the mode is written onto each
 event, switching an assignment from `metadata` to `content` later includes only

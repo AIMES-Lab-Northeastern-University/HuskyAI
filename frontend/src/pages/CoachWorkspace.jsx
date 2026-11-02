@@ -4,10 +4,15 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DIM_META } from '../lib/metricInfo'
 import { API_URL, authHeaders, clearSession, readApiError } from '../lib/api'
+import { StudentSubmissionBar, keepLineBreaks } from '../components/TeamSubmission'
+import FinalReview, { wordCount } from '../components/FinalReview'
 import { clearAllReadBuffers, createReadSender } from '../lib/readBuffer'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
+import { AttachButton, FileChip, PendingFiles, usePendingFiles } from '../components/Attachments'
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
+// Mirrors backend artifacts.MAX_SECTION_CHARS; the server refuses longer saves.
+const SECTION_MAX_CHARS = 20000
 
 /* Collaborative-study workspace: this student's PRIVATE coach on the left, the
  * team's shared artifact on the right.
@@ -81,7 +86,11 @@ export function originFor(draft, copied, pasted) {
 
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen, guide, focusRequest, onFocusSeen, variant }) {
+  const page = variant === 'page'
+  // Page view: Write / Preview, so a student sees the formatted result before
+  // it goes into the document everyone reads.
+  const [preview, setPreview] = useState(false)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(section.content || '')
@@ -104,6 +113,7 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // closing an editor "Copy to document" just opened, or reopening an empty one
   // under an old error. Only answers to our own sends apply.
   const awaitingSave = useRef(false)
+  const rootRef = useRef(null)
 
 
   // Follow the server's copy while not actively editing, so a teammate's edit
@@ -139,6 +149,19 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
     // Consumed: cleared in the parent so a later remount cannot apply it again.
     onInsertSeen?.(insertRequest.n)
   }, [insertRequest]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // "Edit" on the final review: open this section's editor and bring it into
+  // view. Not a read event — the review screen already logged that one.
+  useEffect(() => {
+    if (!focusRequest) return
+    setOpen(true)
+    if (!readOnly) {
+      if (!editing) setBaseVersion(section.version)
+      setEditing(true)
+    }
+    setTimeout(() => rootRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+    onFocusSeen?.(focusRequest.n)
+  }, [focusRequest]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle = () => {
     const next = !open
@@ -180,9 +203,133 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   }
 
   const empty = !(section.content || '').trim()
+  const target = guide?.target_words || null
+  const words = wordCount(section.content || '')
+  const draftWords = wordCount(draft)
+
+  const conflictBox = conflict && (
+    <div className="mt-3 p-3 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]" style={{ borderWidth: '1.5px' }}>
+      <div className="text-[12px] font-bold text-[#C8102E] mb-1">A teammate saved first</div>
+      <div className="text-[12px] text-[#4A4440] mb-2">
+        Their version (v{conflict.version}) is below. Your draft was not lost — it is in the editor; fold in their changes and save again.
+      </div>
+      <div className="mb-2 p-2 rounded-[8px] bg-white border border-[#F5C2CC] text-[12px] text-[#16120E] whitespace-pre-wrap">
+        {section.content}
+      </div>
+      <button onClick={() => onDismissConflict(section.key)}
+              className="text-[11px] font-bold text-[#C8102E] underline cursor-pointer">Got it</button>
+    </div>
+  )
+
+  const editor = (
+    <div className="mt-3">
+      <textarea
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onPaste={e => {
+          // Only the student's OWN coach replies are matched: this
+          // page never holds a teammate's private coaching.
+          const text = e.clipboardData?.getData('text') || ''
+          if (isCoachText(text, coachReplies)) pastedChunks.current.push(text)
+        }}
+        rows={page ? 14 : 8}
+        className={`w-full p-3 text-[#16120E] bg-white border border-[#E7E0D8] rounded-[10px] resize-y leading-relaxed focus:outline-none focus:border-[#C8102E] ${page ? 'text-[14px]' : 'text-[13px] font-mono'}`}
+        style={{ borderWidth: '1.5px' }}
+        placeholder={guide?.prompt ? `${guide.prompt}\n\nWrite it as the team's finished answer. Discuss in team chat.` : "Write the team's finished answer for this section. Discuss in team chat."}
+      />
+      <div className={`mt-1 text-right text-[11px] ${draft.length > SECTION_MAX_CHARS ? 'text-[#C8102E] font-bold' : 'text-[#9A948E]'}`}>
+        {draftWords}{target ? ` / ~${target}` : ''} words · {draft.length.toLocaleString()} / {SECTION_MAX_CHARS.toLocaleString()} characters
+        {draft.length > SECTION_MAX_CHARS && ' · shorten this section to save'}
+      </div>
+      {saveError && (
+        <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>
+      )}
+      <div className="flex gap-2 mt-2">
+        <button onClick={save} disabled={saving || draft.length > SECTION_MAX_CHARS}
+                className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button onClick={() => { setEditing(false); setSaving(false); setSaveError(null); setDraft(section.content || ''); copiedChunks.current = []; pastedChunks.current = [] }}
+                className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+
+  const view = (
+    <div className="mt-3">
+      {empty
+        ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
+        : <div className={`prose-chat text-[#16120E] ${page ? 'text-[15px] leading-relaxed' : 'text-[13px]'}`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(section.content)}</ReactMarkdown></div>}
+      {/* A finished session is read-only; the server refuses writes too. */}
+      {!readOnly && (
+        <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
+                className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
+                style={{ borderWidth: '1.5px' }}>
+          {empty ? 'Write this section' : 'Edit'}
+        </button>
+      )}
+    </div>
+  )
+
+  if (page) {
+    return (
+      <section ref={rootRef} className="scroll-mt-4">
+        <div className="flex items-baseline gap-3 flex-wrap">
+          <h2 className="text-[19px] font-bold text-[#16120E] m-0">{section.title || 'Document'}</h2>
+          <span className="text-[11px] text-[#9A948E]">
+            {empty ? (target ? `Empty · aim for ~${target} words` : 'Empty')
+              : `${words}${target ? ` / ~${target}` : ''} words · ${editorName || 'someone'} · ${timeAgo(section.updated_at)}`}
+          </span>
+          {justUpdatedBy && (
+            <span className="text-[10px] font-bold px-2 py-0.5 rounded-[6px] bg-[#FEF3E8] text-[#D97706]">{justUpdatedBy} edited</span>
+          )}
+        </div>
+        {guide?.prompt && <div className="text-[12px] text-[#9A948E] italic mt-1">{guide.prompt}</div>}
+        {conflictBox}
+        {editing ? (
+          <div className="mt-3">
+            <div className="flex gap-1 mb-2" role="tablist">
+              {[['write', 'Write'], ['preview', 'Preview']].map(([k, label]) => (
+                <button key={k} type="button" role="tab" aria-selected={(k === 'preview') === preview}
+                        onClick={() => setPreview(k === 'preview')}
+                        className={`px-3 py-1 text-[12px] font-bold rounded-[7px] cursor-pointer border ${(k === 'preview') === preview ? 'bg-[#16120E] text-white border-[#16120E]' : 'bg-white text-[#6B6560] border-[#E7E0D8]'}`}>
+                  {label}
+                </button>
+              ))}
+              <span className="ml-auto self-center text-[11px] text-[#9A948E] hidden sm:inline">**bold** · - list · 1. numbered · ## heading</span>
+            </div>
+            {preview ? (
+              <>
+                <div className="min-h-[200px] p-4 rounded-[10px] border border-[#E7E0D8] bg-[#FDFCFB]">
+                  {draft.trim()
+                    ? <div className="prose-chat text-[14px] text-[#16120E] leading-relaxed"><ReactMarkdown remarkPlugins={[remarkGfm]}>{keepLineBreaks(draft)}</ReactMarkdown></div>
+                    : <div className="text-[13px] italic text-[#B5AFA8]">Nothing written yet.</div>}
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={save} disabled={saving || draft.length > SECTION_MAX_CHARS}
+                          className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
+                    {saving ? 'Saving…' : 'Save'}
+                  </button>
+                  <button onClick={() => setPreview(false)}
+                          className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
+                    Keep writing
+                  </button>
+                </div>
+                {saveError && <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>}
+              </>
+            ) : editor}
+          </div>
+        ) : (
+          <div className="text-[14px] leading-relaxed">{view}</div>
+        )}
+      </section>
+    )
+  }
 
   return (
-    <div className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden flex-shrink-0" style={{ borderWidth: '1.5px' }}>
+    <div ref={rootRef} className="border border-[#E7E0D8] rounded-[12px] bg-[#FDFCFB] overflow-hidden flex-shrink-0" style={{ borderWidth: '1.5px' }}>
       <button
         onClick={toggle}
         className="w-full px-4 py-3 flex items-center gap-3 hover:bg-[#F7F3EE] cursor-pointer text-left"
@@ -192,7 +339,8 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
         <div className="flex-1 min-w-0">
           <div className="text-[13px] font-bold text-[#16120E] truncate">{section.title || section.key}</div>
           <div className="text-[11px] text-[#9A948E] mt-0.5">
-            {empty ? 'Empty' : `v${section.version} · ${editorName || 'someone'} · ${timeAgo(section.updated_at)}`}
+            {empty ? (target ? `Empty · aim for ~${target} words` : 'Empty')
+              : `${words}${target ? ` / ~${target}` : ''} words · ${editorName || 'someone'} · ${timeAgo(section.updated_at)}`}
           </div>
         </div>
         {justUpdatedBy && (
@@ -207,65 +355,14 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
 
       {open && (
         <div className="px-4 pb-4 border-t border-[#E7E0D8]" style={{ borderTopWidth: '1.5px' }}>
-          {conflict && (
-            <div className="mt-3 p-3 rounded-[10px] bg-[#FDE8EC] border border-[#F5C2CC]" style={{ borderWidth: '1.5px' }}>
-              <div className="text-[12px] font-bold text-[#C8102E] mb-1">A teammate saved first</div>
-              <div className="text-[12px] text-[#4A4440] mb-2">
-                Their version (v{conflict.version}) is below. Your draft was not lost — it is in the editor; fold in their changes and save again.
-              </div>
-              <div className="mb-2 p-2 rounded-[8px] bg-white border border-[#F5C2CC] text-[12px] text-[#16120E] whitespace-pre-wrap">
-                {section.content}
-              </div>
-              <button onClick={() => onDismissConflict(section.key)}
-                      className="text-[11px] font-bold text-[#C8102E] underline cursor-pointer">Got it</button>
+          {guide?.prompt && (
+            <div className="mt-3 px-3 py-2 rounded-[8px] bg-[#F7F3EE] text-[12px] text-[#4A4440]">
+              <span className="font-bold text-[#6B6560]">What goes here: </span>{guide.prompt}
             </div>
           )}
+          {conflictBox}
 
-          {editing ? (
-            <div className="mt-3">
-              <textarea
-                value={draft}
-                onChange={e => setDraft(e.target.value)}
-                onPaste={e => {
-                  // Only the student's OWN coach replies are matched: this
-                  // page never holds a teammate's private coaching.
-                  const text = e.clipboardData?.getData('text') || ''
-                  if (isCoachText(text, coachReplies)) pastedChunks.current.push(text)
-                }}
-                rows={8}
-                className="w-full p-3 text-[13px] text-[#16120E] bg-white border border-[#E7E0D8] rounded-[10px] resize-y font-mono leading-relaxed focus:outline-none focus:border-[#C8102E]"
-                style={{ borderWidth: '1.5px' }}
-                placeholder="Write the team's work for this section…"
-              />
-              {saveError && (
-                <div role="alert" className="mt-2 text-[12px] text-[#C8102E]">{saveError}</div>
-              )}
-              <div className="flex gap-2 mt-2">
-                <button onClick={save} disabled={saving}
-                        className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#C8102E] rounded-[8px] hover:bg-[#A50D26] disabled:opacity-50 cursor-pointer">
-                  {saving ? 'Saving…' : 'Save'}
-                </button>
-                <button onClick={() => { setEditing(false); setSaving(false); setSaveError(null); setDraft(section.content || ''); copiedChunks.current = []; pastedChunks.current = [] }}
-                        className="px-3 py-1.5 text-[12px] font-bold text-[#6B6560] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] cursor-pointer">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="mt-3">
-              {empty
-                ? <div className="text-[13px] text-[#9A948E] italic py-2">Nothing here yet.</div>
-                : <div className="prose-chat text-[13px] text-[#16120E]"><ReactMarkdown remarkPlugins={[remarkGfm]}>{section.content}</ReactMarkdown></div>}
-              {/* A finished session is read-only; the server refuses writes too. */}
-              {!readOnly && (
-                <button onClick={() => { setBaseVersion(section.version); setEditing(true) }}
-                        className="mt-3 px-3 py-1.5 text-[12px] font-bold text-[#4A4440] bg-[#F7F3EE] border border-[#E7E0D8] rounded-[8px] hover:bg-[#EDEAE4] cursor-pointer"
-                        style={{ borderWidth: '1.5px' }}>
-                  {empty ? 'Write this section' : 'Edit'}
-                </button>
-              )}
-            </div>
-          )}
+          {editing ? editor : view}
         </div>
       )}
     </div>
@@ -319,6 +416,10 @@ export default function CoachWorkspace() {
   const [roster, setRoster]           = useState([])
   const [challengeTitle, setChTitle]  = useState(null)
   const [challengeContext, setCtx]    = useState(null)
+  // The task bar stays pinned above the coach chat for the whole session.
+  // null = not toggled yet: expanded until the first message, then collapsed
+  // to one line so it doesn't push the conversation down.
+  const [taskOpen, setTaskOpen]       = useState(null)
   const [condition, setCondition]     = useState(null)
 
   const [artifact, setArtifact]       = useState(null)
@@ -338,6 +439,8 @@ export default function CoachWorkspace() {
   const pendingSaves = useRef(new Set())
   const [teamChat, setTeamChat]       = useState([])
   const [teamInput, setTeamInput]     = useState('')
+  const coachFiles = usePendingFiles()
+  const teamFiles  = usePendingFiles()
   const [sessionEnded, setEnded]      = useState(false)
   const [ending, setEnding]           = useState(false)
   const [endError, setEndError]       = useState('')
@@ -354,6 +457,27 @@ export default function CoachWorkspace() {
   const [pairs, setPairs]             = useState([])
   const [inboxDirty, setInboxDirty]   = useState(0)
   const [recentEdits, setRecentEdits] = useState({})
+  // The instructor's brief and target length per section, by key.
+  const [guides, setGuides]           = useState({})
+  // Final review: { started_at, required, ready_user_ids, all_ready } from the server.
+  const [review, setReview]           = useState(null)
+  const [reviewOpen, setReviewOpen]   = useState(false)
+  const [reviewNotice, setRevNotice]  = useState('')
+  const [readyBusy, setReadyBusy]     = useState(false)
+  const [reviewError, setReviewError] = useState('')
+  const [focusReq, setFocusReq]       = useState(null)   // { key, n } from the review's Edit
+  const [timeLimit, setTimeLimit]     = useState(null)
+  // Full-document view: the document takes the main area as pages, the coach
+  // shrinks to a side column (or a rail). Off by default, so opening the
+  // workspace still shows no teammate's text until someone chooses to read.
+  const [docMode, setDocMode]         = useState(false)
+  const [coachHidden, setCoachHidden] = useState(false)
+  const docReadKeys = useRef(new Set())
+  // Team chat can fold down to its header to give the document the height.
+  // `seenChat` is how many messages there were when it was folded.
+  const [chatOpen, setChatOpen]       = useState(true)
+  const [seenChat, setSeenChat]       = useState(0)
+  const autoReviewRef = useRef(false)
 
   const wsRef        = useRef(null)
   const reconnectRef = useRef(null)
@@ -488,6 +612,8 @@ export default function CoachWorkspace() {
       setOpenOptions({})
       // Open drafts unmount with the panel, so a conflict about one is moot.
       setConflicts({})
+      setDocMode(false)
+      setCoachHidden(false)
     }
     setArtOpen(next)
     emit({ type: next ? 'artifact_open' : 'artifact_close' })
@@ -537,6 +663,8 @@ export default function CoachWorkspace() {
     switch (data.type) {
       case 'session_init':
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
+        if (data.review) setReview(data.review)
+        setTimeLimit(data.time_limit_minutes ?? null)
         if (data.condition) setCondition(data.condition)
         if (data.group_session_id) setGsId(data.group_session_id)
         if (typeof data.remaining_seconds === 'number') {
@@ -551,13 +679,31 @@ export default function CoachWorkspace() {
       case 'history':
         if (Array.isArray(data.messages)) {
           setMessages(data.messages.filter(m => m?.role && typeof m.content === 'string')
-            .map(m => ({ role: m.role, content: m.content })))
+            .map(m => ({
+              role: m.role, content: m.content,
+              // The history carries each file's bytes, so the chip can open a preview.
+              attachments: (m.attachments || []).map(a => ({ name: a.filename || a.name, data: a.data })),
+            })))
         }
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
         break
       case 'artifact':
         setArtifact(data.data)
         break
+      case 'section_guides':
+        setGuides(data.data || {})
+        break
+      case 'review_state': {
+        const { type: _t, started_by_name, reset_by_name, reset_section, ...state } = data
+        setReview(state)
+        if (started_by_name && started_by_name !== myName) {
+          setRevNotice(`${started_by_name} wants to finish. Read the whole document, fix anything flagged, then mark yourself ready.`)
+          setReviewOpen(true)
+        } else if (reset_by_name) {
+          setRevNotice(`${reset_by_name === myName ? 'You' : reset_by_name} changed the document, so everyone's "ready" was cleared. Check the change and mark ready again.`)
+        }
+        break
+      }
       case 'artifact_updated': {
         // A teammate's live edit. Updates the text; deliberately emits nothing.
         setArtifact(prev => prev && ({
@@ -643,6 +789,7 @@ export default function CoachWorkspace() {
         if (Array.isArray(data.messages)) {
           setTeamChat(data.messages.map(m => ({
             senderName: m.sender_name, content: m.content, isSelf: m.sender_name === myName,
+            attachments: m.attachments || [],
           })))
         }
         break
@@ -650,8 +797,44 @@ export default function CoachWorkspace() {
         // Human-only backchannel. Never enters a coach prompt or the evaluator;
         // whether it enters the research record at all is an open question, so
         // nothing here emits a study event.
-        setTeamChat(prev => [...prev, { senderName: data.sender_name, content: data.content, isSelf: false }])
+        setTeamChat(prev => [...prev, {
+          senderName: data.sender_name, content: data.content, isSelf: false, attachments: data.attachments || [],
+        }])
         break
+      case 'team_chat_saved':
+        // My own message, now stored: swap its placeholder chips for the
+        // stored files so they become downloadable.
+        setTeamChat(prev => prev.map(m => (m.clientId && m.clientId === data.client_id
+          ? { ...m, attachments: [...(data.attachments || []), ...(m.attachments || []).filter(a => a.failed)] }
+          : m)))
+        break
+      case 'team_chat_rejected': {
+        const reasons = Object.fromEntries((data.files || []).map(f => [f.name, f.reason]))
+        setTeamChat(prev => prev
+          .map(m => (m.clientId && m.clientId === data.client_id
+            ? { ...m, attachments: (m.attachments || []).map(a => (a.name in reasons ? { ...a, failed: true, reason: reasons[a.name] } : a)) }
+            : m))
+          // Nothing left of a files-only message: drop the bubble, keep the notice.
+          .filter(m => !(m.clientId === data.client_id && !m.content && (m.attachments || []).every(a => a.failed))))
+        teamFiles.setNotice(`Not sent: ${(data.files || []).map(f => `${f.name} (${f.reason})`).join(', ')}`)
+        break
+      }
+      case 'attachment_warning': {
+        // The server dropped files from my last coach message; mark them.
+        const reasons = Object.fromEntries((data.files || []).map(f => [f.name, f.reason]))
+        setMessages(prev => {
+          const next = [...prev]
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === 'user') {
+              next[i] = { ...next[i], attachments: (next[i].attachments || []).map(a => (
+                a.name in reasons ? { ...a, failed: true, reason: reasons[a.name] } : a)) }
+              break
+            }
+          }
+          return next
+        })
+        break
+      }
       case 'session_ended':
         // Close every open clock now. The server accepts these for a short
         // grace window after the end, because they measure reading done
@@ -659,6 +842,7 @@ export default function CoachWorkspace() {
         flushAllDwell('session_end')
         endedRef.current = true
         setEnded(true)
+        setReviewOpen(false)
         // The same figures the student who ended it sees. A bare frame (a
         // refused late turn) keeps what is already shown.
         if (data.summary) setSummary(data.summary)
@@ -690,7 +874,7 @@ export default function CoachWorkspace() {
         break
       default: break
     }
-  }, [markRecentEdit, settleSave, flushAllDwell, user?.id])
+  }, [markRecentEdit, settleSave, flushAllDwell, user?.id, myName])
 
   const connect = useCallback(() => {
     if (!token || !groupId) return
@@ -743,24 +927,73 @@ export default function CoachWorkspace() {
 
   const send = useCallback(() => {
     const content = input.trim()
-    if (!content || isStreaming || isTyping || isEvaluating) return
+    const files = coachFiles.files
+    if ((!content && !files.length) || isStreaming || isTyping || isEvaluating) return
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
     lastSentRef.current = content
-    setMessages(prev => [...prev, { role: 'user', content }])
-    wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: [] }))
+    setMessages(prev => [...prev, { role: 'user', content, attachments: files.map(f => ({ name: f.name, data: f.data })) }])
+    wsRef.current.send(JSON.stringify({ type: 'message', content, attachments: coachFiles.toWire() }))
     setInput('')
-  }, [input, isStreaming, isTyping, isEvaluating])
+    coachFiles.clear()
+  }, [input, coachFiles, isStreaming, isTyping, isEvaluating])
 
   const sendTeamChat = useCallback(() => {
     const content = teamInput.trim()
-    if (!content || wsRef.current?.readyState !== WebSocket.OPEN) return
-    setTeamChat(prev => [...prev, { senderName: myName, content, isSelf: true }])
-    wsRef.current.send(JSON.stringify({ type: 'team_chat', content }))
+    const files = teamFiles.files
+    if ((!content && !files.length) || wsRef.current?.readyState !== WebSocket.OPEN) return
+    // Matches the server's team_chat_saved / team_chat_rejected back to this bubble.
+    const clientId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    setTeamChat(prev => [...prev, {
+      senderName: myName, content, isSelf: true, clientId, attachments: files.map(f => ({ name: f.name })),
+    }])
+    wsRef.current.send(JSON.stringify({ type: 'team_chat', content, client_id: clientId, attachments: teamFiles.toWire() }))
     setTeamInput('')
-  }, [teamInput, myName])
+    teamFiles.clear()
+  }, [teamInput, teamFiles, myName])
+
+  const startReview = useCallback(async () => {
+    setReviewError('')
+    try {
+      const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/review`,
+        { method: 'POST', headers: authHeaders() })
+      if (!r.ok) { setEndError(await readApiError(r, 'Could not start the final review')); return }
+      setReview(await r.json())
+      setRevNotice('')
+      setReviewOpen(true)
+    } catch {
+      setEndError('Could not reach the server. Try again.')
+    }
+  }, [groupId, sessionNum])
+
+  const setReady = useCallback(async (ready) => {
+    setReadyBusy(true)
+    setReviewError('')
+    try {
+      const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/ready`, {
+        method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ready }),
+      })
+      if (!r.ok) { setReviewError(await readApiError(r, 'Could not save that')); return }
+      const d = await r.json()
+      if (d.ended) {
+        flushAllDwell('session_end')
+        if (d.summary) setSummary(d.summary)
+        setEndInfo({ reason: d.summary?.end_reason || 'team_ready' })
+        endedRef.current = true
+        setEnded(true)
+        setReviewOpen(false)
+      } else {
+        setReview(d)
+      }
+    } catch {
+      setReviewError('Could not reach the server. Try again.')
+    } finally {
+      setReadyBusy(false)
+    }
+  }, [groupId, sessionNum, flushAllDwell])
 
   const endSession = useCallback(async () => {
-    if (!window.confirm('End this session for the whole team? Everyone will be disconnected.')) return
+    if (!window.confirm('Submit the document now and end the session for the whole team? Everyone will be disconnected.')) return
     setEnding(true)
     setEndError('')
     try {
@@ -776,6 +1009,7 @@ export default function CoachWorkspace() {
       if (s?.end_reason) setEndInfo(prev => prev || { reason: s.end_reason, byName: myName })
       endedRef.current = true
       setEnded(true)
+      setReviewOpen(false)
     } catch (e) {
       console.error('could not end session', e)
       setEndError('Could not reach the server, so the session is still open. Try again.')
@@ -783,6 +1017,57 @@ export default function CoachWorkspace() {
       setEnding(false)
     }
   }, [groupId, sessionNum, flushAllDwell, myName])
+
+  // The review shows every section's full text at once, so opening it is a
+  // read of each one that has text, marked as such (see artifacts.READ_VIAS).
+  useEffect(() => {
+    if (!reviewOpen) return
+    for (const s of artifact?.sections || []) {
+      if ((s.content || '').trim()) emit({ type: 'artifact_expand', section_key: s.key, via: 'review' })
+    }
+  }, [reviewOpen]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Five minutes before a timed session ends, start the review for everyone,
+  // so the team finishes the document instead of being cut off mid-edit.
+  useEffect(() => {
+    if (sessionEnded || autoReviewRef.current || remainingMs == null || !timeLimit || timeLimit < 10) return
+    if (remainingMs > 0 && remainingMs <= 5 * 60000) {
+      autoReviewRef.current = true
+      if (!review?.started_at) {
+        startReview().then(() => setRevNotice('Five minutes left. Finish the document and mark yourself ready.'))
+      }
+    }
+  }, [remainingMs, timeLimit, sessionEnded, review, startReview])
+
+  const openDocMode = useCallback(() => {
+    if (!artifactOpen) togglePanel()
+    docReadKeys.current = new Set()
+    setDocMode(true)
+  }, [artifactOpen, togglePanel])
+
+  const closeDocMode = useCallback(() => {
+    setDocMode(false)
+    setCoachHidden(false)
+  }, [])
+
+  // The full view puts every section's text on screen, so each one with text
+  // is a read, marked via "document" (see artifacts.READ_VIAS). A section a
+  // teammate fills in while the view is open is logged when it appears.
+  useEffect(() => {
+    if (!docMode || !artifactOpen) return
+    for (const s of artifact?.sections || []) {
+      if ((s.content || '').trim() && !docReadKeys.current.has(s.key)) {
+        docReadKeys.current.add(s.key)
+        emit({ type: 'artifact_expand', section_key: s.key, via: 'document' })
+      }
+    }
+  }, [docMode, artifactOpen, artifact, emit])
+
+  const editFromReview = useCallback((key) => {
+    setReviewOpen(false)
+    if (!artifactOpen) togglePanel()
+    setFocusReq({ key, n: Date.now() })
+  }, [artifactOpen, togglePanel])
 
   // Countdown tick. Display only: the server ends the session at the deadline
   // (and refuses anything after it) whether or not this tab is open.
@@ -872,6 +1157,7 @@ export default function CoachWorkspace() {
   }
 
   const coachReplies = messages.filter(m => m.role === 'assistant').map(m => m.content)
+  const docWide = docMode && artifactOpen && !narrow
   const pei = evalData?.scores?.PEI ?? 0
   const busy = isStreaming || isTyping || isEvaluating || sessionEnded
 
@@ -919,19 +1205,26 @@ export default function CoachWorkspace() {
         {!sessionEnded && endError && (
           <span role="alert" className="text-[12px] text-[#C8102E] max-w-[260px]">{endError}</span>
         )}
-        {!sessionEnded && (
-          <button onClick={endSession} disabled={ending}
-                  className="px-3 py-1.5 text-[12px] font-bold text-[#C8102E] bg-[#FDFCFB] border border-[#E7E0D8] rounded-[8px] hover:bg-[#FDE8EC] disabled:opacity-50 cursor-pointer"
-                  style={{ borderWidth: '1.5px' }}>
-            {ending ? 'Ending…' : 'End session'}
+        {!sessionEnded && (review?.started_at ? (
+          <button onClick={() => { setRevNotice(''); setReviewOpen(true) }}
+                  className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#0D9488] rounded-[8px] border-0 cursor-pointer">
+            Final review · {review.ready_user_ids?.length || 0}/{review.required?.length || 0} ready
           </button>
-        )}
+        ) : (
+          <button onClick={startReview} disabled={ending || connStatus !== 'connected'}
+                  className="px-3 py-1.5 text-[12px] font-bold text-[#C8102E] bg-[#FDFCFB] border border-[#E7E0D8] rounded-[8px] hover:bg-[#FDE8EC] disabled:opacity-50 cursor-pointer"
+                  style={{ borderWidth: '1.5px' }}
+                  title="Review the whole document with your team, then submit it">
+            Finish &amp; review
+          </button>
+        ))}
       </div>
 
       {sessionEnded && (
-        <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex items-center gap-4 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+        <div className="px-6 py-3 bg-[#E6F7F6] border-b border-[#C7E9E6] flex flex-wrap items-center gap-x-4 gap-y-2 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <span className="text-[13px] font-bold text-[#0D9488]">
             {endInfo?.reason === 'timer_expired' ? 'Time is up — session ended.'
+              : endInfo?.reason === 'team_ready' ? 'Everyone marked the document ready — submitted.'
               : endInfo?.byName ? `Session ended by ${endInfo.byName}.`
               : 'Session ended.'}
           </span>
@@ -945,11 +1238,31 @@ export default function CoachWorkspace() {
               )}
             </span>
           )}
+          <StudentSubmissionBar groupId={groupId} sessionNum={sessionNum} />
           <button onClick={() => navigate('/challenges')}
                   className="ml-auto text-[12px] font-bold text-[#0D9488] underline cursor-pointer">
             Back to challenges
           </button>
         </div>
+      )}
+
+      {reviewOpen && !sessionEnded && artifact && (
+        <FinalReview
+          sections={artifact.sections || []}
+          guides={guides}
+          review={review}
+          myId={user?.id}
+          nameFor={nameFor}
+          teamNames={roster.map(m => m.name)}
+          notice={reviewNotice}
+          onClose={() => setReviewOpen(false)}
+          onEdit={editFromReview}
+          onReady={setReady}
+          readyBusy={readyBusy}
+          onSubmitNow={endSession}
+          ending={ending}
+          error={reviewError || endError}
+        />
       )}
 
       {connStatus === 'error' && (
@@ -960,23 +1273,63 @@ export default function CoachWorkspace() {
 
       <div className="flex-1 flex min-h-0">
         {/* ── Private coach ── */}
-        <div className="flex-1 flex flex-col min-w-0 border-r border-[#E7E0D8]" style={{ borderRightWidth: '1.5px' }}>
+        {docWide && coachHidden && (
+          <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-r border-[#E7E0D8] flex-shrink-0" style={{ width: 52, borderRightWidth: '1.5px' }}>
+            <button onClick={() => setCoachHidden(false)} title="Show your coach" aria-label="Show your coach"
+                    className="w-8 h-8 rounded-[8px] bg-[#F7F3EE] hover:bg-[#EDEAE4] border border-[#E7E0D8] flex items-center justify-center cursor-pointer"
+                    style={{ borderWidth: '1.5px' }}>
+              <svg className="w-4 h-4 stroke-[#6B6560] fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+            </button>
+            <div className="flex-1" />
+            <div className="text-[10px] font-bold text-[#9A948E] uppercase tracking-[0.7px]"
+                 style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>
+              Your coach
+            </div>
+          </div>
+        )}
+        {/* Kept mounted while hidden, so the chat and any reply in progress survive. */}
+        <div className={`${docWide ? 'flex-shrink-0' : 'flex-1'} ${docWide && coachHidden ? 'hidden' : 'flex'} flex-col min-w-0 border-r border-[#E7E0D8]`}
+             style={{ borderRightWidth: '1.5px', width: docWide ? 400 : undefined }}>
           <div className="px-5 py-2.5 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center gap-2 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
             <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Your private coach</span>
             <span className="text-[10px] text-[#9A948E]">· teammates cannot see this</span>
             {turnCount > 0 && <span className="text-[11px] text-[#9A948E] ml-auto">Turn {turnCount}</span>}
+            {docWide && (
+              <button onClick={() => setCoachHidden(true)} title="Hide your coach to give the document more room"
+                      className={`${turnCount > 0 ? '' : 'ml-auto'} text-[11px] font-bold text-[#6B6560] underline cursor-pointer bg-transparent border-0`}>
+                Hide
+              </button>
+            )}
           </div>
 
-          <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
-            {challengeContext && messages.length === 0 && (
-              <div className="p-4 rounded-[12px] bg-[#FDFCFB] border border-[#E7E0D8]" style={{ borderWidth: '1.5px' }}>
-                <div className="text-[13px] font-bold text-[#16120E] mb-1">{challengeContext.title}</div>
-                <div className="text-[13px] text-[#4A4440]">{challengeContext.goal}</div>
-                {challengeContext.seed_question && (
-                  <div className="text-[13px] text-[#6B6560] mt-2 italic">{challengeContext.seed_question}</div>
+          {challengeContext && (challengeContext.goal || challengeContext.brief || challengeContext.seed_question) && (() => {
+            const open = taskOpen ?? messages.length === 0
+            return (
+              <div className="px-5 py-3 bg-[#FDFCFB] border-b border-[#E7E0D8] flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+                <button type="button" onClick={() => setTaskOpen(!open)} aria-expanded={open}
+                  className="w-full flex items-center gap-2 text-left bg-transparent border-0 p-0 cursor-pointer">
+                  <span className="text-[11px] font-bold text-[#C8102E] uppercase tracking-[0.7px] flex-shrink-0">Task</span>
+                  <span className={`text-[13px] text-[#16120E] font-semibold min-w-0 ${open ? '' : 'truncate'}`}>
+                    {challengeContext.title}{!open && challengeContext.goal ? ` · ${challengeContext.goal}` : ''}
+                  </span>
+                  <span className="text-[11px] text-[#9A948E] ml-auto flex-shrink-0">{open ? 'Hide' : 'Show'}</span>
+                </button>
+                {open && (
+                  <div className="mt-2 flex flex-col gap-1.5 text-[13px] leading-relaxed">
+                    {challengeContext.goal && (
+                      <div className="text-[#4A4440]"><strong className="text-[#16120E]">Goal:</strong> {challengeContext.goal}</div>
+                    )}
+                    {challengeContext.brief && <div className="text-[#4A4440]">{challengeContext.brief}</div>}
+                    {challengeContext.seed_question && (
+                      <div className="text-[#6B6560] italic">Starter question: {challengeContext.seed_question}</div>
+                    )}
+                  </div>
                 )}
               </div>
-            )}
+            )
+          })()}
+
+          <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
             {messages.map((m, i) => (
               <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-[80%] px-4 py-2.5 rounded-[14px] text-[14px] leading-relaxed ${
@@ -984,8 +1337,13 @@ export default function CoachWorkspace() {
                     ? 'bg-[#C8102E] text-white'
                     : 'bg-[#FDFCFB] text-[#16120E] border border-[#E7E0D8]'}`}
                      style={m.role === 'user' ? {} : { borderWidth: '1.5px' }}>
+                  {m.attachments?.length > 0 && (
+                    <div className={`flex flex-wrap gap-1.5 ${m.content ? 'mb-1.5' : ''}`}>
+                      {m.attachments.map((a, j) => <FileChip key={j} file={a} tone={m.role === 'user' ? 'dark' : 'light'} />)}
+                    </div>
+                  )}
                   {m.role === 'user'
-                    ? <p className="whitespace-pre-wrap">{m.content}</p>
+                    ? (m.content && <p className="whitespace-pre-wrap">{m.content}</p>)
                     : <div className="prose-chat"><ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown></div>}
                   {m.role === 'assistant' && !sessionEnded && artifact?.sections?.length > 0 && (
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -1028,7 +1386,10 @@ export default function CoachWorkspace() {
           </div>
 
           <div className="p-4 bg-[#FDFCFB] border-t border-[#E7E0D8] flex-shrink-0" style={{ borderTopWidth: '1.5px' }}>
+            <PendingFiles files={coachFiles.files} onRemove={coachFiles.remove} notice={coachFiles.notice} />
             <div className="flex gap-2">
+              <AttachButton onFiles={coachFiles.add} disabled={busy || connStatus !== 'connected'}
+                            label="Attach a file for your coach" />
               <textarea
                 value={input}
                 onChange={e => setInput(e.target.value)}
@@ -1039,7 +1400,7 @@ export default function CoachWorkspace() {
                 className="flex-1 px-4 py-2.5 text-[14px] bg-white border border-[#E7E0D8] rounded-[12px] resize-none focus:outline-none focus:border-[#C8102E] disabled:opacity-60"
                 style={{ borderWidth: '1.5px' }}
               />
-              <button onClick={send} disabled={busy || !input.trim() || connStatus !== 'connected'}
+              <button onClick={send} disabled={busy || (!input.trim() && !coachFiles.files.length) || connStatus !== 'connected'}
                       className="px-4 py-2.5 text-[13px] font-bold text-white bg-[#C8102E] rounded-[12px] hover:bg-[#A50D26] disabled:opacity-40 cursor-pointer">
                 Send
               </button>
@@ -1051,8 +1412,8 @@ export default function CoachWorkspace() {
         {/* On a phone the open pane covers the screen instead of squeezing the
             coach column to nothing; the same toggle opens and closes it, so the
             open/close events are exactly those of the desktop panel. */}
-        <div className={`flex flex-col flex-shrink-0 bg-[#F7F3EE] ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
-             style={{ width: narrow && artifactOpen ? '100%' : artifactOpen ? 460 : 52 }}>
+        <div className={`flex flex-col bg-[#F7F3EE] ${docWide ? 'flex-1 min-w-0' : 'flex-shrink-0'} ${narrow && artifactOpen ? 'fixed inset-0 z-40' : ''}`}
+             style={{ width: narrow && artifactOpen ? '100%' : docWide ? undefined : artifactOpen ? 460 : 52 }}>
           {!artifactOpen ? (
             <div className="h-full flex flex-col items-center py-4 gap-3 bg-[#FDFCFB] border-l border-[#E7E0D8]" style={{ borderLeftWidth: '1.5px' }}>
               <button onClick={togglePanel} title="Open shared artifact" aria-label="Open shared artifact"
@@ -1075,10 +1436,22 @@ export default function CoachWorkspace() {
                         style={{ borderWidth: '1.5px' }}>
                   <svg className="w-3.5 h-3.5 stroke-[#6B6560] fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
                 </button>
-                <div>
-                  <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Shared Artifact</div>
-                  <div className="text-[11px] text-[#9A948E] mt-0.5">Everyone on your team writes here</div>
+                <div className="min-w-0">
+                  <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">{docMode ? 'Team document' : 'Shared Artifact'}</div>
+                  {!narrow && <div className="text-[11px] text-[#9A948E] mt-0.5">Your team's final answer — this is what your instructor receives</div>}
                 </div>
+                <button onClick={docMode ? closeDocMode : openDocMode}
+                        title={docMode ? 'Back to the side panel' : 'Open the whole document as pages'}
+                        className={`${narrow ? '' : 'ml-auto'} px-2.5 py-1.5 text-[11px] font-bold rounded-[8px] cursor-pointer flex-shrink-0 border ${docMode ? 'text-[#4A4440] bg-[#F7F3EE] border-[#E7E0D8]' : 'text-white bg-[#16120E] border-[#16120E]'}`}>
+                  {docMode ? 'Exit full view' : '⤢ Full document'}
+                </button>
+                {/* On a phone this pane covers the header, so finishing lives here too. */}
+                {narrow && !sessionEnded && (
+                  <button onClick={() => (review?.started_at ? (setRevNotice(''), setReviewOpen(true)) : startReview())}
+                          className="ml-auto px-2.5 py-1.5 text-[11px] font-bold text-white bg-[#0D9488] rounded-[8px] border-0 cursor-pointer flex-shrink-0">
+                    {review?.started_at ? `Review · ${review.ready_user_ids?.length || 0}/${review.required?.length || 0}` : 'Finish & review'}
+                  </button>
+                )}
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3 min-h-0">
@@ -1158,7 +1531,65 @@ export default function CoachWorkspace() {
                 ))}
 
                 {!artifact && <div className="text-[13px] text-[#9A948E]">Loading…</div>}
-                {artifact?.sections?.map(s => (
+                {docMode && artifact && (() => {
+                  const secs = artifact.sections || []
+                  const total = secs.reduce((n, s) => n + wordCount(s.content || ''), 0)
+                  const done = secs.filter(s => (s.content || '').trim()).length
+                  return (
+                    <div className="w-full max-w-[800px] mx-auto flex-shrink-0">
+                      <div className="flex flex-wrap items-center gap-1.5 mb-3">
+                        {secs.map(s => {
+                          const filled = !!(s.content || '').trim()
+                          return (
+                            <button key={s.key} type="button"
+                                    onClick={() => document.getElementById(`doc-sec-${s.key}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-white border border-[#E7E0D8] text-[#4A4440] cursor-pointer hover:bg-[#F7F3EE]">
+                              <span className="w-1.5 h-1.5 rounded-full" style={{ background: filled ? '#0D9488' : '#D6CFC7' }} />
+                              {s.title || 'Document'}
+                            </button>
+                          )
+                        })}
+                        <span className="ml-auto text-[11px] text-[#9A948E]">{done}/{secs.length} sections written · {total} words</span>
+                      </div>
+                      <div className="bg-white rounded-[14px] border border-[#E7E0D8] px-6 sm:px-10 py-8 flex flex-col gap-9"
+                           style={{ borderWidth: '1.5px', boxShadow: '0 1px 3px rgba(22,18,14,0.05)' }}>
+                        <header className="border-b border-[#EFE8DF] pb-5">
+                          <div className="text-[11px] font-bold text-[#C8102E] uppercase tracking-[0.8px]">Team document</div>
+                          <h1 className="text-[24px] font-bold text-[#16120E] leading-tight mt-1 mb-0">{challengeTitle || challengeContext?.title || 'Collaborative session'}</h1>
+                          <div className="text-[13px] text-[#6B6560] mt-1">
+                            Session {sessionNum}{challengeContext?.title && challengeContext.title !== challengeTitle ? `: ${challengeContext.title}` : ''}
+                            {roster.length > 0 && <> · {roster.map(m => m.name).join(', ')}</>}
+                          </div>
+                        </header>
+                        {secs.map(s => (
+                          <div key={s.key} id={`doc-sec-${s.key}`} className="scroll-mt-4">
+                            <Section
+                              variant="page"
+                              section={s}
+                              isMine={s.updated_by_user_id === user?.id}
+                              editorName={nameFor(s.updated_by_user_id)}
+                              onExpand={onExpand}
+                              onCollapse={onCollapse}
+                              onSave={saveSection}
+                              conflict={conflicts[s.key]}
+                              onDismissConflict={(k) => setConflicts(p => { const n = { ...p }; delete n[k]; return n })}
+                              justUpdatedBy={recentEdits[s.key]}
+                              saveResult={saveResults[s.key]}
+                              readOnly={sessionEnded}
+                              coachReplies={coachReplies}
+                              insertRequest={insertReq?.key === s.key ? insertReq : null}
+                              onInsertSeen={(n) => setInsertReq(r => (r && r.n === n ? null : r))}
+                              guide={guides[s.key]}
+                              focusRequest={focusReq?.key === s.key ? focusReq : null}
+                              onFocusSeen={(n) => setFocusReq(r => (r && r.n === n ? null : r))}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
+                {!docMode && artifact?.sections?.map(s => (
                   <Section
                     key={s.key}
                     section={s}
@@ -1175,6 +1606,9 @@ export default function CoachWorkspace() {
                     coachReplies={coachReplies}
                     insertRequest={insertReq?.key === s.key ? insertReq : null}
                     onInsertSeen={(n) => setInsertReq(r => (r && r.n === n ? null : r))}
+                    guide={guides[s.key]}
+                    focusRequest={focusReq?.key === s.key ? focusReq : null}
+                    onFocusSeen={(n) => setFocusReq(r => (r && r.n === n ? null : r))}
                   />
                 ))}
               </div>
@@ -1186,9 +1620,12 @@ export default function CoachWorkspace() {
                   condition), so the header says so rather than implying privacy
                   when it is logged. Messages are persisted in
                   group_chat_messages either way. */}
-              <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: 240 }}>
+              <div className="border-t border-[#E7E0D8] flex flex-col flex-shrink-0" style={{ borderTopWidth: '1.5px', height: chatOpen ? 240 : 'auto' }}>
                 <div className="px-4 py-2 flex items-center gap-2 flex-shrink-0">
                   <span className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Team chat</span>
+                  {!chatOpen && teamChat.length > seenChat && (
+                    <span className="text-[10px] font-bold text-white bg-[#7C3AED] rounded-full px-1.5">{teamChat.length - seenChat} new</span>
+                  )}
                   <span className="text-[10px] text-[#9A948E]">
                     · not seen by any coach{condition?.team_chat_logging === 'content'
                       ? ' · recorded for research'
@@ -1196,7 +1633,13 @@ export default function CoachWorkspace() {
                         ? ' · timing logged for research, not text'
                         : ''}
                   </span>
+                  <button type="button" onClick={() => { if (chatOpen) setSeenChat(teamChat.length); setChatOpen(!chatOpen) }}
+                          aria-expanded={chatOpen}
+                          className="ml-auto text-[11px] font-bold text-[#6B6560] underline cursor-pointer bg-transparent border-0 flex-shrink-0">
+                    {chatOpen ? 'Hide' : 'Show'}
+                  </button>
                 </div>
+                {chatOpen && (<>
                 <div className="flex-1 overflow-y-auto px-4 pb-2 flex flex-col gap-2">
                   {teamChat.length === 0 && (
                     <div className="text-[12px] text-[#9A948E] italic">Talk to your teammates here.</div>
@@ -1206,13 +1649,25 @@ export default function CoachWorkspace() {
                       <div className={`max-w-[85%] px-3 py-1.5 rounded-[10px] text-[12px] ${
                         m.isSelf ? 'bg-[#EDE9FE] text-[#16120E]' : 'bg-[#F7F3EE] text-[#16120E]'}`}>
                         {!m.isSelf && <div className="text-[10px] font-bold text-[#6B6560] mb-0.5">{m.senderName}</div>}
-                        <span className="whitespace-pre-wrap">{m.content}</span>
+                        {m.attachments?.length > 0 && (
+                          <div className={`flex flex-wrap gap-1 ${m.content ? 'mb-1' : ''}`}>
+                            {m.attachments.map((a, j) => <FileChip key={a.id || j} file={a} groupId={groupId} />)}
+                          </div>
+                        )}
+                        {m.content && <span className="whitespace-pre-wrap">{m.content}</span>}
                       </div>
                     </div>
                   ))}
                   <div ref={teamEndRef} />
                 </div>
+                {(teamFiles.files.length > 0 || teamFiles.notice) && (
+                  <div className="px-3 pt-2 flex-shrink-0">
+                    <PendingFiles files={teamFiles.files} onRemove={teamFiles.remove} notice={teamFiles.notice} />
+                  </div>
+                )}
                 <div className="p-3 flex gap-2 flex-shrink-0">
+                  <AttachButton onFiles={teamFiles.add} disabled={sessionEnded || connStatus !== 'connected'}
+                                label="Share a file with your team" compact />
                   <input
                     value={teamInput}
                     onChange={e => setTeamInput(e.target.value)}
@@ -1222,11 +1677,12 @@ export default function CoachWorkspace() {
                     className="flex-1 px-3 py-1.5 text-[12px] bg-white border border-[#E7E0D8] rounded-[8px] focus:outline-none focus:border-[#7C3AED] disabled:opacity-60"
                     style={{ borderWidth: '1.5px' }}
                   />
-                  <button onClick={sendTeamChat} disabled={sessionEnded || !teamInput.trim() || connStatus !== 'connected'}
+                  <button onClick={sendTeamChat} disabled={sessionEnded || (!teamInput.trim() && !teamFiles.files.length) || connStatus !== 'connected'}
                           className="px-3 py-1.5 text-[12px] font-bold text-white bg-[#7C3AED] rounded-[8px] disabled:opacity-40 cursor-pointer">
                     Send
                   </button>
                 </div>
+                </>)}
               </div>
             </div>
           )}
