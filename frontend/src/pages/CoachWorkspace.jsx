@@ -86,27 +86,31 @@ export function originFor(draft, copied, pasted) {
 
 /* ───────────────────────── One artifact section ───────────────────────── */
 
-export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen, guide, focusRequest, onFocusSeen, variant }) {
+export function Section({ section, isMine, editorName, onExpand, onCollapse, onSave, conflict, onDismissConflict, justUpdatedBy, saveResult, readOnly, coachReplies = [], insertRequest, onInsertSeen, guide, focusRequest, onFocusSeen, variant, draftStore }) {
   const page = variant === 'page'
+  // An unsaved draft left by this section's previous mount: switching between
+  // the side panel and the full-document view, or closing the panel, unmounts
+  // every section, and the draft would otherwise go with it.
+  const [stashed] = useState(() => draftStore?.current.get(section.key))
   // Page view: Write / Preview, so a student sees the formatted result before
   // it goes into the document everyone reads.
   const [preview, setPreview] = useState(false)
-  const [open, setOpen] = useState(false)
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(section.content || '')
+  const [open, setOpen] = useState(!!stashed)
+  const [editing, setEditing] = useState(!!stashed)
+  const [draft, setDraft] = useState(stashed ? stashed.draft : (section.content || ''))
   const [saving, setSaving] = useState(false)
   // The version this draft was started from. It must NOT be read from
   // section.version at save time: a teammate's save updates that live, so a
   // stale draft would claim to be current and overwrite their work unchallenged.
-  const [baseVersion, setBaseVersion] = useState(section.version)
+  const [baseVersion, setBaseVersion] = useState(stashed ? stashed.baseVersion : section.version)
   // The text we last sent, so a conflict can hand it back.
   const sentDraft = useRef('')
   // Why the last save did not land (offline, refused by the server). The
   // editor stays open with the draft in it whenever this is set.
   const [saveError, setSaveError] = useState(null)
   // Coach text that entered this draft: by "Copy to document", or pasted.
-  const copiedChunks = useRef([])
-  const pastedChunks = useRef([])
+  const copiedChunks = useRef(stashed?.copied || [])
+  const pastedChunks = useRef(stashed?.pasted || [])
   // Whether THIS mounted editor has a save waiting for its answer. Answers and
   // conflicts live in the parent, which outlives us: closing the document panel
   // unmounts every section, and on remount the last answer would replay —
@@ -114,6 +118,23 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   // under an old error. Only answers to our own sends apply.
   const awaitingSave = useRef(false)
   const rootRef = useRef(null)
+
+  // Hand an open draft back to the parent on unmount; anything else clears
+  // the slot. A draft whose save is in flight is not kept: it is on its way,
+  // and its answer or conflict arrives through the parent as usual.
+  const live = useRef(null)
+  live.current = { editing, draft, baseVersion, readOnly }
+  useEffect(() => () => {
+    if (!draftStore) return
+    const { editing, draft, baseVersion, readOnly } = live.current
+    if (editing && !readOnly && !awaitingSave.current) {
+      draftStore.current.set(section.key, {
+        draft, baseVersion, copied: copiedChunks.current, pasted: pastedChunks.current,
+      })
+    } else {
+      draftStore.current.delete(section.key)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // Follow the server's copy while not actively editing, so a teammate's edit
@@ -473,6 +494,8 @@ export default function CoachWorkspace() {
   const [docMode, setDocMode]         = useState(false)
   const [coachHidden, setCoachHidden] = useState(false)
   const docReadKeys = useRef(new Set())
+  // Unsaved section drafts, kept across Section remounts (see Section).
+  const sectionDrafts = useRef(new Map())
   // Team chat can fold down to its header to give the document the height.
   // `seenChat` is how many messages there were when it was folded.
   const [chatOpen, setChatOpen]       = useState(true)
@@ -951,17 +974,21 @@ export default function CoachWorkspace() {
     teamFiles.clear()
   }, [teamInput, teamFiles, myName])
 
+  // Failures go to endError: the review screen is not open yet, so the header
+  // is the only place to say so. Resolves to whether the review opened.
   const startReview = useCallback(async () => {
     setReviewError('')
     try {
       const r = await fetch(`${API_URL}/groups/${groupId}/sessions/${sessionNum}/review`,
         { method: 'POST', headers: authHeaders() })
-      if (!r.ok) { setEndError(await readApiError(r, 'Could not start the final review')); return }
+      if (!r.ok) { setEndError(await readApiError(r, 'Could not start the final review')); return false }
       setReview(await r.json())
       setRevNotice('')
       setReviewOpen(true)
+      return true
     } catch {
       setEndError('Could not reach the server. Try again.')
+      return false
     }
   }, [groupId, sessionNum])
 
@@ -1034,7 +1061,9 @@ export default function CoachWorkspace() {
     if (remainingMs > 0 && remainingMs <= 5 * 60000) {
       autoReviewRef.current = true
       if (!review?.started_at) {
-        startReview().then(() => setRevNotice('Five minutes left. Finish the document and mark yourself ready.'))
+        startReview().then(opened => {
+          if (opened) setRevNotice('Five minutes left. Finish the document and mark yourself ready.')
+        })
       }
     }
   }, [remainingMs, timeLimit, sessionEnded, review, startReview])
@@ -1582,6 +1611,7 @@ export default function CoachWorkspace() {
                               guide={guides[s.key]}
                               focusRequest={focusReq?.key === s.key ? focusReq : null}
                               onFocusSeen={(n) => setFocusReq(r => (r && r.n === n ? null : r))}
+                              draftStore={sectionDrafts}
                             />
                           </div>
                         ))}
@@ -1609,6 +1639,7 @@ export default function CoachWorkspace() {
                     guide={guides[s.key]}
                     focusRequest={focusReq?.key === s.key ? focusReq : null}
                     onFocusSeen={(n) => setFocusReq(r => (r && r.n === n ? null : r))}
+                    draftStore={sectionDrafts}
                   />
                 ))}
               </div>
