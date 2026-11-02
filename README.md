@@ -110,6 +110,10 @@ The result is stored on `UserChallengeSession.session_analysis` as a status blob
 
 A per-assignment study mode (instructor **Study settings**) comparing a solo control arm (chat with the score feed, optionally hidden per session, optional required revision) against a collaborative arm: each team member has a private coach over `/ws/coach`, the team shares one sectioned document (the *artifact*, `backend/artifacts.py`) and a team chat, and every action — writes, reads, coach turns, peer reviews, contested-answer choices — is written to one ordered event log (`study_events`, `backend/events.py`). Behaviour is derived from that log, never self-reported. Instructors get turn-taking metrics, routed peer review, scripted contested answers, a per-assignment reference corpus, and a de-identified per-session export.
 
+**Finishing a team session.** Any member can open the *final review* (`POST /groups/{id}/sessions/{n}/review`, `frontend/src/components/FinalReview.jsx`): everyone sees the whole document against each section's brief and target length (the instructor's `prompt`/`target_words` in `artifact_sections`), and each member who took part marks it ready (`/ready`). Any edit withdraws every mark, in the same transaction as the write. The last mark ends the session with `end_reason="team_ready"`; a timed session opens the review automatically five minutes before the deadline.
+
+**Submissions.** However a team session ends, `backend/submissions.py` freezes the document and the AI team score (the equal-weight mean of each student's average PEI, see `docs/metrics-codebook.md`) into a `TeamSubmission`. A turn scored late, after the end, updates that AI score. Instructors list, grade (their score overrides the AI's, which is kept) and download submissions as PDF or a zip; students read and download their own team's.
+
 Read before changing any of it:
 
 - [docs/collab-study-pending.md](docs/collab-study-pending.md) — what is built, what is blocked on the PI
@@ -173,9 +177,9 @@ ORM definitions: `backend/database.py`.
 
 **challenges** - `id`, `title`, `description`, `category`, `difficulty`, `week`, `total_sessions`, `sessions_data` (JSON), `is_active`, `status`, `created_by_user_id`, `created_at`, `updated_at`
 
-**user_challenge_sessions** - per-user progress per challenge session; links optionally to `conversation_id`, tracks `status`, `best_pei`, `session_avg_pei`, `end_reason` (`timer_expired` | `manual`, decided server-side), `session_analysis` (JSON status blob), timestamps
+**user_challenge_sessions** - per-user progress per challenge session; links optionally to `conversation_id`, tracks `status`, `best_pei`, `session_avg_pei`, `end_reason` (`timer_expired` | `manual`, decided server-side; team sessions also `team_ready`), `session_analysis` (JSON status blob), timestamps
 
-**Collaborative study** - `group_challenges`, `group_members`, `group_sessions`, `group_chat_messages` (teams and their sessions); `artifacts`, `artifact_sections`, `artifact_revisions` (the shared document, append-only); `study_events` (the ordered event log); `verification_assignments`, `verification_responses`, `review_pairings` (peer review); `contested_pairs`, `contested_responses`; `reference_corpora`, `corpus_documents`. Study settings live on `classroom_challenges` (`study_arm`, `coach_prominence`, `verification_policy`, `revision_policy`, `team_chat_logging`, `reference_corpus_id`).
+**Collaborative study** - `group_challenges`, `group_members`, `group_sessions`, `group_chat_messages`, `group_chat_attachments` (teams and their sessions); `review_ready_marks` (final review); `team_submissions` (what each team handed in, with the instructor's grade); `artifacts`, `artifact_sections`, `artifact_revisions` (the shared document, append-only); `study_events` (the ordered event log); `verification_assignments`, `verification_responses`, `review_pairings` (peer review); `contested_pairs`, `contested_responses`; `reference_corpora`, `corpus_documents`. Study settings live on `classroom_challenges` (`study_arm`, `coach_prominence`, `verification_policy`, `revision_policy`, `team_chat_logging`, `reference_corpus_id`).
 
 ---
 
@@ -190,7 +194,8 @@ Not exhaustive; see FastAPI OpenAPI at `/docs` when the server is running.
 | Classrooms | `GET /classrooms/me`, `POST /classrooms`, `POST /classrooms/join`, `GET /classrooms/browse`, `PATCH /classrooms/{id}`, `GET /classrooms/{id}/summary`, `GET /classrooms/{id}/challenges`, `GET /classrooms/{id}/analytics`, `PATCH /classrooms/assignments/{id}/study` |
 | Conversations | `POST /conversations/{id}/end`, `GET /conversations/{id}/export` (Markdown transcript with per-turn scores, owner only), `GET /conversations/{id}/analysis`, `POST /conversations/{id}/analysis/retry` |
 | Teams (instructor) | `/classrooms/{cid}/challenges/{chid}/teams/*` — teams and members, analytics, turn-taking, sessions, reviews, review pairings, contested pairs |
-| Study | `/groups/*` (team sessions, end, analysis), `/verification/*` (peer review), `/contested/*`, `/corpus/*` |
+| Submissions | `GET /groups/{id}/sessions/{n}/submission[/pdf]` (student), `/classrooms/{cid}/challenges/{chid}/submissions*` (instructor: list, view, grade, PDF, zip) |
+| Study | `/groups/*` (team sessions, final review and ready marks, end, analysis, team-chat attachments), `/verification/*` (peer review), `/contested/*`, `/corpus/*` |
 | Research export | `GET /research/sessions/{id}/export?format=json\|jsonl[&include_unconsented=true]` (de-identified per-session bundle, instructor/admin), `GET /research/sessions/{id}/turn-taking` |
 | Admin | `/admin/overview`, `/admin/users`, `/admin/classrooms/{id}`, `/admin/benchmark/*`, `GET /admin/export/conversations?format=json\|csv` (de-identified per-turn export, consented only by default) |
 | Realtime | `WebSocket /ws` (solo), `/ws/coach` (collaborative study), `/ws/group` (legacy shared-coach team room) |
@@ -219,7 +224,7 @@ Pre-pilot HTTP path only: `python scripts/e2e_pre_pilot_http.py`. WebSocket + li
 
 **Redis tests** (skipped unless `REDIS_URL` points at a reachable server): see [docs/multi-worker-deploy.md](docs/multi-worker-deploy.md#running-the-redis-tests).
 
-**Live keys (optional):** `python scripts/verify_external_ai.py` loads `backend/.env` and checks Gemini, OpenAI, vector store `GET`, and one full evaluation (set `VERIFY_SKIP_EVAL=1` to skip the eval call). Does not print secrets. Note: that eval call still imports the older `evaluator.py`, not the live `evaluator_v3.py`, so it proves the keys and vector store work but does not exercise the live judge panel.
+**Live keys (optional):** `python scripts/verify_external_ai.py` loads `backend/.env` and checks Gemini, OpenAI, vector store `GET`, and one full evaluation (set `VERIFY_SKIP_EVAL=1` to skip the eval call). Does not print secrets. The eval call runs the live `evaluator_v3.py` judge panel.
 
 ### Frontend
 

@@ -190,6 +190,12 @@ session_avg_pei = mean( avg_pei(student) for each student with ≥1 scored turn 
 A student who produced no scored turn has no average and is **not counted** —
 they neither raise nor lower the team figure.
 
+Displayed and submitted figures round the unrounded mean **once**, to one
+decimal; the stored `GroupSession.session_avg_pei` keeps two. A turn scored
+late (after the session ended) is included: the end summary and the Progress
+page recompute live, and the team's `TeamSubmission.ai_score` is recomputed
+when the late score lands.
+
 It is always reported with its spread, `pei_range = {min, max}`, the lowest and
 highest per-student average on the team. A lone number can hide a split team
 (one strong student, one struggling); the range makes that visible.
