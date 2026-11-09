@@ -4158,7 +4158,7 @@ async def set_review_ready(
         # Re-check under the session row lock that a document write also takes
         # (artifacts._write_once), so a write still in flight either lands
         # first and withdraws the marks, or waits for the end and is refused.
-        await db.execute(select(GroupSession.id).where(GroupSession.id == gs.id).with_for_update())
+        await db.execute(select(GroupSession.id).where(GroupSession.id == gs.id).with_for_update(key_share=True))
         state = await _review_state(db, gs)
     if state["all_ready"]:
         private = await _private_coach_conversations(db, gs.id)

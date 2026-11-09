@@ -28,7 +28,7 @@ import difflib
 import logging
 from datetime import datetime
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import (
@@ -374,14 +374,17 @@ async def _write_once(
         # either the write commits first and the submitted snapshot includes it,
         # or the session is already completed and the write is refused. The
         # caller's own ended check runs before this and cannot close that gap.
-        open_session = await db.execute(
-            update(GroupSession)
-            .where(GroupSession.id == group_session_id, GroupSession.status != "completed")
-            .values(status=GroupSession.status)
-            .returning(GroupSession.review_started_at)
-        )
-        claimed = open_session.first()
-        if claimed is None:
+        # A row lock, not an UPDATE: a no-op UPDATE writes a new row version,
+        # and under load Postgres refused those ("new multixact has more than
+        # one updating member"). NO KEY UPDATE still conflicts with the end
+        # path's status UPDATE but not with foreign-key checks on child rows.
+        # After waiting, Postgres returns the row as the end left it.
+        claimed = (await db.execute(
+            select(GroupSession.status, GroupSession.review_started_at)
+            .where(GroupSession.id == group_session_id)
+            .with_for_update(key_share=True)
+        )).first()
+        if claimed is None or claimed.status == "completed":
             return {"ok": False, "error": "session_ended",
                     "message": "This session has ended, so the document can no longer be changed."}
 
