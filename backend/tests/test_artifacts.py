@@ -470,7 +470,7 @@ async def test_a_cross_worker_version_race_conflicts_instead_of_losing_an_edit(d
     constraint must turn it into the ordinary conflict (current text returned to
     rebase against), never a silently dropped revision."""
     import artifacts
-    from database import ArtifactRevision, ArtifactSection, AsyncSessionLocal
+    from database import Artifact, ArtifactRevision, ArtifactSection, AsyncSessionLocal
     from sqlalchemy import select
 
     gs = await _make_group_session()
@@ -491,9 +491,9 @@ async def test_a_cross_worker_version_race_conflicts_instead_of_losing_an_edit(d
     # in the way is UNIQUE(section_id, version).
     async with AsyncSessionLocal() as db:
         section = (await db.execute(
-            select(ArtifactSection).where(ArtifactSection.key == key)
-            .order_by(ArtifactSection.updated_at.desc())
-        )).scalars().first()
+            select(ArtifactSection).join(Artifact, Artifact.id == ArtifactSection.artifact_id)
+            .where(Artifact.group_session_id == gs, ArtifactSection.key == key)
+        )).scalar_one()
         db.add(ArtifactRevision(
             artifact_id=section.artifact_id, section_id=section.id, section_key=key,
             version=2, content="the other worker's text", author_user_id=b,
