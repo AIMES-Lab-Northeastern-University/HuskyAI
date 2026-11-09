@@ -470,7 +470,7 @@ async def test_a_cross_worker_version_race_conflicts_instead_of_losing_an_edit(d
     constraint must turn it into the ordinary conflict (current text returned to
     rebase against), never a silently dropped revision."""
     import artifacts
-    from database import ArtifactRevision, ArtifactSection, AsyncSessionLocal
+    from database import Artifact, ArtifactRevision, ArtifactSection, AsyncSessionLocal
     from sqlalchemy import select
 
     gs = await _make_group_session()
@@ -491,9 +491,9 @@ async def test_a_cross_worker_version_race_conflicts_instead_of_losing_an_edit(d
     # in the way is UNIQUE(section_id, version).
     async with AsyncSessionLocal() as db:
         section = (await db.execute(
-            select(ArtifactSection).where(ArtifactSection.key == key)
-            .order_by(ArtifactSection.updated_at.desc())
-        )).scalars().first()
+            select(ArtifactSection).join(Artifact, Artifact.id == ArtifactSection.artifact_id)
+            .where(Artifact.group_session_id == gs, ArtifactSection.key == key)
+        )).scalar_one()
         db.add(ArtifactRevision(
             artifact_id=section.artifact_id, section_id=section.id, section_key=key,
             version=2, content="the other worker's text", author_user_id=b,
@@ -563,3 +563,54 @@ async def test_unchanged_save_from_a_stale_draft_still_conflicts(db_ready):
                                         author_user_id=b, expected_version=1)
 
     assert not res["ok"] and res["conflict"] and res["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_section_over_the_size_limit_is_refused_and_nothing_is_stored(db_ready):
+    import artifacts
+
+    gs = await _make_group_session()
+    await artifacts.get_or_create(gs)
+    writer = await _make_user()
+    k = artifacts.IMPLICIT_SECTION_KEY
+    limit = artifacts.MAX_SECTION_CHARS
+
+    refused = await artifacts.write_section(
+        group_session_id=gs, section_key=k, content="x" * (limit + 1),
+        author_user_id=writer, expected_version=0,
+    )
+    assert refused["ok"] is False and refused["error"] == "section_too_long"
+    assert refused["limit"] == limit and "Shorten it" in refused["message"]
+    # No version was spent, so the writer's next save still expects version 0.
+    at_limit = await artifacts.write_section(
+        group_session_id=gs, section_key=k, content="x" * limit,
+        author_user_id=writer, expected_version=0,
+    )
+    assert at_limit["ok"] is True and at_limit["version"] == 1
+
+
+def test_the_coach_sees_the_whole_document_while_it_fits_the_budget():
+    from main import _artifact_prompt_block
+
+    snap = {"sections": [{"key": "a", "title": "A", "content": "short"},
+                         {"key": "b", "title": "B", "content": "also short"}]}
+    block, keys = _artifact_prompt_block(snap)
+    assert "short" in block and "also short" in block and "shortened" not in block
+    assert keys == ["a", "b"]
+
+
+def test_a_long_document_is_cut_to_the_budget_sharing_it_fairly():
+    from main import _COACH_ARTIFACT_BUDGET, _artifact_prompt_block, _fit_sections
+
+    # The short section keeps everything; the two long ones split the rest.
+    assert _fit_sections([100, 20_000, 20_000], 12_000) == [100, 5_950, 5_950]
+    snap = {"sections": [{"key": "a", "content": "s" * 100},
+                         {"key": "b", "content": "b" * 20_000},
+                         {"key": "c", "content": "c" * 20_000}]}
+    block, keys = _artifact_prompt_block(snap)
+    assert "## a\n" + "s" * 100 + "\n" in block
+    assert "b" * 5_950 + "\n[…shortened for length]" in block and "b" * 5_951 not in block
+    assert "c" * 5_950 + "\n[…shortened for length]" in block and "c" * 5_951 not in block
+    assert len(block) < _COACH_ARTIFACT_BUDGET + 1_000
+    # Shortened sections still reached the coach, so they are still logged as read.
+    assert keys == ["a", "b", "c"]

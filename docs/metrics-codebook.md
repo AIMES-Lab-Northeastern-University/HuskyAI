@@ -125,6 +125,19 @@ as a raw count in `totals`.
 `dwell` alone — `section_expand` carries the read signal — so an expired
 heartbeat degrades precision, not validity.
 
+**Whole-document reads carry `payload.via`.** Two views show every section's
+full text at once: the end-of-session final review (`via: "review"`) and the
+full-document view a student can switch to while writing (`via: "document"`).
+Opening either logs a `section_expand` for each non-empty section, marked with
+its `via`; in the full-document view a section a teammate fills in while it is
+open is logged when it appears. No `dwell` is recorded in these views.
+
+These are currently counted like any other read. Review reads cluster at the end of a session and
+document-view reads say less about attention than a deliberate click, so whether
+they should feed `read_before_write` and `median_write_to_read_ms` is a PI
+decision; excluding them is a filter on `payload.via`, and doing so is a
+definition change (version bump).
+
 **Null is not zero.** Every ratio returns `null` when its denominator is empty,
 rather than `0.0`. "No eligible writes" and "nobody read anything" are different
 findings and must not be collapsed.
@@ -176,6 +189,12 @@ session_avg_pei = mean( avg_pei(student) for each student with ≥1 scored turn 
 
 A student who produced no scored turn has no average and is **not counted** —
 they neither raise nor lower the team figure.
+
+Displayed and submitted figures round the unrounded mean **once**, to one
+decimal; the stored `GroupSession.session_avg_pei` keeps two. A turn scored
+late (after the session ended) is included: the end summary and the Progress
+page recompute live, and the team's `TeamSubmission.ai_score` is recomputed
+when the late score lands.
 
 It is always reported with its spread, `pei_range = {min, max}`, the lowest and
 highest per-student average on the team. A lone number can hide a split team

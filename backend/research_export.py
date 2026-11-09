@@ -44,7 +44,7 @@ log = logging.getLogger("research_export")
 
 router = APIRouter(prefix="/research", tags=["research"])
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 
 
 def export_filename(bundle: dict, fmt: str) -> str:

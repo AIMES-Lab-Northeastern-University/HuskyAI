@@ -143,6 +143,9 @@ export default function Challenges() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [activeFilter, setActiveFilter] = useState('All')
+  // Team or solo challenges. null until chosen: then it follows the default
+  // below, so it can settle once the challenge list has loaded.
+  const [kindChoice, setKindChoice] = useState(null)
 
   // Instructor state
   const [instructorSections, setInstructorSections] = useState([])
@@ -321,9 +324,19 @@ export default function Challenges() {
     border: '1.5px solid #E7E0D8', fontSize: '14px', background: '#fff',
   }
 
-  const categories = ['All', ...new Set(challenges.map(c => c.category))]
+  const teamChallenges = challenges.filter(c => c.group_mode)
+  const soloChallenges = challenges.filter(c => !c.group_mode)
+  const hasBothKinds = teamChallenges.length > 0 && soloChallenges.length > 0
+  // Open on Team while a team challenge is unfinished: that is the one a
+  // teammate may be waiting on. Otherwise whichever kind exists.
+  const kindTab = kindChoice
+    ?? (teamChallenges.some(c => c.sessions_completed < c.total_sessions) || !soloChallenges.length ? 'team' : 'solo')
+  const kindChallenges = hasBothKinds ? (kindTab === 'team' ? teamChallenges : soloChallenges) : challenges
+  const chooseKind = kind => { setKindChoice(kind); setActiveFilter('All') }
 
-  const filtered = challenges.filter(c => {
+  const categories = ['All', ...new Set(kindChallenges.map(c => c.category))]
+
+  const filtered = kindChallenges.filter(c => {
     if (activeFilter === 'All') return true
     if (activeFilter === 'Completed') return c.sessions_completed === c.total_sessions
     return c.category === activeFilter
@@ -380,8 +393,26 @@ export default function Challenges() {
 
           {pageTab === 'mine' && (
           <>
-          {/* Filter bar */}
-          <div style={{ display: 'flex', gap: '8px', marginBottom: '24px', flexWrap: 'wrap' }}>
+          {/* Filter bar: Team / Solo switch, then this kind's categories */}
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '24px', flexWrap: 'wrap', alignItems: 'center' }}>
+            {hasBothKinds && (
+              <div role="tablist" aria-label="Challenge type"
+                   style={{ display: 'inline-flex', padding: '3px', borderRadius: '10px', background: '#EFEAE4', marginRight: '8px' }}>
+                {[['team', 'Team', teamChallenges.length], ['solo', 'Solo', soloChallenges.length]].map(([key, label, n]) => (
+                  <button key={key} type="button" role="tab" aria-selected={kindTab === key} onClick={() => chooseKind(key)}
+                          style={{
+                            padding: '6px 14px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+                            fontSize: '13px', fontWeight: kindTab === key ? 700 : 500,
+                            background: kindTab === key ? '#FDFCFB' : 'transparent',
+                            color: kindTab === key ? '#16120E' : '#6B6560',
+                            boxShadow: kindTab === key ? '0 1px 3px rgba(22,18,14,0.12)' : 'none',
+                          }}>
+                    {label}
+                    <span style={{ marginLeft: '6px', fontSize: '11px', fontWeight: 700, color: kindTab === key ? '#C8102E' : '#9A948E' }}>{n}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             {filters.map(f => (
               <button
                 key={f}
@@ -449,6 +480,10 @@ export default function Challenges() {
             </div>
           )}
 
+          {!loading && !error && challenges.length > 0 && filtered.length === 0 && (
+            <div style={{ fontSize: '13px', color: '#9A948E', paddingTop: '8px' }}>No challenges match this filter.</div>
+          )}
+
           {/* Challenge grid */}
           {!loading && !error && filtered.length > 0 && (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
@@ -501,7 +536,7 @@ export default function Challenges() {
                           Test preview
                         </span>
                       )}
-                      {c.group_mode && (
+                      {c.group_mode && !hasBothKinds && (
                         <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#EDE9FE', color: '#7C3AED', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                           Group
                         </span>

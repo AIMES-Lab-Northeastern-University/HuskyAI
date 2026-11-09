@@ -35,10 +35,28 @@ async def _make_user(consent: bool = False) -> str:
         return user.id
 
 
-def _solo_scope() -> str:
-    """A synthetic session id. The FK is not enforced on SQLite, and these tests
-    are about seq allocation, not referential integrity."""
-    return f"ucs_{uuid.uuid4().hex[:12]}"
+async def _solo_scope() -> str:
+    """A real, empty solo session to scope events to. These tests are about seq
+    allocation, but Postgres enforces the foreign key that SQLite does not."""
+    from database import AsyncSessionLocal, UserChallengeSession
+
+    challenge_id = await _make_challenge()
+    async with AsyncSessionLocal() as db:
+        ucs = UserChallengeSession(user_id=await _make_user(), challenge_id=challenge_id, session_number=1)
+        db.add(ucs)
+        await db.commit()
+        return ucs.id
+
+
+async def _make_challenge() -> str:
+    from database import AsyncSessionLocal, Challenge
+
+    async with AsyncSessionLocal() as db:
+        ch = Challenge(title="Events", description="d", category="c", difficulty="easy",
+                       total_sessions=1, is_active=True, sessions_data=[{"title": "S"}])
+        db.add(ch)
+        await db.commit()
+        return ch.id
 
 
 async def _events_for(scope_id: str) -> list:
@@ -62,7 +80,7 @@ async def test_seq_is_gapless_and_ordered_under_concurrency(db_ready):
     "did they read before they wrote?" unanswerable for that session."""
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user()
 
     await asyncio.gather(*[
@@ -86,7 +104,7 @@ async def test_reads_and_writes_share_one_sequence_space(db_ready):
     property that makes read-before-write measurable."""
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user()
 
     await log_event(action="write", target="artifact", user_challenge_session_id=scope, actor_user_id=actor)
@@ -100,7 +118,7 @@ async def test_reads_and_writes_share_one_sequence_space(db_ready):
 async def test_sessions_have_independent_sequence_spaces(db_ready):
     from events import log_event
 
-    scope_a, scope_b = _solo_scope(), _solo_scope()
+    scope_a, scope_b = await _solo_scope(), await _solo_scope()
     actor = await _make_user()
 
     for _ in range(3):
@@ -117,7 +135,7 @@ async def test_duplicate_delivery_is_deduped_without_burning_a_seq(db_ready):
     must not leave a hole in the sequence that looks like a dropped event."""
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user()
     key = f"idem_{uuid.uuid4().hex[:12]}"
 
@@ -144,7 +162,7 @@ async def test_client_ts_is_preserved_but_not_used_for_ordering(db_ready):
 
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user()
     old = datetime.utcnow() - timedelta(minutes=5)
 
@@ -169,7 +187,7 @@ async def test_consent_is_snapshotted_per_row(db_ready):
     from database import AsyncSessionLocal, User
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user(consent=True)
 
     await log_event(action="open", target="artifact", user_challenge_session_id=scope, actor_user_id=actor)
@@ -190,7 +208,7 @@ async def test_coach_reads_are_distinguishable_from_human_opens(db_ready):
     their human opens — they answer different questions (open question 4)."""
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user()
 
     await log_event(
@@ -213,7 +231,7 @@ async def test_malformed_events_are_rejected_not_silently_miscategorised(db_read
     drop and log loudly than to write a row nobody will find."""
     from events import log_event
 
-    scope = _solo_scope()
+    scope = await _solo_scope()
     actor = await _make_user()
 
     assert await log_event(
@@ -241,7 +259,7 @@ async def test_logging_failure_never_breaks_the_caller(db_ready):
     # payload is JSON-serialised on write; a non-serialisable value fails at commit.
     result = await log_event(
         action="open", target="artifact",
-        user_challenge_session_id=_solo_scope(),
+        user_challenge_session_id=await _solo_scope(),
         payload={"bad": object()},
     )
     assert result is None
@@ -259,13 +277,14 @@ async def test_solo_turn_save_emits_a_coach_turn_event(db_ready):
     from main import _save_turn
 
     actor = await _make_user()
+    challenge_id = await _make_challenge()
     async with AsyncSessionLocal() as db:
         conv = Conversation(user_id=actor)
         db.add(conv)
         await db.flush()
         ucs = UserChallengeSession(
             user_id=actor,
-            challenge_id=f"ch_{uuid.uuid4().hex[:8]}",
+            challenge_id=challenge_id,
             session_number=1,
             conversation_id=conv.id,
         )
@@ -350,7 +369,7 @@ def test_two_event_loops_still_produce_one_gapless_sequence(db_ready):
 
     from events import log_event
 
-    session_id = _solo_scope()
+    session_id = asyncio.run(_solo_scope())
     actor = asyncio.run(_make_user())
 
     errors: list[BaseException] = []

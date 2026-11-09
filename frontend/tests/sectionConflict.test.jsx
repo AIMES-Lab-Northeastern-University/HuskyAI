@@ -67,3 +67,45 @@ describe('Section save', () => {
     expect(onSave).toHaveBeenLastCalledWith('evidence', 'my draft', 2, 'student_typed')
   })
 })
+
+describe('Section draft across remounts', () => {
+  // Switching between the side panel and the full-document view mounts a new
+  // Section; an open draft must survive the switch, from the version it started on.
+  // One render that unmounts the old Section and mounts a new one, as the
+  // app's view switch does: React renders the new one before the old one's
+  // cleanup runs, which is what lost drafts when they were saved on unmount.
+  let generation = 0
+  const remount = (props) => {
+    generation += 1
+    act(() => {
+      root.render(<Section key={generation} section={base} isMine={false} editorName="Cleo"
+        onExpand={() => {}} onCollapse={() => {}} onSave={() => {}}
+        onDismissConflict={() => {}} {...props} />)
+    })
+  }
+
+  it('keeps an unsaved draft and its base version', () => {
+    const onSave = vi.fn()
+    const draftStore = { current: new Map() }
+    render({ onSave, draftStore })
+    click(button('Evidence'))
+    click(button('Edit'))
+    type('half-written')
+    remount({ onSave, draftStore, section: { ...base, content: 'their v2', version: 2 } })
+    expect(container.querySelector('textarea').value).toBe('half-written')
+    click(button('Save'))
+    expect(onSave).toHaveBeenCalledWith('evidence', 'half-written', 1, 'student_typed')
+  })
+
+  it('keeps nothing once the editor was closed', () => {
+    const draftStore = { current: new Map() }
+    render({ draftStore })
+    click(button('Evidence'))
+    click(button('Edit'))
+    type('discard me')
+    click(button('Cancel'))
+    remount({ draftStore })
+    expect(container.querySelector('textarea')).toBeNull()
+    expect(draftStore.current.size).toBe(0)
+  })
+})

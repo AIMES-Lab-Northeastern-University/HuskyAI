@@ -21,3 +21,7 @@ frontend/dist/
 Thumbs.db
 
 /.*
+
+# Local leftovers
+*.bak
+.Rhistory

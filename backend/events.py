@@ -11,6 +11,9 @@ same number loses its INSERT and retries with a fresh one. There is deliberately
 no in-process lock — a lock only orders the writers inside one Uvicorn worker,
 so it is both insufficient (two workers still collide) and misleading (it reads
 as if the ordering were guaranteed in memory). The constraint is the guarantee.
+On Postgres, allocators for one scope also queue on a transaction-scoped
+advisory lock (database.lock_for_create), which every worker shares, so a busy
+session waits briefly instead of exhausting its retries.
 
 Deliberately NOT a Redis INCR either. Redis is a cache in this deployment, and a
 flush would replay sequence numbers into what is meant to be a permanent
@@ -26,7 +29,7 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from database import AsyncSessionLocal, StudyEvent, User
+from database import AsyncSessionLocal, StudyEvent, User, lock_for_create
 
 log = logging.getLogger("study_events")
 
@@ -126,6 +129,12 @@ async def add_event_in(
         else StudyEvent.user_challenge_session_id
     )
     scope_val = group_session_id or user_challenge_session_id
+    # Writers to one session take their number in turn. Without this, W
+    # concurrent writers all read the same MAX, one wins each round, and the
+    # rest burn retries: on Postgres 20 at once lost 6 to 12 events outright.
+    # Cross-worker, released at commit, and a no-op on SQLite, which already
+    # admits one writer at a time. The UNIQUE constraint is still the guarantee.
+    await lock_for_create(db, f"study_seq:{scope_val}")
     current_max = (
         await db.execute(select(func.max(StudyEvent.seq)).where(scope_col == scope_val))
     ).scalar()

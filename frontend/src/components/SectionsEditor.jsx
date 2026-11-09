@@ -51,6 +51,10 @@ export function sectionsProblem(sections) {
     if (seen.has(key)) return `Duplicate key "${key}" — keys must be unique`
     seen.add(key)
     if (!(s.title || '').trim()) return `Section "${key}" needs a title`
+    const t = s.target_words
+    if (t !== '' && t != null && !(Number.isInteger(Number(t)) && Number(t) >= 10 && Number(t) <= 5000)) {
+      return `Section "${key}": target length must be a whole number of words between 10 and 5000`
+    }
   }
   return ''
 }
@@ -62,7 +66,7 @@ export default function SectionsEditor({ sections, onChange, disabled }) {
     const next = rows.map((r, idx) => (idx === i ? { ...r, [field]: value } : r))
     onChange(next)
   }
-  const add = () => onChange([...rows, { key: '', title: '', prompt: '' }])
+  const add = () => onChange([...rows, { key: '', title: '', prompt: '', target_words: '' }])
   const remove = (i) => onChange(rows.filter((_, idx) => idx !== i))
 
   const problem = sectionsProblem(rows)
@@ -70,9 +74,11 @@ export default function SectionsEditor({ sections, onChange, disabled }) {
   return (
     <div style={{ display: 'grid', gap: '8px' }}>
       <div style={{ fontSize: '11px', color: '#9A948E' }}>
-        Shared artifact sections (optional). Anyone on the team can edit any
-        section, even at the same time; if two saves collide, the later one is
-        handed back to merge instead of overwriting. Leave empty for no artifact.
+        Sections of the team's final document (optional) — this is what each
+        team submits. Tell students what goes in each section and roughly how
+        long it should be: they see it while writing, and the final review flags
+        sections that are empty or well short. Anyone on the team can edit any
+        section. Leave empty for no shared document.
       </div>
 
       {rows.length === 0 && (
@@ -81,49 +87,67 @@ export default function SectionsEditor({ sections, onChange, disabled }) {
         </div>
       )}
 
+      {rows.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(80px, 1fr) minmax(120px, 2fr) minmax(90px, 0.9fr) auto', gap: '6px', padding: '0 9px', fontSize: '10px', fontWeight: 700, color: '#9A948E', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+          <span>Key</span><span>Title</span><span>Target words</span><span style={{ width: '62px' }} />
+        </div>
+      )}
+
       {rows.map((s, i) => (
-        <div
-          key={i}
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'minmax(90px, 1fr) minmax(120px, 1.4fr) minmax(140px, 2fr) auto',
-            gap: '6px',
-            alignItems: 'start',
-          }}
-        >
-          <input
-            type="text"
-            placeholder="key"
-            value={s.key || ''}
-            disabled={disabled}
-            onChange={(e) => update(i, 'key', e.target.value)}
-            style={input}
-          />
-          <input
-            type="text"
-            placeholder="Title"
-            value={s.title || ''}
-            disabled={disabled}
-            onChange={(e) => update(i, 'title', e.target.value)}
-            style={input}
-          />
-          <input
-            type="text"
-            placeholder="Prompt shown to the team (optional)"
+        <div key={i} style={{ display: 'grid', gap: '6px', padding: '8px', border: '1px solid #F0EBE4', borderRadius: '9px', background: '#fff' }}>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(80px, 1fr) minmax(120px, 2fr) minmax(90px, 0.9fr) auto',
+              gap: '6px',
+              alignItems: 'start',
+            }}
+          >
+            <input
+              type="text"
+              placeholder="key"
+              value={s.key || ''}
+              disabled={disabled}
+              onChange={(e) => update(i, 'key', e.target.value)}
+              style={input}
+            />
+            <input
+              type="text"
+              placeholder="Title"
+              value={s.title || ''}
+              disabled={disabled}
+              onChange={(e) => update(i, 'title', e.target.value)}
+              style={input}
+            />
+            <input
+              type="number"
+              min={10}
+              max={5000}
+              placeholder="~words"
+              title="Roughly how many words a finished section should have"
+              value={s.target_words ?? ''}
+              disabled={disabled}
+              onChange={(e) => update(i, 'target_words', e.target.value)}
+              style={input}
+            />
+            <button
+              type="button"
+              onClick={() => remove(i)}
+              disabled={disabled}
+              style={{ ...btn, color: '#C8102E' }}
+              aria-label={`Remove section ${s.key || i + 1}`}
+            >
+              Remove
+            </button>
+          </div>
+          <textarea
+            rows={2}
+            placeholder="What should this section contain? e.g. State your recommendation and the two strongest pieces of evidence."
             value={s.prompt || ''}
             disabled={disabled}
             onChange={(e) => update(i, 'prompt', e.target.value)}
-            style={input}
+            style={{ ...input, resize: 'vertical' }}
           />
-          <button
-            type="button"
-            onClick={() => remove(i)}
-            disabled={disabled}
-            style={{ ...btn, color: '#C8102E' }}
-            aria-label={`Remove section ${s.key || i + 1}`}
-          >
-            Remove
-          </button>
         </div>
       ))}
 

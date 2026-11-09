@@ -28,7 +28,7 @@ import difflib
 import logging
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import (
@@ -38,6 +38,7 @@ from database import (
     AsyncSessionLocal,
     GroupChallenge,
     GroupSession,
+    ReviewReadyMark,
     User,
 )
 from events import EventResult, add_event_in, record_event
@@ -63,6 +64,18 @@ COACH_ORIGINS = {"coach_copied", "coach_pasted"}
 ORIGIN_TRACKING = {"copy+paste"}
 
 MAX_SECTION_KEY_LEN = 64
+
+# How a section came to be on someone's screen, when it was not their own click:
+# the final review, or the full-document view, each of which shows every
+# section's text at once.
+READ_VIAS = {"review", "document"}
+
+# Longest a section may be. Every save stores the whole section as a revision
+# and, outside the isolated arm, the document rides along with every coach
+# turn, so an unbounded paste grows both the database and the prompt bill.
+# 20k characters is several pages, far past what one section of a team write-up
+# needs. Mirrored in frontend/src/pages/CoachWorkspace.jsx (SECTION_MAX_CHARS).
+MAX_SECTION_CHARS = 20_000
 
 
 class ArtifactConfigError(ValueError):
@@ -285,6 +298,16 @@ async def write_section(
         return {"ok": False, "error": f"unknown origin {origin!r}"}
     if origin_tracking not in ORIGIN_TRACKING:
         origin_tracking = None
+    if len(content) > MAX_SECTION_CHARS:
+        # Refused before any lookup or lock: nothing is stored, no version is
+        # spent, and the writer keeps their draft to trim.
+        return {
+            "ok": False,
+            "error": "section_too_long",
+            "limit": MAX_SECTION_CHARS,
+            "message": f"This section is {len(content):,} characters; the limit is "
+                       f"{MAX_SECTION_CHARS:,}. Shorten it and save again.",
+        }
 
     # Deliberately does NOT create the artifact. Creating one here would use the
     # default shape, and because sections are never restructured afterwards a
@@ -346,6 +369,25 @@ async def _write_once(
     alternation and read-before-write are all computed from the log, so that
     write silently did not happen as far as the analysis was concerned."""
     async with AsyncSessionLocal() as db:
+        # Claim the session row for this transaction. The end path's conditional
+        # UPDATE takes the same row, so a write and the end cannot interleave:
+        # either the write commits first and the submitted snapshot includes it,
+        # or the session is already completed and the write is refused. The
+        # caller's own ended check runs before this and cannot close that gap.
+        # A row lock, not an UPDATE: a no-op UPDATE writes a new row version,
+        # and under load Postgres refused those ("new multixact has more than
+        # one updating member"). NO KEY UPDATE still conflicts with the end
+        # path's status UPDATE but not with foreign-key checks on child rows.
+        # After waiting, Postgres returns the row as the end left it.
+        claimed = (await db.execute(
+            select(GroupSession.status, GroupSession.review_started_at)
+            .where(GroupSession.id == group_session_id)
+            .with_for_update(key_share=True)
+        )).first()
+        if claimed is None or claimed.status == "completed":
+            return {"ok": False, "error": "session_ended",
+                    "message": "This session has ended, so the document can no longer be changed."}
+
         section = (
             await db.execute(
                 select(ArtifactSection).where(
@@ -419,6 +461,15 @@ async def _write_once(
             artifact.updated_at = now
             artifact.updated_by_user_id = author_user_id
 
+        # A write during final review changes what everyone approved, so the
+        # ready marks go in the same transaction: no teammate can complete the
+        # review on the old text while this write is in flight.
+        marks_cleared = 0
+        if claimed.review_started_at is not None:
+            marks_cleared = (await db.execute(
+                delete(ReviewReadyMark).where(ReviewReadyMark.group_session_id == group_session_id)
+            )).rowcount or 0
+
         try:
             scope = await _scope(db, group_session_id)
             await add_event_in(
@@ -463,6 +514,7 @@ async def _write_once(
         # Returned so the caller can route this contribution for review (Phase 5)
         # without re-querying for the revision it just created.
         "revision_id": revision_id,
+        "ready_marks_cleared": marks_cleared,
     }
 
 
@@ -570,12 +622,21 @@ async def log_section_expand(
     role_label: str | None = None,
     idempotency_key: str | None = None,
     client_ts: datetime | None = None,
+    via: str | None = None,
 ) -> EventResult:
     """A person expanded one section — the finest-grained read, and the one that
-    makes "did they look at Sam's step 2?" answerable."""
+    makes "did they look at Sam's step 2?" answerable.
+
+    `via` ("review" or "document"): the section was in front of them on the
+    team's final review or in the full-document view, both of which show the
+    whole document at once. Still a read, since the text was on their screen,
+    but marked so analysis can tell it from a deliberate click."""
+    payload = {"section_key": section_key}
+    if via in READ_VIAS:
+        payload["via"] = via
     return await _log_read(
         group_session_id, "section_expand", user_id, "student",
-        {"section_key": section_key}, role_label, idempotency_key, client_ts,
+        payload, role_label, idempotency_key, client_ts,
     )
 
 

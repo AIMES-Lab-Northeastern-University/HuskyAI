@@ -1,8 +1,10 @@
 import os
 import io
+import zipfile
 import re
 import json
 import base64
+from urllib.parse import quote
 import asyncio
 import logging
 import weakref
@@ -19,20 +21,29 @@ from google.genai import types
 import openai
 from evaluator_v3 import evaluate_conversation_v3 as evaluate_conversation
 from session_analysis import analyze_session
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, delete, func
 from sqlalchemy.exc import IntegrityError
 
-from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership
+from database import init_db, startup_lock, lock_for_create, AsyncSessionLocal, Conversation, Message, Attachment, EvalResult, Challenge, UserChallengeSession, User, GroupChallenge, GroupMember, GroupSession, ClassroomChallenge, GroupChatMessage, Classroom, ClassroomMembership, GroupChatAttachment, ReviewReadyMark
 from group_room import RedisUnavailable, rooms
 from events import log_event
 import artifacts
 import coordination
+from pdf_render import pdf_safe as _pdf_safe, pei_rgb as _pei_rgb, render_message_body as _render_message_body
+from submissions import (
+    coach_session_summary as _coach_session_summary,
+    private_coach_conversations as _private_coach_conversations,
+    router as submissions_router,
+    team_router as submissions_team_router,
+    record_submission,
+    refresh_ai_score,
+)
 from rate_limit import close_rate_limit_clients
 from study_policy import resolve_for_group_session
 
 # Version of the study event schema (docs/event-schema.md). Echoed in research
 # responses so an exported dataset is interpretable against a fixed spec.
-STUDY_SCHEMA_VERSION = "1.1.0"
+STUDY_SCHEMA_VERSION = "1.2.0"
 from auth import router as auth_router, resolve_token_user_id, pwd_context
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
@@ -260,6 +271,8 @@ app.include_router(verification_router)
 app.include_router(contested_router)
 app.include_router(research_export_router)
 app.include_router(group_teams_router)
+app.include_router(submissions_router)
+app.include_router(submissions_team_router)
 
 BASE_SYSTEM_PROMPT = (
     "You are an expert AI tutor helping students develop their AI prompting and reasoning skills. "
@@ -327,10 +340,20 @@ def _att_field(att: dict, *keys: str) -> str:
     return ""
 
 
+# A .docx is a zip, and only its compressed size is capped on upload. A
+# crafted one can expand to gigabytes when python-docx unpacks it, so the
+# uncompressed sizes are checked first. zipfile stops reading at the declared
+# size, so an entry that lies about it fails its CRC check instead of growing.
+_MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+
+
 def _extract_docx_text(raw: bytes) -> str:
     """Pull visible text (paragraphs + tables) from .docx bytes via python-docx."""
     import docx  # imported lazily so the dep is only needed when a .docx arrives
 
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        if sum(i.file_size for i in z.infolist()) > _MAX_DOCX_UNCOMPRESSED_BYTES:
+            raise ValueError("document expands beyond the size limit")
     document = docx.Document(io.BytesIO(raw))
     parts = [p.text for p in document.paragraphs if p.text.strip()]
     for table in document.tables:
@@ -513,12 +536,20 @@ async def _enforce_chat_attachment_caps(conversation_id: str, attachments: list)
                 func.coalesce(func.sum(Attachment.size_bytes), 0),
             ).where(Attachment.conversation_id == conversation_id)
         )).one()
-    used_count, used_bytes = int(row[0]), int(row[1])
+    return _cap_attachments(
+        int(row[0]), int(row[1]), attachments,
+        size_of=lambda att: (len(att.get("data", "") or "") * 3) // 4,
+        name_of=lambda att: _att_field(att, "filename", "name") or "file",
+    )
 
+
+def _cap_attachments(used_count: int, used_bytes: int, attachments: list, *, size_of, name_of):
+    """Admit attachments while the running file count and bytes stay under the
+    per-chat caps, given what the chat already holds. Returns (kept, rejected)."""
     kept, rejected = [], []
     for att in attachments:
-        name = _att_field(att, "filename", "name") or "file"
-        approx = (len(att.get("data", "") or "") * 3) // 4
+        name = name_of(att)
+        approx = size_of(att)
         if used_count + 1 > _MAX_CHAT_ATTACH_COUNT:
             rejected.append({"name": name, "reason": f"chat limit reached (max {_MAX_CHAT_ATTACH_COUNT} files per chat)"})
             continue
@@ -1191,6 +1222,13 @@ async def _apply_late_score(eval_id: str, result: dict) -> None:
                 if ucs and ucs.status != "completed" and (ucs.best_pei is None or pei > ucs.best_pei):
                     ucs.best_pei = float(pei)
         await db.commit()
+        if conv is not None and pei is not None and conv.kind == "coach_private":
+            gs = await db.get(GroupSession, conv.group_session_id)
+            if gs is not None and gs.status == "completed":
+                try:
+                    await refresh_ai_score(db, gs)
+                except Exception as e:
+                    log.error(f"[RESCORE] could not refresh the submission score: {e}")
     log.info(f"[RESCORE] turn {turn} of {conversation_id[:8]} scored late: PEI={pei}")
     await _deliver_late_score(conversation_id, turn, result)
 
@@ -2134,22 +2172,128 @@ async def _load_group_history(conversation_id: str) -> list[dict]:
     return history
 
 
-async def _save_team_chat(group_id: str, user_id: str, content: str) -> tuple[str, str | None]:
-    """Persist one team-backchannel message. This stream is human-only — it is
-    never sent to Gemini or scored, and it enters the research record only under
-    the assignment's team_chat_logging setting (see _log_team_chat). Returns
-    (message id, created_at ISO string)."""
+# Files a student may share in team chat. Narrower than what the coach accepts:
+# a teammate opens these in the app's own origin, so anything a browser would
+# render as a page (HTML, SVG) is refused, and the download endpoint still
+# serves unknown types as opaque bytes.
+_TEAM_CHAT_MIME_BY_EXT = {
+    ".pdf": "application/pdf",
+    ".docx": _DOCX_MIME,
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _team_chat_files(attachments) -> tuple[list[dict], list[dict]]:
+    """Validate and decode team-chat attachments. The type comes from the
+    extension, never the client's claimed mime. Returns (files, rejected), each
+    file as {filename, mime_type, data: bytes}."""
+    kept, rejected = _sanitize_attachments(attachments)
+    files = []
+    for att in kept:
+        name = (_att_field(att, "filename", "name") or "file").strip()[:512]
+        ext = os.path.splitext(name)[1].lower()
+        mime = _TEAM_CHAT_MIME_BY_EXT.get(ext)
+        if mime is None:
+            rejected.append({"name": name, "reason": "file type not allowed in team chat"})
+            continue
+        try:
+            raw = base64.b64decode(att.get("data") or "", validate=True)
+        except (ValueError, TypeError):
+            rejected.append({"name": name, "reason": "could not read file"})
+            continue
+        if not raw:
+            rejected.append({"name": name, "reason": "file is empty"})
+            continue
+        files.append({"filename": name, "mime_type": mime, "data": raw})
+    return files, rejected
+
+
+async def _cap_team_chat_files(group_id: str, files: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The per-chat file caps, counted over everything this team has shared."""
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(
+            select(
+                func.count(GroupChatAttachment.id),
+                func.coalesce(func.sum(GroupChatAttachment.size_bytes), 0),
+            ).where(GroupChatAttachment.group_id == group_id)
+        )).one()
+    return _cap_attachments(int(row[0]), int(row[1]), files,
+                            size_of=lambda f: len(f["data"]), name_of=lambda f: f["filename"])
+
+
+def _team_chat_file_meta(a) -> dict:
+    return {"id": a.id, "filename": a.filename, "mime_type": a.mime_type, "size_bytes": a.size_bytes}
+
+
+async def _save_team_chat(group_id: str, user_id: str, content: str,
+                          files: list[dict] | None = None) -> tuple[str, str | None, list[dict]]:
+    """Persist one team-backchannel message and any files shared with it. This
+    stream is human-only — it is never sent to Gemini or scored, and it enters
+    the research record only under the assignment's team_chat_logging setting
+    (see _log_team_chat). Returns (message id, created_at ISO string, file
+    metadata without the bytes)."""
     async with AsyncSessionLocal() as db:
         msg = GroupChatMessage(group_id=group_id, sender_user_id=user_id, content=content)
         db.add(msg)
+        await db.flush()
+        rows = [
+            GroupChatAttachment(message_id=msg.id, group_id=group_id, filename=f["filename"],
+                                mime_type=f["mime_type"], size_bytes=len(f["data"]), data=f["data"])
+            for f in files or []
+        ]
+        db.add_all(rows)
         await db.commit()
         await db.refresh(msg)
-        return msg.id, (msg.created_at.isoformat() if msg.created_at else None)
+        return (msg.id, (msg.created_at.isoformat() if msg.created_at else None),
+                [_team_chat_file_meta(a) for a in rows])
+
+
+async def _handle_team_chat(websocket, room, data: dict, group_id: str, user_id: str,
+                            my_name: str, before_notify=None) -> None:
+    """Validate, store and broadcast one team-chat message from either team
+    socket. The sender gets `team_chat_saved` back (their own copy is drawn
+    locally, and the broadcast excludes them) so their file chips can link to
+    the stored files. `before_notify(message_id, text, file_metadata)` runs
+    after the save and before anyone is told, for logging."""
+    content = (data.get("content") or "").strip()
+    files, rejected = _team_chat_files(data.get("attachments"))
+    if files:
+        files, over_cap = await _cap_team_chat_files(group_id, files)
+        rejected.extend(over_cap)
+    if rejected:
+        await websocket.send_text(json.dumps({"type": "team_chat_rejected", "files": rejected,
+                                              "client_id": data.get("client_id")}))
+    if not content and not files:
+        return
+    chat_id, created_at, meta = await _save_team_chat(group_id, user_id, content, files)
+    if before_notify is not None:
+        await before_notify(chat_id, content, meta)
+    await websocket.send_text(json.dumps({"type": "team_chat_saved", "client_id": data.get("client_id"),
+                                          "id": chat_id, "attachments": meta}))
+    await room.broadcast(
+        {
+            "type": "team_chat",
+            "id": chat_id,
+            "sender_user_id": user_id,
+            "sender_name": my_name,
+            "content": content,
+            "attachments": meta,
+            "created_at": created_at,
+        },
+        exclude=websocket,
+    )
 
 
 async def _log_team_chat(policy, group_session_id: str, user_id: str, message_id: str,
                          content: str, classroom_id: str | None, challenge_id: str | None,
-                         condition: dict) -> None:
+                         condition: dict, files: list[dict] | None = None) -> None:
     """One study event per team-chat message, when the assignment logs team chat.
 
     The payload is metadata only — length, never text — in both modes. Under
@@ -2173,6 +2317,14 @@ async def _log_team_chat(policy, group_session_id: str, user_id: str, message_id
             "chars": len(content),
             "words": len(content.split()),
             "content_logged": policy.logs_team_chat_content,
+            # Shared files are described, never copied: the bytes stay in
+            # group_chat_attachments, outside the research record. Only present
+            # when files were attached, so text-only events are unchanged.
+            **({
+                "attachments": len(files),
+                "attachment_bytes": sum(f["size_bytes"] for f in files),
+                "attachment_types": sorted({f["mime_type"] for f in files}),
+            } if files else {}),
         },
         condition=condition,
     )
@@ -2187,11 +2339,22 @@ async def _load_team_chat(group_id: str) -> list[dict]:
             .where(GroupChatMessage.group_id == group_id)
             .order_by(GroupChatMessage.created_at)
         )
+        # Metadata only; the bytes are fetched on demand by a member.
+        files: dict[str, list[dict]] = {}
+        for a in (await db.execute(
+            select(GroupChatAttachment.id, GroupChatAttachment.message_id, GroupChatAttachment.filename,
+                   GroupChatAttachment.mime_type, GroupChatAttachment.size_bytes)
+            .where(GroupChatAttachment.group_id == group_id)
+            .order_by(GroupChatAttachment.created_at)
+        )).all():
+            files.setdefault(a.message_id, []).append(_team_chat_file_meta(a))
         return [
             {
+                "id": m.id,
                 "sender_user_id": m.sender_user_id,
                 "sender_name": name,
                 "content": m.content,
+                "attachments": files.get(m.id, []),
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m, name in rows.all()
@@ -2433,20 +2596,7 @@ async def group_websocket_endpoint(
             # Team backchannel: student-to-student only. Free-form (no turn lock),
             # never sent to Gemini, never scored. Persisted separately for replay.
             if mtype == "team_chat":
-                chat_content = (data.get("content") or "").strip()
-                if not chat_content:
-                    continue
-                _, created_at = await _save_team_chat(group_id, user_id, chat_content)
-                await room.broadcast(
-                    {
-                        "type": "team_chat",
-                        "sender_user_id": user_id,
-                        "sender_name": my_name,
-                        "content": chat_content,
-                        "created_at": created_at,
-                    },
-                    exclude=websocket,
-                )
+                await _handle_team_chat(websocket, room, data, group_id, user_id, my_name)
                 continue
 
             if mtype != "message":
@@ -2669,6 +2819,27 @@ async def _load_private_history(conversation_id: str) -> list[dict]:
         return [{"role": m.role, "content": m.content} for m in msgs]
 
 
+# Most of the shared document a coach turn carries. Sections are capped at
+# artifacts.MAX_SECTION_CHARS each, but a twelve-section document could still
+# put ~240k characters into every turn. Under the budget nothing is cut.
+_COACH_ARTIFACT_BUDGET = 12_000
+_SHORTENED_NOTE = "\n[…shortened for length]"
+
+
+def _fit_sections(lengths: list[int], budget: int) -> list[int]:
+    """How many characters of each section fit, sharing the budget fairly: short
+    sections keep all their text and the long ones split what is left equally."""
+    allowed = [0] * len(lengths)
+    remaining = budget
+    todo = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    while todo:
+        share = remaining // len(todo)
+        i = todo.pop(0)
+        allowed[i] = min(lengths[i], share)
+        remaining -= allowed[i]
+    return allowed
+
+
 def _artifact_prompt_block(snap: dict | None) -> tuple[str, list[str]]:
     """Render the shared artifact for injection into a coach prompt.
 
@@ -2687,10 +2858,13 @@ def _artifact_prompt_block(snap: dict | None) -> tuple[str, list[str]]:
     written = [s for s in snap["sections"] if (s.get("content") or "").strip()]
     if not written:
         return "", []
+    texts = [(s.get("content") or "").strip() for s in written]
+    fits = _fit_sections([len(t) for t in texts], _COACH_ARTIFACT_BUDGET)
     parts = ["--- SHARED TEAM ARTIFACT (your student's team is writing this together) ---"]
-    for s in written:
+    for s, text, fit in zip(written, texts, fits):
         label = s.get("title") or s["key"]
-        parts.append(f"\n## {label}\n{(s.get('content') or '').strip()}")
+        body = text if fit >= len(text) else text[:fit].rstrip() + _SHORTENED_NOTE
+        parts.append(f"\n## {label}\n{body}")
     parts.append(
         "\n--- END ARTIFACT ---\n"
         "This is the team's shared work, which may include teammates' contributions. "
@@ -2846,6 +3020,7 @@ async def coach_websocket_endpoint(
             "deadline": deadline.isoformat() + "Z" if deadline else None,
             "remaining_seconds": (max(0, int((deadline - datetime.utcnow()).total_seconds()))
                                   if deadline else None),
+            "review": await _review_state_for(group_session_id),
         }))
         if session_data:
             await websocket.send_text(json.dumps({
@@ -2869,6 +3044,12 @@ async def coach_websocket_endpoint(
         # the panel is actually opened.
         snap = await artifacts.snapshot(group_session_id)
         await websocket.send_text(json.dumps({"type": "artifact", "data": snap}))
+        # What each section should contain and roughly how long it should be,
+        # as the instructor wrote it. Display only; keyed like the sections.
+        guides = {d["key"]: {"prompt": d.get("prompt") or None, "target_words": d.get("target_words")}
+                  for d in (section_defs or []) if isinstance(d, dict) and d.get("key")}
+        if guides:
+            await websocket.send_text(json.dumps({"type": "section_guides", "data": guides}))
 
         team_chat = await _load_team_chat(group_id)
         if team_chat:
@@ -3006,6 +3187,7 @@ async def coach_websocket_endpoint(
                     res = await artifacts.log_section_expand(
                         group_session_id, user_id, key,
                         idempotency_key=data.get("event_id"), client_ts=_client_ts(data),
+                        via=data.get("via"),
                     )
                     await _ack_read(data, res)
                 continue
@@ -3122,6 +3304,8 @@ async def coach_websocket_endpoint(
                     },
                     exclude=websocket,
                 )
+                if result.get("ready_marks_cleared"):
+                    await _announce_review_reset(group_session_id, my_name, key)
                 continue
 
             if mtype == "typing_indicator":
@@ -3134,25 +3318,14 @@ async def coach_websocket_endpoint(
                 continue
 
             if mtype == "team_chat":
-                chat_content = (data.get("content") or "").strip()
-                if not chat_content:
-                    continue
-                chat_id, created_at = await _save_team_chat(group_id, user_id, chat_content)
-                # Still delivered after the end, but outside the measurement
-                # window, so not logged (same rule as reads).
-                if not await _is_ended():
-                    await _log_team_chat(policy, group_session_id, user_id, chat_id, chat_content,
-                                         _classroom_id, challenge_id, condition)
-                await room.broadcast(
-                    {
-                        "type": "team_chat",
-                        "sender_user_id": user_id,
-                        "sender_name": my_name,
-                        "content": chat_content,
-                        "created_at": created_at,
-                    },
-                    exclude=websocket,
-                )
+                async def _log_chat(chat_id, chat_content, files):
+                    # Still delivered after the end, but outside the measurement
+                    # window, so not logged (same rule as reads).
+                    if not await _is_ended():
+                        await _log_team_chat(policy, group_session_id, user_id, chat_id, chat_content,
+                                             _classroom_id, challenge_id, condition, files)
+                await _handle_team_chat(websocket, room, data, group_id, user_id, my_name,
+                                        before_notify=_log_chat)
                 continue
 
             if mtype != "message":
@@ -3648,75 +3821,6 @@ async def get_turn_taking(
     }
 
 
-async def _coach_session_summary(db, gs, private_conversations: list) -> tuple[dict, float | None]:
-    """The end-of-session figures for the private-coach arm, and the unrounded
-    team mean. Read-only, so the ender, every teammate's session_ended frame
-    and a tab reopening a finished session all see the same numbers.
-
-    The team score is an EQUAL-WEIGHT mean: the average of each student's own
-    average PEI, so every student counts once no matter how many turns they
-    took. The earlier placeholder pooled every turn (sum of all turns / turn
-    count), which let the most active student dominate — a student with 20 turns
-    outweighed a teammate with 3. It is returned with the range (min/max of the
-    per-student averages) so a single number can never hide a split team, and
-    each student's own average is still exposed in `per_student`. See
-    docs/metrics-codebook.md ("Team PEI") for the definition.
-    """
-    per_student: dict[str, dict] = {}
-    student_means: list[float] = []  # one value per student, unrounded — equal weight
-    total_turns = 0
-    user_ids = [c.user_id for c in private_conversations]
-    names = {}
-    if user_ids:
-        names = {u.id: u.name for u in (await db.execute(
-            select(User).where(User.id.in_(user_ids))
-        )).scalars().all()}
-
-    for conv in private_conversations:
-        peis = (await db.execute(
-            select(EvalResult.pei).where(
-                EvalResult.conversation_id == conv.id, EvalResult.pei.is_not(None)
-            )
-        )).scalars().all()
-        if peis:
-            student_means.append(sum(float(p) for p in peis) / len(peis))
-        total_turns += len(peis)
-        per_student[conv.user_id] = {
-            "avg_pei": round(sum(peis) / len(peis), 1) if peis else None,
-            "turns": len(peis),
-            # Teammates may be offline when the frame arrives, so the client
-            # cannot always name them from presence.
-            "name": names.get(conv.user_id),
-        }
-
-    # Equal-weight mean of the per-student averages (not of raw turns), plus the
-    # spread. A student with no scored turn has no average and is simply not
-    # counted — they do not drag the team mean toward zero.
-    team_mean = round(sum(student_means) / len(student_means), 2) if student_means else None
-    pei_range = (
-        {"min": round(min(student_means), 1), "max": round(max(student_means), 1)}
-        if student_means else None
-    )
-    return {
-        "arm": "collab_coach_artifact",
-        "session_avg_pei": round(team_mean, 1) if team_mean is not None else None,
-        "pei_range": pei_range,
-        "turns": total_turns,
-        "per_student": per_student,
-        "analysis_status": None,
-        "end_reason": gs.end_reason,
-    }, team_mean
-
-
-async def _private_coach_conversations(db, group_session_id: str) -> list:
-    return (await db.execute(
-        select(Conversation).where(
-            Conversation.group_session_id == group_session_id,
-            Conversation.kind == "coach_private",
-        )
-    )).scalars().all()
-
-
 async def _end_coach_session(db, gs, private_conversations: list, *,
                              end_reason: str = "manual",
                              ended_by: tuple[str, str] | None = None) -> dict:
@@ -3761,6 +3865,7 @@ async def _end_coach_session(db, gs, private_conversations: list, *,
     summary["end_reason"] = gs.end_reason
 
     if won:
+        await _hand_in(db, gs)
         # notify, not peek+broadcast: under Redis the team's sockets may be on
         # other workers, and a worker that holds no room for this session would
         # otherwise tell nobody. Every teammate's tab must lock, wherever it is,
@@ -3773,6 +3878,19 @@ async def _end_coach_session(db, gs, private_conversations: list, *,
         })
 
     return summary
+
+
+async def _hand_in(db, gs) -> None:
+    """Submit the team's document to the instructor as the session ends. A
+    failure here must not undo or block the end itself: the instructor's
+    submissions view records any ended session that is missing one."""
+    try:
+        await record_submission(db, gs)
+    except Exception as e:
+        log.error(f"could not record the submission for {gs.id[:8]}: {e}", exc_info=True)
+        await db.rollback()
+        # The rollback expired gs, and the end path reads it straight after.
+        await db.refresh(gs)
 
 
 def _group_deadline(gs) -> datetime | None:
@@ -3891,6 +4009,7 @@ async def end_group_session(
         schedule_analysis = True
 
     await db.commit()
+    await _hand_in(db, gs)
 
     if schedule_analysis:
         _spawn_group_analysis(gs.id)
@@ -3906,6 +4025,226 @@ async def end_group_session(
     }
 
 
+# ---- Final review -----------------------------------------------------------
+# Finishing a team session is a step, not a button. A member asks to finish; the
+# team sees the whole document as it will be submitted, with a checklist, and
+# each participant marks it ready. The session ends when all of them are ready,
+# when a member submits without waiting (the existing End), or at the deadline.
+
+
+async def _review_state(db, gs) -> dict:
+    """Who has to be ready and who is. Required = the members who opened this
+    session (have a coach conversation in it); a member who never joined cannot
+    hold the team up. Falls back to every member if somehow nobody has."""
+    members = (await db.execute(
+        select(User.id, User.name).join(GroupMember, GroupMember.user_id == User.id)
+        .where(GroupMember.group_id == gs.group_id).order_by(GroupMember.joined_at)
+    )).all()
+    joined = {c.user_id for c in await _private_coach_conversations(db, gs.id)}
+    required = [(uid, name) for uid, name in members if uid in joined] or list(members)
+    marks = set((await db.execute(
+        select(ReviewReadyMark.user_id).where(ReviewReadyMark.group_session_id == gs.id)
+    )).scalars().all())
+    required_ids = {uid for uid, _ in required}
+    return {
+        "started_at": gs.review_started_at.isoformat() + "Z" if gs.review_started_at else None,
+        "required": [{"user_id": uid, "name": name} for uid, name in required],
+        "ready_user_ids": [uid for uid, _ in required if uid in marks],
+        "all_ready": bool(required_ids) and required_ids <= marks,
+    }
+
+
+async def _review_state_for(group_session_id: str) -> dict | None:
+    try:
+        async with AsyncSessionLocal() as db:
+            gs = await db.get(GroupSession, group_session_id)
+            return await _review_state(db, gs) if gs else None
+    except Exception as e:
+        log.error(f"[REVIEW] could not read review state for {group_session_id[:8]}: {e}")
+        return None
+
+
+async def _notify_review(group_session_id: str, state: dict, **extra) -> None:
+    try:
+        await rooms.notify(group_session_id, {"type": "review_state", **state, **extra})
+    except Exception as e:
+        log.error(f"[REVIEW] could not announce review state for {group_session_id[:8]}: {e}")
+
+
+async def _begin_review(db, gs) -> bool:
+    """Start the review once; True for the call that started it."""
+    res = await db.execute(
+        update(GroupSession)
+        .where(GroupSession.id == gs.id, GroupSession.review_started_at.is_(None),
+               GroupSession.status != "completed")
+        .values(review_started_at=datetime.utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    await db.refresh(gs)
+    return res.rowcount == 1
+
+
+async def _announce_review_reset(group_session_id: str, by_name: str, section_key: str) -> None:
+    """A write during review withdrew every ready mark (artifacts.write_section
+    does that in the write's own transaction); tell the team who changed what.
+    Never raises: the write it follows is already committed."""
+    state = await _review_state_for(group_session_id)
+    if state is not None:
+        await _notify_review(group_session_id, state, reset_by_name=by_name, reset_section=section_key)
+
+
+async def _review_gs_or_409(db, group_id: str, session_num: int, user_id: str):
+    gs = await _group_session_or_403(db, group_id, session_num, user_id)
+    if gs.status == "completed":
+        raise HTTPException(status_code=409, detail="This session has already ended")
+    if not await _private_coach_conversations(db, gs.id):
+        raise HTTPException(status_code=409, detail="This session has no final review")
+    return gs
+
+
+@app.post("/groups/{group_id}/sessions/{session_num}/review")
+async def start_group_review(
+    group_id: str,
+    session_num: int,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """A member asks to finish. Idempotent: the team is told once, by name."""
+    gs = await _review_gs_or_409(db, group_id, session_num, user_id)
+    started = await _begin_review(db, gs)
+    state = await _review_state(db, gs)
+    if started:
+        me = await db.get(User, user_id)
+        await _notify_review(gs.id, state, started_by_name=me.name if me else None)
+    return state
+
+
+class ReadyBody(BaseModel):
+    ready: bool
+
+
+@app.post("/groups/{group_id}/sessions/{session_num}/ready")
+async def set_review_ready(
+    group_id: str,
+    session_num: int,
+    body: ReadyBody,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Mark (or unmark) yourself ready to submit. The last participant to mark
+    ready ends the session and submits the document."""
+    gs = await _review_gs_or_409(db, group_id, session_num, user_id)
+    deadline = _group_deadline(gs)
+    if deadline is not None and datetime.utcnow() >= deadline:
+        private = await _private_coach_conversations(db, gs.id)
+        return {"ended": True, "summary": await _end_coach_session(db, gs, private, end_reason="timer_expired")}
+
+    started = await _begin_review(db, gs)
+    if body.ready:
+        db.add(ReviewReadyMark(group_session_id=gs.id, user_id=user_id))
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()  # already marked
+            await db.refresh(gs)
+    else:
+        await db.execute(delete(ReviewReadyMark).where(
+            ReviewReadyMark.group_session_id == gs.id, ReviewReadyMark.user_id == user_id))
+        await db.commit()
+
+    state = await _review_state(db, gs)
+    if state["all_ready"]:
+        # Re-check under the session row lock that a document write also takes
+        # (artifacts._write_once), so a write still in flight either lands
+        # first and withdraws the marks, or waits for the end and is refused.
+        await db.execute(select(GroupSession.id).where(GroupSession.id == gs.id).with_for_update(key_share=True))
+        state = await _review_state(db, gs)
+    if state["all_ready"]:
+        private = await _private_coach_conversations(db, gs.id)
+        summary = await _end_coach_session(db, gs, private, end_reason="team_ready")
+        return {**state, "ended": True, "summary": summary}
+    me = await db.get(User, user_id)
+    await _notify_review(gs.id, state, **({"started_by_name": me.name if me else None} if started else {}))
+    return state
+
+
+async def _team_chat_attachment_or_403(db, group_id: str, attachment_id: str, user_id: str):
+    member = (await db.execute(
+        select(GroupMember.id).where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+    )).scalar_one_or_none()
+    if member is None:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    att = await db.get(GroupChatAttachment, attachment_id)
+    if att is None or att.group_id != group_id:
+        raise HTTPException(status_code=404, detail="File not found")
+    return att
+
+
+class DocxTextBody(BaseModel):
+    data: str  # base64 .docx bytes
+
+
+@app.post("/files/docx-text")
+async def docx_text(body: DocxTextBody, user_id: str = Depends(get_current_user)):
+    """The visible text of a .docx the caller already holds, for previewing a
+    file attached to a coach message (the page has its bytes from the chat).
+    Stateless: nothing is stored, and the caller only learns what is in the
+    file they sent. Capped at the per-file attachment limit."""
+    if (len(body.data) * 3) // 4 > _MAX_ATTACH_BYTES:
+        raise HTTPException(status_code=413, detail="File too large to preview")
+    try:
+        raw = base64.b64decode(body.data, validate=True)
+        text = await asyncio.to_thread(_extract_docx_text, raw)
+    except Exception:
+        raise HTTPException(status_code=422, detail="This document could not be read. Download it instead.")
+    return {"text": text}
+
+
+@app.get("/groups/{group_id}/team-chat/attachments/{attachment_id}/text")
+async def preview_team_chat_docx(
+    group_id: str,
+    attachment_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """The visible text of a shared .docx, for the in-app preview. Browsers can
+    show images, PDFs and plain text themselves; a Word file they can only
+    download, so its text is extracted here (the same extraction the coach uses)."""
+    att = await _team_chat_attachment_or_403(db, group_id, attachment_id, user_id)
+    if att.mime_type != _DOCX_MIME:
+        raise HTTPException(status_code=400, detail="Only Word documents need a text preview")
+    try:
+        text = await asyncio.to_thread(_extract_docx_text, att.data)
+    except Exception as e:
+        log.warning(f"could not extract docx text for preview {attachment_id}: {e}")
+        raise HTTPException(status_code=422, detail="This document could not be read. Download it instead.")
+    return {"filename": att.filename, "text": text}
+
+
+@app.get("/groups/{group_id}/team-chat/attachments/{attachment_id}")
+async def download_team_chat_attachment(
+    group_id: str,
+    attachment_id: str,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """A file shared in team chat, for members of that team only. Always sent
+    as a download, never rendered inline, so a shared file cannot run as a page
+    in the app's origin. The in-app preview fetches these bytes too and shows
+    them itself (image, PDF viewer or plain text)."""
+    att = await _team_chat_attachment_or_403(db, group_id, attachment_id, user_id)
+    mime = att.mime_type if att.mime_type in _TEAM_CHAT_MIME_BY_EXT.values() else "application/octet-stream"
+    return Response(
+        content=att.data,
+        media_type=mime,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(att.filename)}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.get("/groups/{group_id}/sessions/{session_num}/analysis")
 async def get_group_session_analysis(
     group_id: str,
@@ -3919,69 +4258,8 @@ async def get_group_session_analysis(
 
 
 # --- Chat export → PDF ------------------------------------------------------
-# Rendered with fpdf2 (pure-Python, no system deps — safe on Railway). Core
-# fonts are latin-1 only, so text is normalized first; message bodies get a
-# light markdown cleanup and fenced code blocks render in a monospace box.
-
-def _pdf_safe(s: str) -> str:
-    """Make text safe for fpdf2 core (latin-1) fonts."""
-    if not s:
-        return ""
-    repl = {
-        "‘": "'", "’": "'", "“": '"', "”": '"',
-        "–": "-", "—": "-", "…": "...", "•": "-",
-        " ": " ", "→": "->", "←": "<-", "✓": "[x]",
-    }
-    for k, v in repl.items():
-        s = s.replace(k, v)
-    return s.encode("latin-1", "replace").decode("latin-1")
-
-
-def _pei_rgb(pei):
-    if pei is None:
-        return (107, 101, 96)
-    if pei <= 40:
-        return (200, 16, 46)
-    if pei <= 65:
-        return (249, 115, 22)
-    if pei <= 80:
-        return (13, 148, 136)
-    return (22, 163, 74)
-
-
-def _md_inline_clean(s: str) -> str:
-    """Strip inline markdown markers so prose reads cleanly without artifacts."""
-    s = re.sub(r"`([^`]*)`", r"\1", s)          # inline code
-    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)    # bold
-    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)  # italic
-    s = re.sub(r"__([^_]+)__", r"\1", s)        # underline/bold
-    s = re.sub(r"^\s{0,3}#{1,6}\s*", "", s, flags=re.M)  # headings
-    return s
-
-
-def _render_message_body(pdf, text: str):
-    """Write a message body, rendering fenced code blocks in a monospace box."""
-    from fpdf.enums import XPos, YPos
-
-    text = text or ""
-    for part in re.split(r"(```.*?```)", text, flags=re.DOTALL):
-        if not part:
-            continue
-        if part.startswith("```"):
-            code = re.sub(r"^```[a-zA-Z0-9_+\-]*\n?", "", part)
-            code = re.sub(r"```$", "", code).rstrip()
-            pdf.set_font("Courier", "", 8.5)
-            pdf.set_text_color(40, 40, 40)
-            pdf.set_fill_color(244, 244, 246)
-            pdf.multi_cell(0, 4.3, _pdf_safe(code), fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.ln(0.5)
-        else:
-            clean = _md_inline_clean(part).strip("\n")
-            if clean.strip():
-                pdf.set_font("Helvetica", "", 10)
-                pdf.set_text_color(30, 30, 30)
-                pdf.multi_cell(0, 5, _pdf_safe(clean), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
+# Rendered with fpdf2; the text helpers live in pdf_render.py, shared with the
+# team submission PDF.
 
 def _render_export_pdf(title: str, started_at, turns: list, avg_pei) -> bytes:
     from fpdf import FPDF

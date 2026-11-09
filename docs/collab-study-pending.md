@@ -1,8 +1,15 @@
 # Collaborative study — pending work
 
-Status as of 2026-10-04. Branch `feature/collab-study-phase-1` (backend: 232
-tests passing, 10 skipped — the skips are the real-Redis tests, which need
-`REDIS_URL`; see `docs/multi-worker-deploy.md`).
+Status as of 2026-11-09. Branch `feature/student-progress` (PR #18): backend
+316 tests passing with `REDIS_URL` set, on SQLite and on Postgres (306 + 10
+skipped without Redis), frontend 26 passing.
+
+**Since 2026-10-04.** Item 4 is decided and built (equal-weight team PEI).
+Item 8 has its tests. Team sessions now end through a final review where every
+member who took part marks the document ready, and every ended session is
+frozen as a `TeamSubmission` that the instructor grades (see the README,
+"Finishing a team session" and "Submissions"). A two-worker end-to-end dry run
+and the server half of item 13 were run on 2026-11-02; see items 12 and 13.
 
 **What exists already.** Every student in a team has their own private coach;
 the team shares one sectioned document; and every action — including who read
@@ -12,8 +19,9 @@ scores, routed peer review, contested-answer choices, a de-identified export,
 and an instructor UI for every one of those. Multi-worker deployment behind
 Redis has been verified with real processes.
 
-**What is left.** Four PI decisions (items 1–4), one real-network check
-(item 13), and the deliberately deferred auto-detection (item 11). Everything an
+**What is left.** Three PI decisions (items 1–3) plus one on late reads (see
+item 13), a capacity check on the real database (item 12), and the deliberately
+deferred auto-detection (item 11). Everything an
 instructor needs to configure and read out a session (items 5–10) is built.
 
 **The principle to preserve.** Anything about *behaviour* is derived from the
@@ -115,7 +123,13 @@ still `off` can't be recovered.
 
 ---
 
-### 4. What does a team's PEI mean?
+### 4. What does a team's PEI mean? — *decided and built*
+
+**Decision.** The equal-weight mean of each student's own average PEI, always
+shown with its range; defined in `docs/metrics-codebook.md` ("Team PEI") and
+computed in one place, `coach_session_summary` in `backend/submissions.py`.
+It is also the AI score on a team's submission. The text below is the original
+framing, kept for context.
 
 **What.** In the collaborative arm each student has their own coach and their own
 per-turn score. There is no single number that is obviously "the team's score".
@@ -216,10 +230,9 @@ reviewer picked gets no review — it never falls back to round robin."
 `PeerReviewsPanel` (same file) lists each review's derived outcome and lets
 the instructor reassign a pending one (`POST /verification/{id}/reassign`).
 
-**Gap.** Nothing in `backend/tests/` exercises the `instructor_assigned` branch,
-the `unrouted` event, or the review-pairings route. `test_verification.py`
-covers round-robin and outcome classification only. Add a test before relying
-on this arm.
+**Tests.** `backend/tests/test_review_pairings.py` covers the
+`instructor_assigned` branch, the `unrouted` event and the review-pairings
+route.
 
 ### 9. Turn-taking dashboard — *done*
 
@@ -300,11 +313,45 @@ code 4005 rather than degrading to per-worker rooms. Solo chat is unaffected.
   survivors kept showing the dead members until something else changed).
 
 All 10 real-Redis tests in `backend/tests` (`test_multiworker_redis.py`,
-`test_rate_limit_shared.py`) pass against a real server. They are skipped in an
+`test_rate_limit_shared.py`) pass against a real server (last run 2026-11-02).
+
+**End-to-end dry run, 2026-11-02.** Two Uvicorn workers sharing one Redis and
+one database, driven over HTTP and WebSocket with live Gemini: an instructor
+created a section, a group challenge with section briefs, study settings
+(`instructor_assigned`, team chat `metadata`), a team, review pairings and a
+contested pair; two students on different workers took coach turns, wrote
+sections (each write reached the other worker; a stale write came back as a
+conflict), read, and used team chat; the final review ran (an edit withdrew a
+ready mark, the last mark ended the session as `team_ready`, the other worker
+got `session_ended`, later writes were refused); then the submission, student
+and instructor PDFs, grading, zip, analytics, turn-taking, team progress and
+the research export were read back (consent-filtered, no emails, strictly
+increasing `seq`, team chat as metadata with no text). 54 of 54 checks passed.
+Turn scoring could not be checked: the OpenAI key in `backend/.env` is
+rejected (401), so every turn came back `eval_pending`. They are skipped in an
 ordinary run, which is why the suite reports 10 skipped.
 
 **How to deploy it.** `docs/multi-worker-deploy.md` — what `REDIS_URL` turns
 on, what a worker crash costs a team, and a pre-deploy checklist.
+
+**On Postgres, 2026-11-09.** The suite now runs against a real database
+(`TEST_DATABASE_URL`, see `backend/tests/conftest.py`): 316 pass. Running it
+there found that concurrent events for one session could be dropped (20 at once
+kept 8–14), now fixed with a per-session advisory lock in `events.py`.
+`backend/scripts/stress_team_sessions.py` then ran 12 and 30 concurrent teams
+across two workers with every invariant checked; it also caught the session-row
+lock added on 2026-11-02 failing under load (now a `FOR NO KEY UPDATE`).
+
+**Capacity: open.** Through port 6543 (the transaction-pooler path, which the
+deploy notes prefer) the app opens a new database connection for every
+transaction, and recording one read takes two. Locally that made a read about
+5x slower than with a pool (17 ms vs 3.3 ms). In a class-sized run (30 teams,
+90 students at a human pace, two workers) reads were stored 6 s late on
+average and up to 34 s late, and some sockets dropped on keepalive timeouts.
+The same run with a normal pool had no problems (0.6 s average). Against
+Supabase each new connection also costs a network round trip and TLS, so run
+the stress script against a staging database on the production connection
+settings before a full class uses the collaborative arm.
 
 **Not covered.** A Redis outage *during* a session closes group and coach
 sockets with 1011 and refuses reconnects with 4005 until Redis is back; the
@@ -327,8 +374,27 @@ behind can be flushed under the next student's identity on a shared machine.
 13 tests in `frontend/tests/readBuffer.test.js` cover the loss paths, including
 the reload case; three in `test_coach_socket.py` cover the ack contract.
 
-**Still to do.** Kill wifi mid-session, expand several artifact sections,
-reload the page for good measure, reconnect. Every read should appear exactly
+**Server half verified, 2026-11-02.** Reads sent on one worker, the TCP
+connection aborted with no close frame before any ack, then the same reads
+replayed twice on the other worker, as the buffer does after a reconnect and
+again after a reload: each read was stored exactly once, every one was acked,
+and each kept the client timestamp from when it happened (a minute earlier),
+not when it arrived.
+
+**Browser half verified, 2026-11-09.** In Chromium (Playwright), a student
+went offline mid-session, expanded each of two sections twice, came back
+online and reloaded at once. All four reads were stored exactly once, each with
+the time it happened rather than when it arrived, and the localStorage buffer
+was empty afterwards. Item 13 is done.
+
+**Open: reads that happened during the session but arrive after it.** A read
+is recorded only if it reaches the server before the session ends (apart from
+the closing dwell). A student whose wifi drops in the last minutes of a timed
+session and who reconnects after the deadline therefore loses those reads: they
+are acked and discarded. Accepting them would mean trusting `client_ts`, which
+the schema deliberately never does. A PI decision: keep the rule, or accept
+late reads whose `client_ts` falls inside the session and that arrive within a
+grace window. Every read should appear exactly
 once, each keeping the timestamp from when it happened rather than when it
 arrived. No amount of unit testing substitutes for one real drop.
 
@@ -338,15 +404,18 @@ arrived. No amount of unit testing substitutes for one real drop.
 
 1. **Item 1** (consent/IRB) — still first. Longest lead time, blocks the run, and
    nothing technical is waiting on anything else.
-2. **Items 3, 4, 2** — chase the decisions. Item 3 is a dropdown once decided
-   and must be decided before the first real session; item 4 changes what the
-   instructor views report; item 2 is the only one that still needs building
-   (column, migration, UI, prompt) after the decision.
-3. **Tests for item 8** — the `instructor_assigned` routing, the `unrouted`
-   event and the review-pairings route have no backend test. Add them before a
-   study arm depends on manual pairing.
-4. **Item 13** — one real network drop, in progress separately.
-5. **A dry run** — one instructor configures an assignment end to end through
-   the UI (items 5–10), a team runs a session on the multi-worker deployment
-   (item 12, `docs/multi-worker-deploy.md`), and the export is read back.
+2. **Items 3, 2** — chase the decisions. Item 3 is a dropdown once decided
+   and must be decided before the first real session; item 2 still needs
+   building (column, migration, UI, prompt) after the decision.
+3. **A working OpenAI key** in every deployment's environment — without one no
+   turn is scored (they queue as `eval_pending`). Check with
+   `python scripts/verify_external_ai.py`.
+4. **Capacity on the real database** — run
+   `backend/scripts/stress_team_sessions.py` (class pace) against a Supabase
+   staging database with production connection settings (item 12).
+5. **A dry run on the deployed site** — the API dry run (item 12) and a
+   three-browser run (2026-11-09: live edits across workers, a conflicting edit,
+   a draft carried into the full-document view, an offline spell with a reload,
+   the final review, the hand-in, PDFs, and instructor grading) both pass
+   locally; what is left is the deployed site.
 6. **Item 11** — after a first real run, once corpora are in use.
