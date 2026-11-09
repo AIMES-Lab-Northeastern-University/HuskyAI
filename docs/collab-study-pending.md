@@ -1,8 +1,8 @@
 # Collaborative study — pending work
 
-Status as of 2026-11-02. Branch `feature/student-progress` (PR #18): backend
-316 tests passing with `REDIS_URL` set (306 + 10 skipped without it), frontend
-26 passing.
+Status as of 2026-11-09. Branch `feature/student-progress` (PR #18): backend
+316 tests passing with `REDIS_URL` set, on SQLite and on Postgres (306 + 10
+skipped without Redis), frontend 26 passing.
 
 **Since 2026-10-04.** Item 4 is decided and built (equal-weight team PEI).
 Item 8 has its tests. Team sessions now end through a final review where every
@@ -19,9 +19,9 @@ scores, routed peer review, contested-answer choices, a de-identified export,
 and an instructor UI for every one of those. Multi-worker deployment behind
 Redis has been verified with real processes.
 
-**What is left.** Three PI decisions (items 1–3), the browser half of one
-real-network check (item 13), and the deliberately deferred auto-detection
-(item 11). Everything an
+**What is left.** Three PI decisions (items 1–3) plus one on late reads (see
+item 13), a capacity check on the real database (item 12), and the deliberately
+deferred auto-detection (item 11). Everything an
 instructor needs to configure and read out a session (items 5–10) is built.
 
 **The principle to preserve.** Anything about *behaviour* is derived from the
@@ -334,6 +334,25 @@ ordinary run, which is why the suite reports 10 skipped.
 **How to deploy it.** `docs/multi-worker-deploy.md` — what `REDIS_URL` turns
 on, what a worker crash costs a team, and a pre-deploy checklist.
 
+**On Postgres, 2026-11-09.** The suite now runs against a real database
+(`TEST_DATABASE_URL`, see `backend/tests/conftest.py`): 316 pass. Running it
+there found that concurrent events for one session could be dropped (20 at once
+kept 8–14), now fixed with a per-session advisory lock in `events.py`.
+`backend/scripts/stress_team_sessions.py` then ran 12 and 30 concurrent teams
+across two workers with every invariant checked; it also caught the session-row
+lock added on 2026-11-02 failing under load (now a `FOR NO KEY UPDATE`).
+
+**Capacity: open.** Through port 6543 (the transaction-pooler path, which the
+deploy notes prefer) the app opens a new database connection for every
+transaction, and recording one read takes two. Locally that made a read about
+5x slower than with a pool (17 ms vs 3.3 ms). In a class-sized run (30 teams,
+90 students at a human pace, two workers) reads were stored 6 s late on
+average and up to 34 s late, and some sockets dropped on keepalive timeouts.
+The same run with a normal pool had no problems (0.6 s average). Against
+Supabase each new connection also costs a network round trip and TLS, so run
+the stress script against a staging database on the production connection
+settings before a full class uses the collaborative arm.
+
 **Not covered.** A Redis outage *during* a session closes group and coach
 sockets with 1011 and refuses reconnects with 4005 until Redis is back; the
 coach workspace stops retrying on 4005, so students reload once it recovers.
@@ -362,8 +381,20 @@ again after a reload: each read was stored exactly once, every one was acked,
 and each kept the client timestamp from when it happened (a minute earlier),
 not when it arrived.
 
-**Still to do.** The browser half: kill wifi mid-session, expand several
-artifact sections, reload the page for good measure, reconnect. Every read should appear exactly
+**Browser half verified, 2026-11-09.** In Chromium (Playwright), a student
+went offline mid-session, expanded each of two sections twice, came back
+online and reloaded at once. All four reads were stored exactly once, each with
+the time it happened rather than when it arrived, and the localStorage buffer
+was empty afterwards. Item 13 is done.
+
+**Open: reads that happened during the session but arrive after it.** A read
+is recorded only if it reaches the server before the session ends (apart from
+the closing dwell). A student whose wifi drops in the last minutes of a timed
+session and who reconnects after the deadline therefore loses those reads: they
+are acked and discarded. Accepting them would mean trusting `client_ts`, which
+the schema deliberately never does. A PI decision: keep the rule, or accept
+late reads whose `client_ts` falls inside the session and that arrive within a
+grace window. Every read should appear exactly
 once, each keeping the timestamp from when it happened rather than when it
 arrived. No amount of unit testing substitutes for one real drop.
 
@@ -379,8 +410,12 @@ arrived. No amount of unit testing substitutes for one real drop.
 3. **A working OpenAI key** in every deployment's environment — without one no
    turn is scored (they queue as `eval_pending`). Check with
    `python scripts/verify_external_ai.py`.
-4. **Item 13, browser half** — one real network drop.
-5. **A dry run in the browser** — the API-level dry run passed (item 12); what
-   is left is a person clicking through the instructor UI and a team session
-   on the deployed site.
+4. **Capacity on the real database** — run
+   `backend/scripts/stress_team_sessions.py` (class pace) against a Supabase
+   staging database with production connection settings (item 12).
+5. **A dry run on the deployed site** — the API dry run (item 12) and a
+   three-browser run (2026-11-09: live edits across workers, a conflicting edit,
+   a draft carried into the full-document view, an offline spell with a reload,
+   the final review, the hand-in, PDFs, and instructor grading) both pass
+   locally; what is left is the deployed site.
 6. **Item 11** — after a first real run, once corpora are in use.
