@@ -119,22 +119,21 @@ export function Section({ section, isMine, editorName, onExpand, onCollapse, onS
   const awaitingSave = useRef(false)
   const rootRef = useRef(null)
 
-  // Hand an open draft back to the parent on unmount; anything else clears
-  // the slot. A draft whose save is in flight is not kept: it is on its way,
-  // and its answer or conflict arrives through the parent as usual.
-  const live = useRef(null)
-  live.current = { editing, draft, baseVersion, readOnly }
-  useEffect(() => () => {
+  // Keep an open draft in the parent while it changes, and clear the slot
+  // otherwise. Not on unmount: switching views mounts the new Section (which
+  // reads the slot) before the old one's cleanup runs, so a draft handed over
+  // at unmount arrives too late. A draft whose save is in flight is not kept:
+  // it is on its way, and its answer or conflict arrives through the parent.
+  useEffect(() => {
     if (!draftStore) return
-    const { editing, draft, baseVersion, readOnly } = live.current
-    if (editing && !readOnly && !awaitingSave.current) {
+    if (editing && !readOnly && !saving) {
       draftStore.current.set(section.key, {
         draft, baseVersion, copied: copiedChunks.current, pasted: pastedChunks.current,
       })
     } else {
       draftStore.current.delete(section.key)
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [editing, draft, baseVersion, readOnly, saving]) // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // Follow the server's copy while not actively editing, so a teammate's edit
@@ -1424,7 +1423,7 @@ export default function CoachWorkspace() {
                 onChange={e => setInput(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
                 rows={1}
-                placeholder={busy ? 'Waiting for your coach…' : 'Ask your coach…'}
+                placeholder={sessionEnded ? 'This session has ended.' : busy ? 'Waiting for your coach…' : 'Ask your coach…'}
                 disabled={busy || connStatus !== 'connected'}
                 className="flex-1 px-4 py-2.5 text-[14px] bg-white border border-[#E7E0D8] rounded-[12px] resize-none focus:outline-none focus:border-[#C8102E] disabled:opacity-60"
                 style={{ borderWidth: '1.5px' }}

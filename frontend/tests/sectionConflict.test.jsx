@@ -71,9 +71,17 @@ describe('Section save', () => {
 describe('Section draft across remounts', () => {
   // Switching between the side panel and the full-document view mounts a new
   // Section; an open draft must survive the switch, from the version it started on.
+  // One render that unmounts the old Section and mounts a new one, as the
+  // app's view switch does: React renders the new one before the old one's
+  // cleanup runs, which is what lost drafts when they were saved on unmount.
+  let generation = 0
   const remount = (props) => {
-    act(() => root.render(<div />))
-    render(props)
+    generation += 1
+    act(() => {
+      root.render(<Section key={generation} section={base} isMine={false} editorName="Cleo"
+        onExpand={() => {}} onCollapse={() => {}} onSave={() => {}}
+        onDismissConflict={() => {}} {...props} />)
+    })
   }
 
   it('keeps an unsaved draft and its base version', () => {
