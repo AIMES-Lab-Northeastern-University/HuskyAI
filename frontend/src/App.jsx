@@ -21,6 +21,10 @@ import ConsentGate from './components/ConsentGate'
 import Admin from './pages/Admin'
 import GroupChat from './pages/GroupChat'
 import CoachWorkspace from './pages/CoachWorkspace'
+import StudyLogin from './pages/StudyLogin'
+import StudyHome from './pages/StudyHome'
+import StudyAdmin from './pages/StudyAdmin'
+import { StudyRedirect, isParticipant, studyUiEnabled } from './lib/study'
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
@@ -29,6 +33,9 @@ function RequireAuth({ children }) {
     const next = safeNextPath(location.pathname + location.search)
     return <Navigate to={next ? `/login?next=${encodeURIComponent(next)}` : '/login'} replace />
   }
+  // Study participants skip the general research notice until the study's own
+  // consent screen exists; their consent stays off, so nothing is exported.
+  if (isParticipant()) return children
   return <ConsentGate>{children}</ConsentGate>
 }
 
@@ -40,6 +47,7 @@ export default function App() {
         v7_relativeSplatPath: true,
       }}
     >
+      <StudyRedirect />
       <Routes>
         {/* Public */}
         <Route path="/"             element={<LandingPage />} />
@@ -76,6 +84,11 @@ export default function App() {
         <Route path="/group/:id"   element={<RequireAuth><GroupChat /></RequireAuth>} />
         {/* Collaborative study arm: private coach per student + one shared artifact. */}
         <Route path="/coach/:id"   element={<RequireAuth><CoachWorkspace /></RequireAuth>} />
+
+        {/* Study mode: only in a build with VITE_STUDY_MODE_ENABLED=true. */}
+        {studyUiEnabled() && <Route path="/study" element={<StudyLogin />} />}
+        {studyUiEnabled() && <Route path="/study/home" element={<RequireAuth><StudyHome /></RequireAuth>} />}
+        {studyUiEnabled() && <Route path="/study-admin" element={<RequireAuth><StudyAdmin /></RequireAuth>} />}
 
         {/* Redirects */}
         <Route path="/app"  element={<Navigate to="/workspace" replace />} />

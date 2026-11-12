@@ -14,12 +14,14 @@ from sqlalchemy import select, update
 
 from database import PasswordResetToken, User, AsyncSessionLocal
 from emailer import send_password_reset
-from rate_limit import (check_auth_rate_limit, check_login_paused, check_reset_rate_limit,
-                        record_login_failure)
+from rate_limit import (_client_ip, check_auth_rate_limit, check_login_paused,
+                        check_reset_rate_limit, record_login_failure)
+from study_mode import participant_by_code, study_mode_enabled
 
 log = logging.getLogger(__name__)
 
-SECRET_KEY = os.getenv("JWT_SECRET", "dev-secret-change-in-production")
+_DEV_JWT_SECRET = "dev-secret-change-in-production"
+SECRET_KEY = os.getenv("JWT_SECRET", _DEV_JWT_SECRET)
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
@@ -179,6 +181,12 @@ async def resolve_token_user_id(token: str) -> str | None:
     # matches a freshly migrated account — so deploying does not log anyone out.
     if int(payload.get("tv", 0) or 0) != int(getattr(u, "token_version", 0) or 0):
         return None
+    # Study participants (flag on only): a token works only inside the
+    # participant's study session, and never once they are revoked.
+    if study_mode_enabled():
+        import study_mode
+        if not await study_mode.token_allowed(uid):
+            return None
     return uid
 
 
@@ -371,3 +379,64 @@ async def update_me(req: UpdateMeRequest, user_id: str = Depends(_bearer_user_id
             consent_research=bool(u.consent_research),
             research_acknowledged=u.research_ack_at is not None,
         )
+
+
+# --- Study mode: anonymous code sign-in ---------------------------------------
+# Additive and off by default. Nothing above this line depends on it.
+
+class StudyLoginRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+
+
+async def _require_study_mode() -> None:
+    """First dependency of /auth/study-login, so with the flag off the request
+    is a plain 404 before it reaches the rate limiter (whose per-IP budget is
+    shared with normal login) or body validation.
+
+    With the flag on, refuse to mint tokens under a guessable key: code-only
+    sign-in has no password behind it, so a known signing secret would let
+    anyone forge a participant's token."""
+    if not study_mode_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not SECRET_KEY.strip() or SECRET_KEY == _DEV_JWT_SECRET:
+        log.error("study-login refused: JWT_SECRET is unset or the dev fallback")
+        raise HTTPException(status_code=503, detail="Study sign-in is not available.")
+
+
+@router.post(
+    "/study-login",
+    response_model=TokenResponse,
+    include_in_schema=False,
+    dependencies=[Depends(_require_study_mode), Depends(check_auth_rate_limit)],
+)
+async def study_login(req: StudyLoginRequest, request: Request):
+    # The code is the credential, so there is no account to pause; failures
+    # are counted per client IP instead (_client_ip trusts only the hop our
+    # proxy appended to X-Forwarded-For). The "study:" identifier contains no
+    # "@", which LoginRequest requires, so it can never share a counter with
+    # an email's.
+    pause_key = f"study:{_client_ip(request)}"
+    await check_login_paused(request, pause_key)
+    participant = await participant_by_code(req.code)
+    user = None
+    if participant is not None:
+        async with AsyncSessionLocal() as db:
+            user = await db.get(User, participant.user_id)
+    if user is None:
+        await record_login_failure(request, pause_key)
+        # One message whether the code is unknown or malformed.
+        raise HTTPException(status_code=401, detail="That code was not recognised.")
+    # A right code opens the study session window on first use; a revoked or
+    # expired participant is told the session is over, whatever the reason.
+    import study_mode
+    if await study_mode.login_refusal(participant) is not None:
+        raise HTTPException(status_code=403, detail=study_mode.STUDY_ENDED_DETAIL)
+    return TokenResponse(
+        access_token=create_token(user.id, getattr(user, "token_version", 0)),
+        user_id=user.id,
+        name=user.name,
+        email=user.email,
+        is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
+        consent_research=bool(getattr(user, "consent_research", False)),
+        research_acknowledged=getattr(user, "research_ack_at", None) is not None,
+    )

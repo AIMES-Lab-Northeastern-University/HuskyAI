@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom'
 import { API_URL, formatApiErrorDetail, safeNextPath } from '../lib/api'
+import { studyUiEnabled } from '../lib/study'
 
 const ROLES = [
   {
@@ -289,6 +290,11 @@ export default function AuthPage() {
               : <>Already have an account? <button type="button" onClick={() => switchTab('login')} className="text-[#C8102E] font-semibold bg-transparent border-none cursor-pointer p-0">Sign in</button></>
             }
           </div>
+          {studyUiEnabled() && tab === 'login' && (
+            <div className="text-center mt-3 text-[13px] text-[#9A948E]">
+              Joining a study? <Link to="/study" className="text-[#C8102E] font-semibold no-underline">Enter your code</Link>
+            </div>
+          )}
           </>
           )}
         </div>

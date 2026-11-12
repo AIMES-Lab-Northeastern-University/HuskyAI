@@ -34,6 +34,7 @@ from study_policy import resolve_for_group_session
 # responses so an exported dataset is interpretable against a fixed spec.
 STUDY_SCHEMA_VERSION = "1.1.0"
 from auth import router as auth_router, resolve_token_user_id, pwd_context
+import study_mode
 from challenges import router as challenges_router, seed_challenges, get_current_user, get_db
 from classrooms import router as classrooms_router, seed_demo_classroom, seed_pilot_classroom
 from admin import router as admin_router
@@ -260,6 +261,7 @@ app.include_router(verification_router)
 app.include_router(contested_router)
 app.include_router(research_export_router)
 app.include_router(group_teams_router)
+app.include_router(study_mode.study_router)
 
 BASE_SYSTEM_PROMPT = (
     "You are an expert AI tutor helping students develop their AI prompting and reasoning skills. "
@@ -645,15 +647,22 @@ async def _build_gemini_history(conversation_history: list) -> list:
     return history
 
 
-async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None, is_graded_revision: bool = False) -> str | None:
+async def _save_turn(conversation_id: str, user_msg: str, assistant_msg: str, eval_data: dict, turn_num: int, attachments=None, condition: dict | None = None, is_graded_revision: bool = False, sent_at: tuple | None = None) -> str | None:
     """Persist one turn. Returns the EvalResult id, or None if the save failed.
-    A failed evaluation (eval_failed) is saved with NULL scores as "pending"."""
+    A failed evaluation (eval_failed) is saved with NULL scores as "pending".
+
+    `sent_at` = (when the user message arrived, when the reply finished): the
+    messages' created_at, so they record when each was sent rather than when
+    the turn was saved (after the evaluation). Omitted, both default to now."""
     score_pending = bool(eval_data.get("eval_failed"))
+    user_at, assistant_at = sent_at or (None, None)
     try:
         async with AsyncSessionLocal() as db:
-            user_message = Message(conversation_id=conversation_id, role="user", content=user_msg)
+            user_message = Message(conversation_id=conversation_id, role="user", content=user_msg,
+                                   **({"created_at": user_at} if user_at else {}))
             db.add(user_message)
-            db.add(Message(conversation_id=conversation_id, role="assistant", content=assistant_msg))
+            db.add(Message(conversation_id=conversation_id, role="assistant", content=assistant_msg,
+                           **({"created_at": assistant_at} if assistant_at else {})))
             # Persist uploaded files, linked to this user message, so they survive
             # reconnects/refreshes and can be replayed when the conversation resumes.
             if attachments:
@@ -875,6 +884,8 @@ async def _finalize_session(conversation_id: str) -> float | None:
                     ucs.session_analysis = _pending_blob()
                     schedule_analysis = True
             await db.commit()
+            if ucs:
+                await study_mode.advance_if_block_done(ucs.user_id, ucs.challenge_id)
             if missed_revision_turn is not None:
                 await _log_feed_event(conversation_id, "revision.missed",
                                       {"after_turn": missed_revision_turn,
@@ -885,6 +896,28 @@ async def _finalize_session(conversation_id: str) -> float | None:
     except Exception as e:
         log.error(f"Failed to finalize session: {e}")
         return None
+
+
+# Study mode finishes overdue participant sessions through the same path.
+study_mode.register_finalizer(_finalize_session)
+
+
+async def _study_deadline_watchdog(websocket: WebSocket, conversation_id: str,
+                                   deadline: datetime) -> None:
+    """Study participants only: finish the task at its deadline from the server
+    side, so the cap holds even if the browser never asks (a throttled
+    background tab, a stopped script), and tell the open socket."""
+    try:
+        await asyncio.sleep(max(0.0, (deadline - datetime.utcnow()).total_seconds()))
+        # Finished meanwhile (another tab, the challenge page): _finalize_session
+        # would re-stamp completed_at, so leave it alone.
+        if not await _solo_session_completed(conversation_id):
+            await _finalize_session(conversation_id)
+        await websocket.send_text(json.dumps({"type": "session_ended"}))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.debug(f"study deadline watchdog for {conversation_id}: {e}")
 
 
 async def _build_system_prompt(challenge_id: str | None, session_num: int | None) -> tuple[str, dict | None]:
@@ -919,6 +952,21 @@ async def _build_system_prompt(challenge_id: str | None, session_num: int | None
         return BASE_SYSTEM_PROMPT, None
 
 
+def _study_feed_gate(resolve):
+    """Study participants (flag on only) see the feed only where their
+    session's snapshotted block allows it. Wraps the resolver so the on-time
+    turn, the late score and the give-up notice all inherit the same answer."""
+    async def gated(user_id, challenge_id, session_num):
+        policy, feed_enabled, revision_turn = await resolve(user_id, challenge_id, session_num)
+        gate = await study_mode.solo_gate(user_id, challenge_id, session_num)
+        if gate is not None and not gate.visible:
+            feed_enabled = False
+        return policy, feed_enabled, revision_turn
+    gated.__doc__ = resolve.__doc__
+    return gated
+
+
+@_study_feed_gate
 async def _resolve_solo_study_config(user_id: str, challenge_id: str | None,
                                      session_num: int | None) -> tuple:
     """(CoachPolicy, feed_enabled, revision_turn) for a solo/control session.
@@ -1221,6 +1269,9 @@ async def _deliver_late_score(conversation_id: str, turn: int, result: dict) -> 
     policy, feed_enabled, revision_turn = await _resolve_solo_study_config(
         ctx["user_id"], ctx["challenge_id"], ctx["session_number"])
     condition = policy.as_condition()
+    late_gate = await study_mode.solo_gate(ctx["user_id"], ctx["challenge_id"], ctx["session_number"])
+    if late_gate is not None:
+        condition.update(late_gate.condition_fields())
     # A revision can only open in a session that is still running: after the
     # end (e.g. the timer, which already logged revision.missed) it cannot.
     opens_revision = (revision_turn is not None and turn == revision_turn and feed_enabled
@@ -1373,7 +1424,8 @@ async def _fresh_history(conversation_id: str, current: list[dict]) -> list[dict
         return current
 
 
-async def _can_play_solo(user_id: str, challenge_id: str) -> bool | None:
+async def _can_play_solo(user_id: str, challenge_id: str | None,
+                         session_num: int | None = None) -> bool | None:
     """True/False from the access rule; None when it could not be checked.
 
     A failed check (a pooler blip, say) is not a refusal: the client treats
@@ -1381,12 +1433,15 @@ async def _can_play_solo(user_id: str, challenge_id: str) -> bool | None:
     allowed in. The caller closes with a retryable code instead."""
     try:
         from challenges import _can_play_challenge, _challenge_access_sets
+        if not challenge_id:
+            # Only asked with study mode on: a participant chats only inside a task.
+            return await study_mode.active_participant(user_id) is None
         async with AsyncSessionLocal() as db:
             ch = await db.get(Challenge, challenge_id)
             if ch is None:
                 return False
             _, _, is_admin = await _challenge_access_sets(db, user_id)
-            return await _can_play_challenge(db, user_id, challenge_id, ch, is_admin)
+            return await _can_play_challenge(db, user_id, challenge_id, ch, is_admin, session_num)
     except Exception as e:
         log.error(f"could not check access to challenge {challenge_id}: {e}")
         return None
@@ -1452,8 +1507,8 @@ async def websocket_endpoint(
     # anything about the challenge is loaded: without it, any signed-in user
     # with a challenge id could open a chat on it and be sent its brief, goal
     # and coaching prompt, whether or not it was ever assigned to them.
-    if challenge_id:
-        allowed = await _can_play_solo(user_id, challenge_id)
+    if challenge_id or study_mode.study_mode_enabled():
+        allowed = await _can_play_solo(user_id, challenge_id, session_num)
         if allowed is None:
             # 1013 = try again later; the client reconnects on anything but 4001/4003.
             await websocket.close(code=1013, reason="Could not check access; retrying")
@@ -1463,12 +1518,34 @@ async def websocket_endpoint(
             return
 
     system_prompt, session_data = await _build_system_prompt(challenge_id, session_num)
-    chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
     study_policy_, feed_enabled, revision_turn = await _resolve_solo_study_config(
         user_id, challenge_id, session_num
     )
     study_condition = study_policy_.as_condition()
+    study_gate = await study_mode.solo_gate(user_id, challenge_id, session_num)
+    if study_gate is not None:
+        study_condition.update(study_gate.condition_fields())
+        # Lucy's design picks the prompt per task: the study tutor prompt
+        # (HuskyAI training), or the plain prompt (standard training; every
+        # post-test task, with its scripted error). Every
+        # other challenge keeps _build_system_prompt's prompt unchanged.
+        study_prompt = study_mode.study_system_prompt(
+            study_gate.participant, challenge_id, session_data)
+        if study_prompt is not None:
+            system_prompt = study_prompt
+        # Named on every event too, so the log says which version produced it
+        # without a join.
+        assignment = study_mode.assignment_of(study_gate.participant)
+        study_condition["study_phase"] = study_mode.phase_of(study_gate.participant, challenge_id)
+        study_condition["study_error_type"] = study_mode.error_type_for(
+            study_gate.participant, challenge_id)
+        study_condition["study_set_order"] = assignment.get("set_order")
+        study_condition["study_error_order"] = assignment.get("error_order")
+        # What produced this session's replies and scores, for the export.
+        study_condition["chat_model"] = study_mode.STUDY_CHAT_MODEL
+        study_condition["eval_version"] = study_mode.eval_version()
+    chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
     # Resolved once per connection rather than per turn: a corpus cannot change
     # mid-session without a reconnect, and re-resolving each turn would add a
     # query to the hot path for a value that does not move.
@@ -1579,8 +1656,14 @@ async def websocket_endpoint(
                         session_min_turns = ucs.min_turns
                         session_started_at = ucs.started_at
                     if ucs and not ucs.conversation_id:
-                        ucs.conversation_id = conversation_id
-                        await db.commit()
+                        if study_gate is not None:
+                            # Participants: two first connects (a fast reconnect)
+                            # must not leave the turns in an unlinked conversation.
+                            conversation_id = await study_mode.link_conversation(
+                                db, ucs, conversation_id)
+                        else:
+                            ucs.conversation_id = conversation_id
+                            await db.commit()
                     if ucs and ucs.status != "completed":
                         from challenges import revision_owed
                         revision_owed_turn = await revision_owed(db, user_id, challenge_id, ucs)
@@ -1604,6 +1687,10 @@ async def websocket_endpoint(
         max(0, int((session_deadline - datetime.utcnow()).total_seconds()))
         if session_deadline else None
     )
+    if study_gate is not None and session_deadline:
+        # Rounded up for participants, so their countdown never ends before
+        # the server's deadline (see study_mode.remaining_seconds).
+        remaining_seconds = study_mode.remaining_seconds(session_deadline)
 
     scored_turns = 0
     if conversation_id:
@@ -1626,6 +1713,7 @@ async def websocket_endpoint(
             # What the minimum-turns rule counts: turns that got a score.
             "scored_turns": scored_turns,
             "revision_owed_after_turn": None if session_is_completed else revision_owed_turn,
+            **({"feedback_visible": feed_enabled} if study_gate is not None else {}),
         }))
 
     # Send session context to client immediately if challenge mode
@@ -1637,6 +1725,10 @@ async def websocket_endpoint(
                 "goal": session_data.get("goal"),
                 "brief": session_data.get("brief"),
                 "seed_question": session_data.get("seed_question"),
+                # Only Lucy's study tasks set it (a Markdown table brief);
+                # every other challenge sends exactly what it did before.
+                **({"brief_format": session_data["brief_format"]}
+                   if session_data.get("brief_format") else {}),
             }
         }))
 
@@ -1667,6 +1759,10 @@ async def websocket_endpoint(
     if conversation_id:
         _solo_sockets.setdefault(conversation_id, set()).add(websocket)
     solo_lock = _solo_turn_lock(conversation_id) if conversation_id else asyncio.Lock()
+    study_watchdog = None
+    if study_gate is not None and conversation_id and session_deadline and not session_is_completed:
+        study_watchdog = asyncio.create_task(
+            _study_deadline_watchdog(websocket, conversation_id, session_deadline))
 
     client_host = websocket.client.host if websocket.client else "unknown"
     mode = f"challenge={challenge_id}/session={session_num}" if challenge_id else "free"
@@ -1678,7 +1774,25 @@ async def websocket_endpoint(
     try:
         while True:
             raw = await websocket.receive_text()
+            # When the participant sent it: the message rows are written only
+            # after the reply and its evaluation, so their own time is late.
+            received_at = datetime.utcnow()
             data = json.loads(raw)
+
+            if data.get("type") == "study_panel":
+                # A participant hiding or reopening the feedback panel changes
+                # how much of the intervention they saw, so it is logged like
+                # the feed itself. Participants only; anyone else is ignored.
+                if study_gate is not None and conversation_id:
+                    is_open = data.get("open") is True
+                    reason = data.get("reason") if data.get("reason") in ("user", "auto_narrow") else "user"
+                    await _log_feed_event(
+                        conversation_id,
+                        "feed.panel_opened" if is_open else "feed.panel_collapsed",
+                        {"open": is_open, "reason": reason},
+                        condition=study_condition,
+                    )
+                continue
 
             if data.get("type") != "message":
                 log.debug(f"[WS] Ignoring non-message packet: type={data.get('type')}")
@@ -1829,6 +1943,7 @@ async def websocket_endpoint(
                     continue
 
                 conversation_history.append({"role": "assistant", "content": full_response})
+                responded_at = datetime.utcnow()
 
                 await websocket.send_text(json.dumps({
                     "type": "done",
@@ -1896,6 +2011,9 @@ async def websocket_endpoint(
                             conversation_id, user_content, full_response, eval_result, turn,
                             attachments, condition=study_condition,
                             is_graded_revision=is_revision,
+                            # Participants only: the study logs when each
+                            # message was sent; everyone else is unchanged.
+                            sent_at=(received_at, responded_at) if study_gate is not None else None,
                         )
                     if eval_failed and eval_id:
                         # Before notifying, for the same reason as the save above.
@@ -1979,6 +2097,8 @@ async def websocket_endpoint(
         if conversation_id:
             await _close_conversation(conversation_id)
     finally:
+        if study_watchdog is not None:
+            study_watchdog.cancel()
         if conversation_id:
             socks = _solo_sockets.get(conversation_id)
             if socks is not None:
@@ -3366,6 +3486,9 @@ async def end_conversation(
     if ucs:
         from challenges import finish_check, raise_if_blocked
         check = await finish_check(db, user_id, ucs.challenge_id, ucs)
+        if not check.past_deadline and await study_mode.in_end_grace(user_id, ucs):
+            check.past_deadline = True
+        await study_mode.require_a_turn(db, user_id, ucs, check.past_deadline)
         raise_if_blocked(check)
         past_deadline = check.past_deadline
         missed_revision_turn = check.revision_owed_turn
@@ -3408,6 +3531,10 @@ async def end_conversation(
     if schedule_analysis:
         _spawn_analysis(conversation_id, user_id)
 
+    if ucs:
+        await study_mode.advance_if_block_done(user_id, ucs.challenge_id)
+    if await study_mode.feedback_hidden_for(user_id, ucs.id if ucs else None):
+        avg_pei = None
     return {
         "session_avg_pei": round(float(avg_pei), 1) if avg_pei is not None else None,
         "turns": int(turn_count or 0),
@@ -3941,6 +4068,10 @@ async def export_conversation(
     peis = [e.pei for e in evals if e.pei is not None]
     avg_pei = sum(peis) / len(peis) if peis else None
 
+    if await study_mode.feedback_hidden_for(user_id, ucs.id if ucs else None):
+        for t in turns:
+            t["eval"] = None
+        avg_pei = None
     pdf_bytes = _render_export_pdf(title, conv.started_at, turns, avg_pei)
     safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip().replace(" ", "_")[:60]
     date_str = (conv.started_at or datetime.utcnow()).strftime("%Y%m%d")
@@ -3983,6 +4114,8 @@ async def get_session_analysis(
         _spawn_analysis(conversation_id, user_id)
         log.info(f"[SESSION-ANALYSIS] re-queued stale pending for {conversation_id[:8]}...")
 
+    if await study_mode.feedback_hidden_for(user_id, ucs.id):
+        return {"status": "hidden"}
     return ucs.session_analysis
 
 
@@ -4045,6 +4178,8 @@ async def stronger_prompt(
     the student's input. Powers the 'Show me a stronger prompt' button in the eval
     sidebar. Grounded in the turn's two weakest dimensions + coach suggestions.
     """
+    if await study_mode.feedback_hidden_now(user_id):
+        raise HTTPException(status_code=403, detail="Not available in this session.")
     original = (body.prompt or "").strip()
     if not original:
         raise HTTPException(status_code=400, detail="No prompt to improve yet.")

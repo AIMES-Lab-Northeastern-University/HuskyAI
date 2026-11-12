@@ -20,6 +20,7 @@ from auth import resolve_token_user_id, pwd_context
 # Authored-section reader, kept in challenges.py next to the validation that
 # writes them so the two cannot drift on which sessions_data key holds them.
 from challenges import _feed_flags_of, _sections_of
+import study_mode
 from database import (
     AsyncSessionLocal,
     Challenge,
@@ -99,6 +100,13 @@ class ReorderChallengesBody(BaseModel):
     ordered_challenge_ids: list[str] = Field(..., min_length=1)
 
 
+async def _refuse_study_account(user_id: str) -> None:
+    """Study participants never join or run a section: their data must stay
+    out of every roster, dashboard and classroom export."""
+    if await study_mode.is_participant_user(user_id):
+        raise HTTPException(status_code=403, detail="Study accounts can't join or create sections.")
+
+
 @router.post("")
 async def create_classroom(
     body: CreateClassroomBody,
@@ -106,6 +114,7 @@ async def create_classroom(
     db: AsyncSession = Depends(get_db),
 ):
     """Instructor creates a section; caller becomes instructor membership."""
+    await _refuse_study_account(user_id)
     for _ in range(12):
         code = _generate_join_code()
         existing = await db.execute(select(Classroom).where(Classroom.join_code == code))
@@ -154,6 +163,7 @@ async def join_classroom(
     user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _refuse_study_account(user_id)
     raw = body.code.strip().upper().replace(" ", "")
     result = await db.execute(select(Classroom).where(Classroom.join_code == raw, Classroom.is_active == True))  # noqa: E712
     room = result.scalar_one_or_none()
@@ -190,6 +200,7 @@ async def join_listed_classroom(
     """Join a section directly from the public directory. Only sections the
     instructor marked listed_in_directory=True can be joined this way; unlisted
     sections still require the private join code via POST /classrooms/join."""
+    await _refuse_study_account(user_id)
     room = await db.get(Classroom, classroom_id)
     if not room or not room.is_active:
         raise HTTPException(status_code=404, detail="Section not found")
@@ -1180,7 +1191,7 @@ async def seed_pilot_classroom() -> None:
         )
         added = 0
         for ch in r_ch.scalars().all():
-            if ch.id in already_linked:
+            if ch.id in already_linked or study_mode.is_study_challenge(ch.id):
                 continue
             db.add(
                 ClassroomChallenge(
