@@ -48,7 +48,8 @@ export function authHeaders() {
 // out (sign-out button, expired token, a 4001 socket close): clearing only the
 // token left the previous person's instructor/admin nav flags and role list
 // behind for whoever signed in next on the same machine.
-const SESSION_KEYS = ['token', 'user', 'is_instructor', 'debug_roles', 'research_ack']
+const SESSION_KEYS = ['token', 'user', 'is_instructor', 'debug_roles', 'research_ack',
+                      'study_participant', 'study_last_block']
 
 export function clearSession() {
   for (const k of SESSION_KEYS) {
@@ -77,7 +78,14 @@ let redirectingToLogin = false
 export function handleUnauthorized(go = (url) => window.location.assign(url)) {
   if (redirectingToLogin) return
   redirectingToLogin = true
-  const target = loginUrlWithNext()
+  // Study builds only: a participant's token is refused once their study
+  // session has ended (or they were revoked); they have no login to go to.
+  let participant = false
+  try {
+    participant = import.meta.env.VITE_STUDY_MODE_ENABLED === 'true'
+      && localStorage.getItem('study_participant') === 'true'
+  } catch { /* storage blocked */ }
+  const target = participant ? '/study?ended=1' : loginUrlWithNext()
   clearSession()
   go(target)
 }

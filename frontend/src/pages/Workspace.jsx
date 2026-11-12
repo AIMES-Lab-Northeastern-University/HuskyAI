@@ -8,7 +8,30 @@ import InfoIcon from '../components/InfoIcon'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 import { API_URL, authHeaders, formatApiErrorDetail, clearSession, readApiError } from '../lib/api'
 import { DIM_META, PEI_INFO } from '../lib/metricInfo'
+import {
+  STUDY_TASK_COUNT, StudyTaskEnded, StudyTaskFinishedPage, StudyTaskUnavailable, isParticipant,
+  maskFeedbackFrame, NEUTRAL_PANEL_TEXT, studyTakesOver, useCompletion,
+} from '../lib/study'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
+
+// Narrow enough that a 380px feedback panel would squeeze the chat (a phone,
+// or a narrow survey frame).
+const NARROW_QUERY = '(max-width: 900px)'
+function narrowNow() {
+  try { return Boolean(window.matchMedia?.(NARROW_QUERY).matches) } catch { return false }
+}
+function useNarrowScreen() {
+  const [narrow, setNarrow] = useState(narrowNow)
+  useEffect(() => {
+    let mq
+    try { mq = window.matchMedia?.(NARROW_QUERY) } catch { mq = null }
+    if (!mq) return undefined
+    const onChange = () => setNarrow(mq.matches)
+    mq.addEventListener?.('change', onChange)
+    return () => mq.removeEventListener?.('change', onChange)
+  }, [])
+  return narrow
+}
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -83,11 +106,23 @@ function fmtClock(ms) {
 }
 
 /* ─── Eval Panel ─── */
-function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreNotice }) {
+function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreNotice, neutral = false }) {
   // A session can be configured to score every turn without showing the score.
   // That is an experimental condition, not a failure, so it gets its own
   // deliberate panel — an empty or errored-looking sidebar would read as the
   // evaluator being broken and change how students behave for the wrong reason.
+  if (feedSuppressed && neutral) {
+    // Study participants: nothing here may suggest the work is being scored.
+    return (
+      <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col" style={{ borderLeftWidth: '1.5px' }}>
+        <div className="p-5">
+          <div className="bg-[#F7F3EE] border border-[#E7E0D8] rounded-[14px] p-5" style={{ borderWidth: '1.5px' }}>
+            <p className="text-[13px] text-[#4A4440] leading-relaxed">{NEUTRAL_PANEL_TEXT}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
   if (feedSuppressed) {
     return (
       <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col" style={{ borderLeftWidth: '1.5px' }}>
@@ -352,6 +387,20 @@ function Message({ role, content, attachments, citations }) {
 }
 
 /* ─── Challenge brief banner ─── */
+// A Markdown brief's policy list and document table, styled to sit in the banner.
+const BRIEF_MARKDOWN = {
+  p: ({ children }) => <p style={{ margin: '0 0 8px' }}>{children}</p>,
+  ul: ({ children }) => <ul style={{ margin: '0 0 8px', paddingLeft: '18px', listStyle: 'disc' }}>{children}</ul>,
+  li: ({ children }) => <li style={{ marginBottom: '2px' }}>{children}</li>,
+  table: ({ children }) => (
+    <div style={{ overflowX: 'auto', margin: '0 0 8px' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '12.5px', background: '#FFFFFF' }}>{children}</table>
+    </div>
+  ),
+  th: ({ children, style }) => <th style={{ ...style, border: '1px solid #E7E0D8', padding: '5px 8px', background: '#F7F3EE', fontWeight: 600, color: '#16120E' }}>{children}</th>,
+  td: ({ children, style }) => <td style={{ ...style, border: '1px solid #E7E0D8', padding: '5px 8px' }}>{children}</td>,
+}
+
 function ChallengeBanner({ context, onUseSeed }) {
   const [expanded, setExpanded] = useState(true)
   if (!context) return null
@@ -380,13 +429,23 @@ function ChallengeBanner({ context, onUseSeed }) {
       </div>
       {expanded && (
         <>
-          <p style={{ fontSize: '12px', color: '#9E0B24', marginBottom: '8px', lineHeight: 1.6 }}>
-            <strong>Goal:</strong> {context.goal}
-          </p>
-          <div style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px', fontSize: '12px', color: '#4A4440', lineHeight: 1.7, marginBottom: '10px', whiteSpace: 'pre-wrap' }}>
-            {context.brief}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
+          {/* A Markdown brief (Lucy's study tasks only) ends with its own
+              "Your task" line, so it carries no separate goal. */}
+          {context.brief_format !== 'markdown' && (
+            <p style={{ fontSize: '12px', color: '#9E0B24', marginBottom: '8px', lineHeight: 1.6 }}>
+              <strong>Goal:</strong> {context.goal}
+            </p>
+          )}
+          {context.brief_format === 'markdown' ? (
+            <div data-testid="brief-markdown" className="study-brief" style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px 12px', fontSize: '13px', color: '#4A4440', lineHeight: 1.6, marginBottom: '10px' }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={BRIEF_MARKDOWN}>{context.brief}</ReactMarkdown>
+            </div>
+          ) : (
+            <div style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px', fontSize: '12px', color: '#4A4440', lineHeight: 1.7, marginBottom: '10px', whiteSpace: 'pre-wrap' }}>
+              {context.brief}
+            </div>
+          )}
+          {!(isParticipant() && !context.seed_question) && <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
             <p style={{ fontSize: '12px', color: '#9E0B24', fontStyle: 'italic', flex: 1, margin: 0, lineHeight: 1.6 }}>
               "{context.seed_question}"
             </p>
@@ -396,7 +455,7 @@ function ChallengeBanner({ context, onUseSeed }) {
             >
               Use this →
             </button>
-          </div>
+          </div>}
         </>
       )}
     </div>
@@ -411,6 +470,13 @@ export default function Workspace() {
   const [searchParams] = useSearchParams()
   const challengeId  = searchParams.get('challenge')
   const sessionNum   = searchParams.get('session')
+  // Study survey links (/study?code=...&task=N) land here with these.
+  const studyTask    = searchParams.get('task')
+  const studyEmbed   = searchParams.get('embed') === '1'
+  const embeddedInSurvey = studyEmbed && isParticipant()
+  // A survey task (per-task link, or framed in the survey): no way back to
+  // the task list, which is not part of the survey flow.
+  const fromSurvey = Boolean(studyTask) || embeddedInSurvey
   const demoChallengeSlug = searchParams.get('demoChallenge')
 
   const token = localStorage.getItem('token')
@@ -447,6 +513,19 @@ export default function Workspace() {
   // the score is deliberately not shown. revisionRequired: the feed has been
   // shown for the designated turn and the next submission is the one that counts.
   const [feedSuppressed, setFeedSuppressed] = useState(false)
+  // Study mode second layer. A participant starts with feedback hidden (fail
+  // closed) and sees it only once session_init says feedback_visible: true;
+  // while hidden, score frames are masked and every score surface is hidden.
+  // The server already withholds them. Normal users never get the field.
+  const [feedbackHidden, setFeedbackHidden] = useState(() => isParticipant())
+  const feedbackHiddenRef = useRef(feedbackHidden)
+  // Participants only: the feedback panel can be hidden. It starts hidden on
+  // a narrow screen (a phone in the survey frame) and opens over the chat
+  // there. Every change is logged: the panel is the intervention.
+  const narrowScreen = useNarrowScreen()
+  const [panelOpen, setPanelOpen] = useState(() => !narrowNow())
+  const panelLoggedRef = useRef(false)
+  const [taskUnavailable, setTaskUnavailable] = useState(false)
   const [revisionRequired, setRevisionRequired] = useState(null)
   const [revisionDone, setRevisionDone]   = useState(false)
   // Turn whose feedback still needs a graded revision (server-decided, sent in
@@ -465,6 +544,8 @@ export default function Workspace() {
   const [deadlineMs, setDeadlineMs]       = useState(null)
   const [remainingMs, setRemainingMs]     = useState(null)
   const [timeWarning, setTimeWarning]     = useState(false)
+  // A participant's finished task: its owed page of questions, then its code.
+  const study = useCompletion(sessionEnded && isParticipant() ? challengeId : null, studyEmbed)
 
   const wsRef              = useRef(null)
   const reconnectTimer     = useRef(null)
@@ -564,14 +645,42 @@ export default function Workspace() {
       navigate('/', { replace: true })
       return
     }
+    // Read before clearSession, which drops the participant marker.
+    const participant = isParticipant()
     clearSession()
     wsRef.current?.close()
-    navigate('/login', { replace: true })
+    // A participant's token stops working when their study session ends.
+    navigate(participant ? '/study?ended=1' : '/login', { replace: true })
   }
 
+  const sendPanelState = (open, reason) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify({ type: 'study_panel', open, reason })) } catch { /* closing */ }
+    }
+  }
+  const togglePanel = () => {
+    const open = !panelOpen
+    setPanelOpen(open)
+    sendPanelState(open, 'user')
+  }
+  // A panel that starts hidden (narrow screen) is logged once, when the
+  // session says feedback is shown, so its absence is in the log too.
+  useEffect(() => {
+    if (!isParticipant() || feedbackHidden || connStatus !== 'connected' || panelLoggedRef.current) return
+    panelLoggedRef.current = true
+    if (!panelOpen) sendPanelState(false, 'auto_narrow')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedbackHidden, connStatus])
+
   const handleWsMessage = useCallback((data) => {
+    if (feedbackHiddenRef.current) data = maskFeedbackFrame(data)
     switch (data.type) {
       case 'session_init':
+        if (typeof data.feedback_visible === 'boolean') {
+          feedbackHiddenRef.current = !data.feedback_visible
+          setFeedbackHidden(!data.feedback_visible)
+        }
         setConversationId(data.conversation_id)
         setMinTurns(typeof data.min_turns === 'number' ? data.min_turns : null)
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
@@ -760,7 +869,7 @@ export default function Workspace() {
       setConnStatus('disconnected'); setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
       if (e.code === 4001) { handleLogout(); return }
       // Not allowed to play this challenge: retrying every 3s cannot fix that.
-      if (e.code === 4003) { setConnStatus('error'); return }
+      if (e.code === 4003) { setConnStatus('error'); if (isParticipant()) setTaskUnavailable(true); return }
       if (sessionEndedRef.current) return
       reconnectTimer.current = setTimeout(connect, 3000)
     }
@@ -853,8 +962,11 @@ export default function Workspace() {
         setEndReason(data.end_reason ?? null)
         ok = true
         // Surface the analysis panel and start polling for the background result.
-        setShowAnalysis(true)
-        pollAnalysis(conversationId)
+        // Not on a survey task link: there the completion code is what matters.
+        if (!feedbackHiddenRef.current && !(isParticipant() && studyTask)) {
+          setShowAnalysis(true)
+          pollAnalysis(conversationId)
+        }
       } else if (!auto) {
         // Normally unreachable: the button is disabled while a gate applies.
         // Shown inline for a stale tab, instead of failing silently.
@@ -988,20 +1100,27 @@ export default function Workspace() {
   }
 
   if (!isDemo && !token) return <Navigate to="/login" replace />
+  // Past page 1 of a finished task's questions: the task and chat are gone.
+  if (isParticipant() && sessionEnded && studyTakesOver(study)) {
+    return <StudyTaskFinishedPage study={study} fromSurvey={fromSurvey} />
+  }
 
   const connDot = { connected: '#16A34A', connecting: '#F97316', error: '#C8102E', disconnected: '#9A948E' }
 
   return (
     <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
-      <Sidebar onLogout={handleLogout} />
+      {/* Embedded in the survey: no sidebar. Its only entries (study tasks,
+          sign out) are not for use mid-survey, and the frame needs the width. */}
+      {!embeddedInSurvey && <Sidebar onLogout={handleLogout} />}
 
       {/* Main area */}
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: embeddedInSurvey ? 0 : 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0 sticky top-0 z-10" style={{ borderBottomWidth: '1.5px' }}>
           {challengeId ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {!isParticipant() && <>
               <button
                 onClick={() => navigate(`${isDemo ? '/demo' : ''}/challenges/${challengeId}`)}
                 style={{ display: 'flex', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '12px', padding: 0 }}
@@ -1010,12 +1129,13 @@ export default function Workspace() {
                 Challenge
               </button>
               <span style={{ color: '#E7E0D8' }}>/</span>
+              </>}
               <span className="text-[14px] font-semibold text-[#16120E]">
                 {challengeContext?.title || 'Session ' + sessionNum}
               </span>
               {sessionNum && (
                 <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#FDE8EC', color: '#C8102E' }}>
-                  Session {sessionNum}
+                  {isParticipant() && studyTask ? `Task ${studyTask} of ${STUDY_TASK_COUNT}` : `Session ${sessionNum}`}
                 </span>
               )}
             </div>
@@ -1046,7 +1166,7 @@ export default function Workspace() {
                 <span aria-hidden>⏱</span>{fmtClock(remainingMs)}
               </div>
             )}
-            {conversationId && !isDemo && messages.length > 0 && (
+            {conversationId && !isDemo && messages.length > 0 && !feedbackHidden && (
               <button
                 onClick={handleExport}
                 disabled={exporting}
@@ -1067,13 +1187,47 @@ export default function Workspace() {
                 {exporting ? 'Exporting…' : 'Export chat'}
               </button>
             )}
-            {conversationId && !isDemo && (() => {
+            {conversationId && !isDemo && isParticipant() && (() => {
+              // A participant finishes after at least one saved turn; the server
+              // enforces the same rule (and the timer ends the task regardless).
+              // turnCount moves when the server confirms the turn is saved (the
+              // eval / eval_suppressed / eval_pending frame), not when the reply
+              // finishes streaming: the save comes after scoring.
+              const saved = turnCount >= 1 && !isEvaluating && !isStreaming && !isTyping
+              const disabled = sessionEnded || endingSession || !saved
+              return (
+                <>
+                {endError && <span role="alert" style={{ fontSize: '12px', color: '#C8102E' }}>{endError}</span>}
+                <button
+                  onClick={() => handleEndSession()}
+                  disabled={disabled}
+                  title={sessionEnded || saved ? undefined
+                    : (turnCount >= 1 || isEvaluating || isStreaming || isTyping ? 'Saving your message…' : 'Send at least one message first')}
+                  style={{
+                    padding: '5px 14px',
+                    background: disabled ? '#F7F3EE' : '#FDE8EC',
+                    color: disabled ? '#9A948E' : '#C8102E',
+                    border: '1.5px solid',
+                    borderColor: disabled ? '#E7E0D8' : '#F9BFCA',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: disabled ? 'default' : 'pointer',
+                    opacity: endingSession ? 0.6 : 1,
+                  }}
+                >
+                  {sessionEnded ? 'Task finished' : endingSession ? 'Finishing…' : 'Finish task'}
+                </button>
+                </>
+              )
+            })()}
+            {conversationId && !isDemo && !isParticipant() && (() => {
               const minTurnsMet = minTurns == null || scoredTurns >= minTurns
               const turnsLeft = minTurns != null ? Math.max(0, minTurns - scoredTurns) : 0
               const revisionPending = revisionOwedTurn != null && !revisionDone
               const disabled = sessionEnded || endingSession || !minTurnsMet || revisionPending
               const title = sessionEnded ? undefined
-                : !minTurnsMet ? `Send ${turnsLeft} more scored turn${turnsLeft !== 1 ? 's' : ''} to end`
+                : !minTurnsMet ? `Send ${turnsLeft} more ${feedbackHidden ? '' : 'scored '}turn${turnsLeft !== 1 ? 's' : ''} to end`
                 : revisionPending
                   ? (turnCount < revisionOwedTurn
                     ? `After the feedback on turn ${revisionOwedTurn} you'll send one revised attempt; you can end the session after that`
@@ -1126,7 +1280,7 @@ export default function Workspace() {
         </div>
 
         {/* Two-panel layout */}
-        <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 flex overflow-hidden relative">
 
           {/* Chat panel */}
           <div className="flex flex-col flex-1 overflow-hidden bg-[#F7F3EE]">
@@ -1140,7 +1294,8 @@ export default function Workspace() {
                 />
               )}
 
-              {messages.length === 0 && !isTyping && !isStreaming && (
+              {taskUnavailable && <StudyTaskUnavailable fromSurvey={fromSurvey} />}
+              {messages.length === 0 && !isTyping && !isStreaming && !taskUnavailable && (
                 <div className="flex-1 flex flex-col items-center justify-center text-center py-20">
                   <div className="w-12 h-12 bg-[#C8102E] rounded-[14px] flex items-center justify-center mb-4 mx-auto">
                     <svg className="w-6 h-6 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1152,9 +1307,11 @@ export default function Workspace() {
                     {challengeContext ? 'Challenge ready' : 'Start your session'}
                   </h2>
                   <p className="text-[13px] text-[#9A948E] max-w-[320px] leading-[1.65]">
-                    {challengeContext
-                      ? 'Click "Use this →" above to load the seed question, or write your own.'
-                      : 'Ask a question. Your prompting style will be scored in real time.'}
+                    {challengeContext && isParticipant() && !challengeContext.seed_question
+                      ? 'Write your first message to the AI assistant below.'
+                      : challengeContext
+                        ? 'Click "Use this →" above to load the seed question, or write your own.'
+                        : 'Ask a question. Your prompting style will be scored in real time.'}
                   </p>
                 </div>
               )}
@@ -1165,7 +1322,7 @@ export default function Workspace() {
                   {/* Under the latest user turn, once it has been scored (not in demo). */}
                   {!isDemo
                     && i === messages.findLastIndex((mm) => mm.role === 'user')
-                    && evalData?.scores?.PEI != null && (
+                    && evalData?.scores?.PEI != null && !feedbackHidden && (
                       <StrongerPromptCard
                         prompt={m.content}
                         scores={evalData?.scores}
@@ -1215,7 +1372,10 @@ export default function Workspace() {
 
             {/* Input area */}
             <div className="flex-shrink-0 px-6 py-4 border-t border-[#E7E0D8] bg-[#FDFCFB]" style={{ borderTopWidth: '1.5px' }}>
-              {sessionEnded ? (
+              {sessionEnded && isParticipant() ? (
+                <StudyTaskEnded canViewAnalysis={!feedbackHidden && !fromSurvey} onViewAnalysis={() => setShowAnalysis(true)}
+                  study={study} fromSurvey={fromSurvey} />
+              ) : sessionEnded ? (
                 <div style={{
                   background: '#F7F3EE',
                   border: '1.5px solid #E7E0D8',
@@ -1349,15 +1509,44 @@ export default function Workspace() {
             </div>
           </div>
 
-          {/* Eval panel */}
-          <div className="w-[380px] flex-shrink-0 overflow-hidden">
-            <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} scoreNotice={scoreNotice} />
-          </div>
+          {/* Eval panel. A participant whose session shows no feedback gets no
+              panel at all (standard condition, and every post-test task). */}
+          {!isParticipant() && (
+            <div className="w-[380px] flex-shrink-0 overflow-hidden">
+              <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed || feedbackHidden} scoreNotice={scoreNotice} neutral={feedbackHidden} />
+            </div>
+          )}
+          {isParticipant() && !feedbackHidden && !panelOpen && (
+            <div className="w-[40px] flex-shrink-0 bg-[#FDFCFB] border-l border-[#E7E0D8] flex justify-center pt-3" style={{ borderLeftWidth: '1.5px' }}>
+              <button type="button" onClick={togglePanel} aria-expanded="false" aria-controls="study-feedback-panel"
+                data-testid="feedback-panel-show"
+                className="[writing-mode:vertical-rl] rotate-180 px-1 py-3 bg-[#C8102E] text-white text-[12px] font-semibold border-none rounded-[8px] cursor-pointer">
+                Show feedback
+              </button>
+            </div>
+          )}
+          {isParticipant() && !feedbackHidden && panelOpen && (
+            <div id="study-feedback-panel" data-testid="feedback-panel"
+              className={narrowScreen
+                ? 'absolute top-0 right-0 bottom-0 z-20 w-[min(380px,100%)] flex flex-col bg-[#FDFCFB] shadow-[-8px_0_24px_rgba(22,18,14,0.18)]'
+                : 'w-[380px] flex-shrink-0 flex flex-col overflow-hidden'}>
+              <div className="flex justify-end px-3 py-2 bg-[#FDFCFB] border-b border-l border-[#E7E0D8] flex-shrink-0">
+                <button type="button" onClick={togglePanel} aria-expanded="true" aria-controls="study-feedback-panel"
+                  data-testid="feedback-panel-hide"
+                  className="px-3 py-[5px] bg-[#FDFCFB] text-[#4A4440] border-[1.5px] border-[#E7E0D8] rounded-[8px] text-[12px] font-semibold cursor-pointer">
+                  Hide feedback ›
+                </button>
+              </div>
+              <div className="flex-1 overflow-hidden">
+                <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} scoreNotice={scoreNotice} neutral={false} />
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Post-session analysis modal */}
-      {showAnalysis && !isDemo && (
+      {showAnalysis && !isDemo && !feedbackHidden && (
         <div
           onClick={() => setShowAnalysis(false)}
           style={{
