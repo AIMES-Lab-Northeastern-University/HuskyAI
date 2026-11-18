@@ -50,7 +50,11 @@ export default function StudyHome() {
         load()
         return
       }
-      navigate(`/workspace?challenge=${task.challenge_id}&session=${task.session_number}`)
+      // With its task number the workspace looks exactly as it does from the
+      // survey link (no sidebar, task progress, timer bar).
+      const q = new URLSearchParams({ challenge: task.challenge_id, session: String(task.session_number) })
+      if (task.task) q.set('task', String(task.task))
+      navigate(`/workspace?${q}`)
     } catch {
       setStartError('Could not reach the server. Try again.')
       setStarting(false)

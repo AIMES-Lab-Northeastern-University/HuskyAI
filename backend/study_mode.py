@@ -872,8 +872,12 @@ async def study_tasks(participant: StudyParticipant = Depends(_current_participa
     return {
         "current_block": participant.current_block,
         "progress": {"completed": len(done), "total": len(ids)},
+        # `task` is the survey's task number (1-6), so the task list can open a
+        # task exactly as its survey link does (?task=N). None in the older
+        # layout, which has no task numbers.
         "tasks": [
             {"challenge_id": t, "title": titles.get(t), "session_number": STUDY_SESSION_NUMBER,
+             "task": task_number_for(participant, t),
              "completed": t in done, "started": t in started, "current": t == current}
             for t in ids
         ],

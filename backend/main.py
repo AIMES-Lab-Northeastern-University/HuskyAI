@@ -1794,6 +1794,21 @@ async def websocket_endpoint(
                     )
                 continue
 
+            if data.get("type") == "study_panel_resize":
+                # A participant on a narrow screen resizing the feedback overlay:
+                # how much of the screen the feedback took. Participants only;
+                # anything that is not a pair of sane pixel counts is dropped.
+                if study_gate is not None and conversation_id:
+                    w, c = data.get("width_px"), data.get("container_px")
+                    if all(isinstance(v, int) and not isinstance(v, bool) and 0 < v <= 10000
+                           for v in (w, c)):
+                        await _log_feed_event(
+                            conversation_id, "feed.panel_resized",
+                            {"width_px": w, "container_px": c},
+                            condition=study_condition,
+                        )
+                continue
+
             if data.get("type") != "message":
                 log.debug(f"[WS] Ignoring non-message packet: type={data.get('type')}")
                 continue
@@ -4002,6 +4017,10 @@ async def export_conversation(
     conv = await db.get(Conversation, conversation_id)
     if not conv or conv.user_id != user_id:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    # Study participants never take a copy of a task out of the survey, in
+    # either condition. Flag off: no lookup, everyone exports as before.
+    if await study_mode.active_participant(user_id) is not None:
+        raise HTTPException(status_code=403, detail="Export is not available in the study")
 
     # Title: challenge/session name if linked, else a generic workspace label.
     title = "Workspace chat"
@@ -4068,10 +4087,6 @@ async def export_conversation(
     peis = [e.pei for e in evals if e.pei is not None]
     avg_pei = sum(peis) / len(peis) if peis else None
 
-    if await study_mode.feedback_hidden_for(user_id, ucs.id if ucs else None):
-        for t in turns:
-            t["eval"] = None
-        avg_pei = None
     pdf_bytes = _render_export_pdf(title, conv.started_at, turns, avg_pei)
     safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip().replace(" ", "_")[:60]
     date_str = (conv.started_at or datetime.utcnow()).strftime("%Y%m%d")
