@@ -6,6 +6,7 @@ import InfoIcon from '../components/InfoIcon'
 import { PEI_INFO } from '../lib/metricInfo'
 import { getDemoChallengeDetail, demoSlugForChallengeId } from '../demo/demoData'
 import { readApiError, clearSession } from '../lib/api'
+import { STUDY_HOME, isParticipant, studyTaskView } from '../lib/study'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -130,7 +131,7 @@ export default function ChallengeDetail() {
         if (!r.ok) throw new Error('Not found')
         return r.json()
       })
-      .then(data => setChallenge(data))
+      .then(data => setChallenge(isParticipant() ? studyTaskView(data) : data))
       .catch(() => setError('Challenge not found'))
       .finally(() => setLoading(false))
   }
@@ -172,6 +173,9 @@ export default function ChallengeDetail() {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       })
+      // A participant's task that is no longer current was finished already
+      // (another tab, the timer): carry on to the next one.
+      if (isParticipant() && (res.ok || res.status === 404)) { navigate(STUDY_HOME); return }
       if (!res.ok) {
         const msg = await readApiError(res, 'Could not mark session as complete')
         setCompleteError(prev => ({ ...prev, [sessionNumber]: msg }))
@@ -225,13 +229,13 @@ export default function ChallengeDetail() {
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
           <button
-            onClick={() => navigate(`${pathPrefix}/challenges`)}
+            onClick={() => navigate(isParticipant() ? STUDY_HOME : `${pathPrefix}/challenges`)}
             style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '13px', padding: 0 }}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M19 12H5M12 19l-7-7 7-7" />
             </svg>
-            Challenges
+            {isParticipant() ? 'Study tasks' : 'Challenges'}
           </button>
           <span style={{ color: '#E7E0D8' }}>/</span>
           <span style={{ fontSize: '14px', fontWeight: 600, color: '#16120E' }}>{challenge.title}</span>
@@ -613,7 +617,7 @@ export default function ChallengeDetail() {
                             )}
 
                             {/* completed: View analysis (real sessions with a saved conversation) */}
-                            {session.status === 'completed' && !isDemo && session.conversation_id && (
+                            {session.status === 'completed' && !isDemo && session.conversation_id && !isParticipant() && (
                               <button
                                 onClick={() => openAnalysis(session.conversation_id)}
                                 style={{

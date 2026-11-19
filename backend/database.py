@@ -12,8 +12,10 @@ from sqlalchemy import (
     JSON,
     Text,
     Boolean,
+    CheckConstraint,
     LargeBinary,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -928,6 +930,172 @@ class ArtifactRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+STUDY_CONDITIONS = ("feedback", "no_feedback")
+STUDY_BLOCKS = ("pretest", "training", "posttest", "done")
+
+
+class StudyParticipant(Base):
+    """One anonymous participant in the cognitive-offloading study.
+
+    Backed by an ordinary User row (placeholder email, unusable password) so
+    every existing user_id foreign key, access check and export keeps working;
+    this row holds only what is study-specific. The participant signs in with a
+    code, of which only the SHA-256 is stored (see study_mode.hash_code).
+
+    `condition` is fixed at creation. A participant whose condition moved
+    mid-study would contribute data to both arms under one id, which analysis
+    cannot detect afterwards, so the ORM refuses the change outright (see
+    _refuse_condition_change below) and the CHECK refuses an unknown value.
+    """
+
+    __tablename__ = "study_participants"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_study_participant_user"),
+        UniqueConstraint("code_hash", name="uq_study_participant_code_hash"),
+        CheckConstraint(
+            "condition IN ('feedback', 'no_feedback')", name="ck_study_participant_condition"
+        ),
+        CheckConstraint(
+            "current_block IN ('pretest', 'training', 'posttest', 'done')",
+            name="ck_study_participant_block",
+        ),
+        # Lucy's design assigns cells by enrollment number; unique, so two
+        # concurrent enrollments can never take the same one.
+        UniqueConstraint("enroll_seq", name="uq_study_participant_enroll_seq"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    condition: Mapped[str] = mapped_column(String(16), nullable=False)
+    current_block: Mapped[str] = mapped_column(String(16), default="pretest", nullable=False)
+    # Drives the per-block task shuffle; stored so the order is reproducible.
+    seed: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The realised order, {block: [task_id, ...]}, fixed at creation so editing
+    # the task config later cannot silently reorder a participant mid-study.
+    task_order: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # The enrollment number that picked this participant's cell (Lucy's
+    # design); NULL for participants of the older layout.
+    enroll_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+@event.listens_for(StudyParticipant, "before_update")
+def _refuse_condition_change(mapper, connection, target):
+    from sqlalchemy import inspect as sa_inspect
+
+    if sa_inspect(target).attrs.condition.history.has_changes():
+        raise ValueError("StudyParticipant.condition is fixed at creation")
+
+
+class StudyEnrollment(Base):
+    """A participant created by the Qualtrics survey (POST /study/enroll).
+
+    `response_id` is the Qualtrics ResponseID, the only join key to the survey
+    data; the Prolific ID is never stored. Enrollment is idempotent on it, so the
+    participant's sign-in code must be recoverable: it is kept Fernet-encrypted
+    under a key derived from STUDY_SECRET_KEY (the participant row still holds
+    only its hash, which is what sign-in checks)."""
+
+    __tablename__ = "study_enrollments"
+    __table_args__ = (
+        UniqueConstraint("response_id", name="uq_study_enrollment_response"),
+        UniqueConstraint("participant_id", name="uq_study_enrollment_participant"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    participant_id: Mapped[str] = mapped_column(
+        String, ForeignKey("study_participants.id"), nullable=False)
+    response_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    code_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    # Consent is taken in Qualtrics before enrollment; this is when HuskyAI
+    # recorded it.
+    consent_recorded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StudyParticipantStatus(Base):
+    """Lifecycle of one participant's study session: when the session window
+    opened (first sign-in), and whether it was revoked or ran out. A row exists
+    once the participant has signed in or been revoked; no row = never used."""
+
+    __tablename__ = "study_participant_status"
+
+    participant_id: Mapped[str] = mapped_column(
+        String, ForeignKey("study_participants.id"), primary_key=True)
+    first_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class StudyTaskAnswer(Base):
+    """A participant's answers to the end-of-task questions, one row per task.
+
+    Two pages, each written once. Page 1 (total, corrections) creates the row,
+    and the unique constraint is its lock, so a second submit (another tab, a
+    retry) cannot replace the first. Page 2 (confidence; trust and checking on
+    post-test tasks) fills the NULL columns once, by a conditional UPDATE.
+    `total` is the dollar answer as the canonical 2-decimal string, so it is
+    exported exactly as entered rather than through a float."""
+
+    __tablename__ = "study_task_answers"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "task", name="uq_study_task_answer"),
+        CheckConstraint("confidence >= 0 AND confidence <= 100",
+                        name="ck_study_task_answer_confidence"),
+        CheckConstraint("ai_trust >= 1 AND ai_trust <= 6", name="ck_study_task_answer_trust"),
+        CheckConstraint("self_check >= 1 AND self_check <= 6",
+                        name="ck_study_task_answer_check"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    participant_id: Mapped[str] = mapped_column(
+        String, ForeignKey("study_participants.id"), nullable=False, index=True)
+    task: Mapped[int] = mapped_column(Integer, nullable=False)
+    challenge_id: Mapped[str] = mapped_column(String, nullable=False)
+    user_challenge_session_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("user_challenge_sessions.id"), nullable=True)
+    total: Mapped[str] = mapped_column(String(32), nullable=False)
+    corrections: Mapped[str] = mapped_column(Text, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    # Page 2. NULL until it is submitted.
+    confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Post-test tasks only (Tk_TRUST, Tk_CHECK): 1 = completely disagree ...
+    # 6 = completely agree.
+    ai_trust: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    self_check: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class StudyExposureJudgment(Base):
+    """Whether the AI actually stated a post-test task's scripted error to the
+    participant (Lucy's EXPOSED_Tk), as judged by a model from the transcript
+    (study_exposure.py). A first-pass signal for the research team to
+    spot-check, not coded data. One row per participant and task; `exposed`
+    stays NULL when the judge failed (status "failed"), never False."""
+
+    __tablename__ = "study_exposure_judgments"
+    __table_args__ = (
+        UniqueConstraint("participant_id", "task", name="uq_study_exposure_judgment"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    participant_id: Mapped[str] = mapped_column(
+        String, ForeignKey("study_participants.id"), nullable=False, index=True)
+    task: Mapped[int] = mapped_column(Integer, nullable=False)
+    challenge_id: Mapped[str] = mapped_column(String, nullable=False)
+    error_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    exposed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Which way the claim reached the participant (e.g. for omission:
+    # "explicit_claim" or "left_capped_in_review"), or "none".
+    exposure_case: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    judge_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    judged_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 # Columns added to already-existing tables, as (table, column, DDL type).
 # `create_all` creates missing TABLES but never missing COLUMNS, and Alembic does
 # not run against SQLite here — so without this, adding a column to an existing
@@ -949,6 +1117,13 @@ _SQLITE_ADDED_COLUMNS = [
     ("verification_assignments", "replaces_assignment_id", "VARCHAR"),
     ("eval_results", "score_status", "VARCHAR(16)"),
     ("eval_results", "scored_at", "DATETIME"),
+    ("study_participants", "enroll_seq", "INTEGER"),
+]
+
+
+# Unique indexes for columns in _SQLITE_ADDED_COLUMNS, created alongside them.
+_SQLITE_ADDED_INDEXES = [
+    ("uq_study_participant_enroll_seq", "study_participants", "enroll_seq"),
 ]
 
 
@@ -969,6 +1144,15 @@ async def _ensure_sqlite_columns(conn):
             import logging
             logging.getLogger("database").warning(
                 "could not add %s.%s on sqlite: %s", table, column, e
+            )
+    for name, table, column in _SQLITE_ADDED_INDEXES:
+        try:
+            await conn.exec_driver_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({column})")
+        except Exception as e:
+            import logging
+            logging.getLogger("database").warning(
+                "could not add index %s on sqlite: %s", name, e
             )
 
 

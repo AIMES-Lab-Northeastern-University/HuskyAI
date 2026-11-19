@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import study_mode
 from auth import resolve_token_user_id
 from database import (
     AsyncSessionLocal,
@@ -992,7 +993,7 @@ async def _challenge_access_sets(
     is_admin = bool(u and u.is_platform_admin)
     if is_admin:
         r = await db.execute(select(Challenge.id))
-        return {row[0] for row in r.all()}, set(), True
+        return {row[0] for row in r.all() if not study_mode.is_study_challenge(row[0])}, set(), True
 
     stu = await _student_classroom_ids(db, user_id)
     te = await _test_enrollment_classroom_ids(db, user_id)
@@ -1005,7 +1006,7 @@ async def _challenge_access_sets(
             ClassroomChallenge.classroom_id.in_(all_cids)
         )
     )
-    rows = r.all()
+    rows = [row for row in r.all() if not study_mode.is_study_challenge(row[0])]
     by_challenge: dict[str, set[str]] = {}
     for ch_id, cid in rows:
         by_challenge.setdefault(ch_id, set()).add(cid)
@@ -1044,8 +1045,16 @@ async def _manages_linked_classroom(db: AsyncSession, user_id: str, challenge_id
 
 
 async def _can_play_challenge(
-    db: AsyncSession, user_id: str, challenge_id: str, ch: Challenge, is_admin: bool
+    db: AsyncSession, user_id: str, challenge_id: str, ch: Challenge, is_admin: bool,
+    session_number: int | None = None,
 ) -> bool:
+    # Study participants (flag on only) play their current task, nothing else.
+    participant = await study_mode.active_participant(user_id)
+    if participant is not None:
+        return bool(ch.is_active) and await study_mode.may_play(
+            db, participant, challenge_id, session_number)
+    if study_mode.is_study_challenge(challenge_id):
+        return False
     if is_admin:
         return bool(ch.is_active)
     allowed, _, _ = await _challenge_access_sets(db, user_id)
@@ -1095,6 +1104,9 @@ async def list_challenges(
     db: AsyncSession = Depends(get_db),
 ):
     allowed_ids, preview_ids, is_admin = await _challenge_access_sets(db, user_id)
+    participant = await study_mode.active_participant(user_id)
+    if participant is not None:
+        allowed_ids, preview_ids, is_admin = set(study_mode.block_task_ids(participant)), set(), False
     if not allowed_ids:
         return []
 
@@ -1139,6 +1151,9 @@ async def list_challenges(
             "group_mode": ch.id in group_ids,
         })
 
+    if participant is not None:
+        order = study_mode.block_task_ids(participant)
+        return sorted((study_mode.strip_scores(c) for c in out), key=lambda c: order.index(c["id"]))
     return out
 
 
@@ -1148,6 +1163,8 @@ async def my_husky_score(
     db: AsyncSession = Depends(get_db),
 ):
     """Husky Score = average of per-session avg PEI across all the user's ended challenge sessions."""
+    if await study_mode.active_participant(user_id) is not None:
+        return {"husky_score": None, "turns_counted": 0, "sessions_counted": 0}
     stmt = (
         select(
             func.avg(UserChallengeSession.session_avg_pei),
@@ -1315,6 +1332,11 @@ async def get_challenge(
         visible = True
     else:
         visible = False
+    if study_mode.is_study_challenge(ch.id):
+        visible = False
+    participant = await study_mode.active_participant(user_id)
+    if participant is not None:
+        visible = bool(ch.is_active) and ch.id in study_mode.block_task_ids(participant)
     if not visible:
         raise HTTPException(status_code=404, detail="Challenge not found")
 
@@ -1350,7 +1372,7 @@ async def get_challenge(
 
     group_mode, group = await _student_group_info(db, user_id, challenge_id)
 
-    return {
+    return (study_mode.strip_scores if participant is not None else dict)({
         "id": ch.id,
         "title": ch.title,
         "description": ch.description,
@@ -1364,7 +1386,7 @@ async def get_challenge(
         "group_mode": group_mode,
         "group": group,
         "sections": _sections_of(ch),
-    }
+    })
 
 
 async def _finish_hints(db: AsyncSession, user_id: str, challenge_id: str, us) -> dict:
@@ -1392,7 +1414,7 @@ async def start_session(
         raise HTTPException(status_code=404, detail="Challenge not found")
 
     _, _, is_admin = await _challenge_access_sets(db, user_id)
-    if not await _can_play_challenge(db, user_id, challenge_id, ch, is_admin):
+    if not await _can_play_challenge(db, user_id, challenge_id, ch, is_admin, session_number):
         raise HTTPException(status_code=404, detail="Challenge not found")
 
     if session_number < 1 or session_number > ch.total_sessions:
@@ -1424,6 +1446,16 @@ async def start_session(
     )
     session_record = existing_result.scalar_one_or_none()
 
+    # Study participants (flag on only): every task has the study's cap (none
+    # in Lucy's design), and no new task starts once their study session is over.
+    participant = await study_mode.active_participant(user_id)
+    time_limit = ch.time_limit_minutes
+    if participant is not None:
+        time_limit = study_mode.task_time_limit(participant)
+        starting = session_record is None or session_record.status == "not_started"
+        if starting and await study_mode.window_closed(participant):
+            raise HTTPException(status_code=403, detail=study_mode.STUDY_ENDED_DETAIL)
+
     if not session_record:
         session_record = UserChallengeSession(
             user_id=user_id,
@@ -1434,7 +1466,7 @@ async def start_session(
             # Snapshot the challenge's timer settings now, so later instructor
             # edits don't change the rules mid-attempt. The countdown is anchored
             # to started_at + time_limit_minutes.
-            time_limit_minutes=ch.time_limit_minutes,
+            time_limit_minutes=time_limit,
             min_turns=ch.min_turns,
         )
         db.add(session_record)
@@ -1443,9 +1475,15 @@ async def start_session(
     elif session_record.status == "not_started":
         session_record.status = "in_progress"
         session_record.started_at = datetime.utcnow()
-        session_record.time_limit_minutes = ch.time_limit_minutes
+        session_record.time_limit_minutes = time_limit
         session_record.min_turns = ch.min_turns
         await db.commit()
+
+    # The block a participant is in when the session starts decides feedback
+    # for the whole session. Refused rather than started without one: a
+    # session with no snapshot would run hidden, silently changing the arm.
+    if participant is not None and not await study_mode.snapshot_block(participant, session_record):
+        raise HTTPException(status_code=503, detail="Could not start the session. Try again.")
 
     sd = ch.sessions_data[session_number - 1]
     return {
@@ -1607,7 +1645,7 @@ async def complete_session(
     if not ch:
         raise HTTPException(status_code=404, detail="Challenge not found")
     _, _, is_admin = await _challenge_access_sets(db, user_id)
-    if not await _can_play_challenge(db, user_id, challenge_id, ch, is_admin):
+    if not await _can_play_challenge(db, user_id, challenge_id, ch, is_admin, session_number):
         raise HTTPException(status_code=404, detail="Challenge not found")
 
     result = await db.execute(
@@ -1630,6 +1668,9 @@ async def complete_session(
     # design — a client that skips a step, or a stale tab, must not be able to
     # close the session without them.
     check = await finish_check(db, user_id, challenge_id, session_record)
+    if not check.past_deadline and await study_mode.in_end_grace(user_id, session_record):
+        check.past_deadline = True
+    await study_mode.require_a_turn(db, user_id, session_record, check.past_deadline)
     raise_if_blocked(check)
 
     session_record.status = "completed"
@@ -1639,6 +1680,7 @@ async def complete_session(
     if session_record.end_reason is None:
         session_record.end_reason = "timer_expired" if check.past_deadline else "manual"
     await db.commit()
+    await study_mode.advance_if_block_done(user_id, challenge_id)
 
     if check.revision_owed_turn is not None:
         # Only reachable past the deadline (otherwise the check refused).

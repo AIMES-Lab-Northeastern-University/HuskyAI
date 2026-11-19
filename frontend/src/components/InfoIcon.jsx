@@ -1,10 +1,13 @@
 import { useState, useRef, useEffect } from 'react'
 
-// Small "i" affordance: click/tap to toggle a popover, click outside to close.
-// Deliberately not hover-only -- hover has no equivalent on touch devices.
+// Small "i" affordance. With a mouse it opens on hover and closes when the
+// pointer leaves. Touch has no hover, so a tap toggles it there (tap outside
+// to close), and the keyboard toggles it with Enter/Space. Decided per pointer,
+// not per device, so a touchscreen laptop gets both.
 export default function InfoIcon({ text, className = '' }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
+  const lastPointer = useRef(null)
 
   useEffect(() => {
     if (!open) return
@@ -18,10 +21,19 @@ export default function InfoIcon({ text, className = '' }) {
   if (!text) return null
 
   return (
-    <span ref={ref} className={`relative inline-flex ${className}`}>
+    <span ref={ref} className={`relative inline-flex ${className}`}
+      onPointerEnter={(e) => { if (e.pointerType === 'mouse') setOpen(true) }}
+      onPointerLeave={(e) => { if (e.pointerType === 'mouse') setOpen(false) }}>
       <button
         type="button"
-        onClick={(e) => { e.stopPropagation(); setOpen(o => !o) }}
+        onPointerDown={(e) => { lastPointer.current = e.pointerType }}
+        onClick={(e) => {
+          e.stopPropagation()
+          // A mouse click lands on an icon hover already opened: leave it open.
+          const viaMouse = lastPointer.current === 'mouse'
+          lastPointer.current = null
+          if (!viaMouse) setOpen(o => !o)
+        }}
         aria-label="More info"
         aria-expanded={open}
         className="w-3.5 h-3.5 rounded-full border border-[#D8D0C6] text-[#9A948E] flex items-center justify-center text-[9px] font-bold leading-none hover:bg-[#F7F3EE] hover:text-[#4A4440] hover:border-[#C8BEB2] transition-colors flex-shrink-0"

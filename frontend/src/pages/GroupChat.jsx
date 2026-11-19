@@ -54,13 +54,15 @@ function DimBar({ code, value = 0 }) {
   const pct = Math.min(100, value)
   return (
     <div className="mb-[14px]">
-      <div className="flex items-center gap-[10px] mb-[4px]">
+      {/* Same layout as the Workspace: the info icon gets its own column just
+          before the score, so the five icons line up. */}
+      <div className="flex items-center gap-[8px] mb-[4px]">
         <div className="flex items-center gap-[6px] flex-1 min-w-0">
           <span className="text-[11px] font-bold font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: meta.color, background: `${meta.color}15`, border: `1px solid ${meta.color}30` }}>{code}</span>
           <span className="text-[12px] text-[#4A4440] font-medium truncate">{meta.label}</span>
-          <InfoIcon text={meta.description} />
         </div>
-        <div className="text-[12px] font-bold text-[#4A4440] w-8 text-right flex-shrink-0">{Math.round(value)}</div>
+        <InfoIcon text={meta.description} className="flex-shrink-0" />
+        <div className="text-[12px] font-bold text-[#4A4440] w-7 text-right flex-shrink-0 tabular-nums">{Math.round(value)}</div>
       </div>
       <div className="flex-1 h-[6px] bg-[#F7F3EE] rounded-full border border-[#E7E0D8] overflow-hidden">
         <div className="h-full rounded-full prog-fill" style={{ width: `${pct}%`, background: meta.color }} />
@@ -132,9 +134,14 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, collapsed, onToggle, s
         <ScoreNotice message={scoreNotice} />
         <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] p-5 text-center" style={{ borderWidth: '1.5px' }}>
           <PeiRing pei={pei} />
-          <div className="flex items-center justify-center gap-2 mb-1.5">
-            <span className="text-[11px] font-bold px-[10px] py-[3px] rounded-[20px]" style={{ background: scoreBg(pei), color: scoreColor(pei) }}>{scoreLabel(pei)}</span>
-            <InfoIcon text={PEI_INFO.description} />
+          {/* Pill centred on its own; the info icon hangs off its right edge. */}
+          <div className="flex justify-center mb-1.5">
+            <div className="relative inline-flex items-center">
+              <span className="text-[11px] font-bold px-[10px] py-[3px] rounded-[20px]" style={{ background: scoreBg(pei), color: scoreColor(pei) }}>{scoreLabel(pei)}</span>
+              <span className="absolute left-full top-0 bottom-0 ml-2 flex items-center">
+                <InfoIcon text={PEI_INFO.description} />
+              </span>
+            </div>
           </div>
           {classification !== '-' && <div className="text-[12px] text-[#9A948E]">{classification} · {leadStatus}</div>}
         </div>

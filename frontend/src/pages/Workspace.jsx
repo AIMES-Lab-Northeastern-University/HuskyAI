@@ -8,7 +8,42 @@ import InfoIcon from '../components/InfoIcon'
 import ScoreNotice, { lateScoreAction } from '../components/ScoreNotice'
 import { API_URL, authHeaders, formatApiErrorDetail, clearSession, readApiError } from '../lib/api'
 import { DIM_META, PEI_INFO } from '../lib/metricInfo'
+import {
+  STUDY_TASK_COUNT, StudyTaskEnded, StudyTaskFinishedPage, StudyTaskUnavailable, isParticipant,
+  maskFeedbackFrame, NEUTRAL_PANEL_TEXT, studyTakesOver, useCompletion,
+} from '../lib/study'
 import { SAMPLE_EVAL, cannedAssistantReply, DEMO_CHALLENGE_CONTEXTS } from '../demo/demoData'
+
+// Narrow enough that a 380px feedback panel would squeeze the chat (a phone,
+// or a narrow survey frame).
+const NARROW_QUERY = '(max-width: 900px)'
+function narrowNow() {
+  try { return Boolean(window.matchMedia?.(NARROW_QUERY).matches) } catch { return false }
+}
+function useNarrowScreen() {
+  const [narrow, setNarrow] = useState(narrowNow)
+  useEffect(() => {
+    let mq
+    try { mq = window.matchMedia?.(NARROW_QUERY) } catch { mq = null }
+    if (!mq) return undefined
+    const onChange = () => setNarrow(mq.matches)
+    mq.addEventListener?.('change', onChange)
+    return () => mq.removeEventListener?.('change', onChange)
+  }, [])
+  return narrow
+}
+
+// Narrow screens only: the feedback overlay can be dragged wider or narrower,
+// within limits, so a participant can keep part of the chat in view. It never
+// gets narrower than the scores stay readable, nor wider than the screen.
+export const PANEL_MIN_PX = 240
+const STUDY_COLUMN_PX = 820
+const STUDY_COLUMN_PAD = `max(16px, calc((100% - ${STUDY_COLUMN_PX}px) / 2))`
+const PANEL_KEY_STEP_PX = 24
+export function clampPanelWidth(px, containerPx) {
+  const max = Math.max(PANEL_MIN_PX, containerPx || 0)
+  return Math.round(Math.min(max, Math.max(PANEL_MIN_PX, px)))
+}
 
 const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 
@@ -59,19 +94,46 @@ function DimBar({ code, value = 0, max = 100 }) {
   const pct = Math.min(100, (value / max) * 100)
   return (
     <div className="mb-[14px]">
-      <div className="flex items-center gap-[10px] mb-[4px]">
+      {/* The info icon sits in its own column just before the score, so the
+          five icons line up whatever the label length. */}
+      <div className="flex items-center gap-[8px] mb-[4px]">
         <div className="flex items-center gap-[6px] flex-1 min-w-0">
           <span className="text-[11px] font-bold font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: meta.color, background: `${meta.color}15`, border: `1px solid ${meta.color}30` }}>{code}</span>
           <span className="text-[12px] text-[#4A4440] font-medium truncate">{meta.label}</span>
-          <InfoIcon text={meta.description} />
         </div>
-        <div className="text-[12px] font-bold text-[#4A4440] w-8 text-right flex-shrink-0">{Math.round(value)}</div>
+        <InfoIcon text={meta.description} className="flex-shrink-0" />
+        <div className="text-[12px] font-bold text-[#4A4440] w-7 text-right flex-shrink-0 tabular-nums">{Math.round(value)}</div>
       </div>
       <div className="flex items-center gap-[10px]">
         <div className="flex-1 h-[6px] bg-[#F7F3EE] rounded-full border border-[#E7E0D8] overflow-hidden">
           <div className="h-full rounded-full prog-fill" style={{ width: `${pct}%`, background: meta.color }} />
         </div>
       </div>
+    </div>
+  )
+}
+
+/* ─── Study task stepper ─── */
+// Where a participant is in their six tasks. Tasks open strictly in order, so
+// every task before the current one is finished.
+export function TaskStepper({ current, total }) {
+  return (
+    <div className="flex items-center gap-2" data-testid="task-stepper">
+      <div className="flex items-center gap-[4px]" aria-hidden>
+        {Array.from({ length: total }, (_, i) => {
+          const n = i + 1
+          const state = n < current ? 'done' : n === current ? 'current' : 'todo'
+          return (
+            <span key={n} data-state={state} className="block h-[6px] rounded-full transition-all"
+              style={{
+                width: state === 'current' ? '18px' : '8px',
+                background: state === 'todo' ? '#E7E0D8' : '#C8102E',
+                opacity: state === 'done' ? 0.45 : 1,
+              }} />
+          )
+        })}
+      </div>
+      <span className="text-[11px] font-semibold text-[#9A948E] whitespace-nowrap">Task {current} of {total}</span>
     </div>
   )
 }
@@ -83,17 +145,35 @@ function fmtClock(ms) {
 }
 
 /* ─── Eval Panel ─── */
-function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreNotice }) {
+// headerAction: an optional control shown at the right of the panel header
+// (the participant's Hide feedback button).
+function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreNotice, neutral = false,
+  headerAction = null }) {
   // A session can be configured to score every turn without showing the score.
   // That is an experimental condition, not a failure, so it gets its own
   // deliberate panel — an empty or errored-looking sidebar would read as the
   // evaluator being broken and change how students behave for the wrong reason.
+  if (feedSuppressed && neutral) {
+    // Study participants: nothing here may suggest the work is being scored.
+    return (
+      <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col" style={{ borderLeftWidth: '1.5px' }}>
+        <div className="p-5">
+          <div className="bg-[#F7F3EE] border border-[#E7E0D8] rounded-[14px] p-5" style={{ borderWidth: '1.5px' }}>
+            <p className="text-[13px] text-[#4A4440] leading-relaxed">{NEUTRAL_PANEL_TEXT}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
   if (feedSuppressed) {
     return (
       <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col" style={{ borderLeftWidth: '1.5px' }}>
-        <div className="px-5 py-4 border-b border-[#E7E0D8] flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
-          <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Evaluator</div>
-          {turnCount > 0 && <div className="text-[12px] text-[#9A948E] mt-0.5">Turn {turnCount}</div>}
+        <div className="px-5 py-4 border-b border-[#E7E0D8] flex items-center justify-between gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+          <div>
+            <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Evaluator</div>
+            {turnCount > 0 && <div className="text-[12px] text-[#9A948E] mt-0.5">Turn {turnCount}</div>}
+          </div>
+          {headerAction}
         </div>
         <div className="p-5 flex flex-col gap-3">
           <div className="bg-[#F7F3EE] border border-[#E7E0D8] rounded-[14px] p-5" style={{ borderWidth: '1.5px' }}>
@@ -120,15 +200,20 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreN
   return (
     <div className="h-full bg-[#FDFCFB] border-l border-[#E7E0D8] flex flex-col overflow-y-auto" style={{ borderLeftWidth: '1.5px' }}>
       {/* Header */}
-      <div className="px-5 py-4 border-b border-[#E7E0D8] flex items-center justify-between flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
+      <div className="px-5 py-4 border-b border-[#E7E0D8] flex items-center justify-between gap-3 flex-shrink-0" style={{ borderBottomWidth: '1.5px' }}>
         <div>
           <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px]">Prompt Evaluator</div>
           {turnCount > 0 && <div className="text-[12px] text-[#9A948E] mt-0.5">Turn {turnCount}</div>}
         </div>
-        {isEvaluating && (
-          <div className="flex items-center gap-1.5 text-[11px] text-[#9A948E]">
-            <div className="w-1.5 h-1.5 rounded-full bg-[#C8102E] live-dot" />
-            Scoring…
+        {(isEvaluating || headerAction) && (
+          <div className="flex items-center gap-3">
+            {isEvaluating && (
+              <div className="flex items-center gap-1.5 text-[11px] text-[#9A948E]">
+                <div className="w-1.5 h-1.5 rounded-full bg-[#C8102E] live-dot" />
+                Scoring…
+              </div>
+            )}
+            {headerAction}
           </div>
         )}
       </div>
@@ -138,14 +223,23 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreN
         {/* PEI ring */}
         <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] p-5 text-center" style={{ borderWidth: '1.5px' }}>
           <PeiRing pei={pei} />
-          <div className="flex items-center justify-center gap-2 mb-1.5">
-            <span className="text-[11px] font-bold px-[10px] py-[3px] rounded-[20px]"
-              style={{ background: scoreBg(pei), color: scoreColor(pei) }}>
-              {scoreLabel(pei)}
-            </span>
-            <InfoIcon text={PEI_INFO.description} />
+          {/* The level pill is centred on its own under the ring; the info icon
+              hangs off its right edge, out of the flow, so it can't pull the
+              pill off centre. */}
+          <div className="flex justify-center mb-1.5">
+            <div className="relative inline-flex items-center">
+              <span className="text-[11px] font-bold px-[10px] py-[3px] rounded-[20px]"
+                style={{ background: scoreBg(pei), color: scoreColor(pei) }}>
+                {scoreLabel(pei)}
+              </span>
+              <span className="absolute left-full top-0 bottom-0 ml-2 flex items-center">
+                <InfoIcon text={PEI_INFO.description} />
+              </span>
+            </div>
           </div>
-          {classification !== '-' && (
+          {/* Not for participants: the pill already names the level (on a
+              different scale from this one), and "ai-led" is unexplained jargon. */}
+          {classification !== '-' && !isParticipant() && (
             <div className="text-[12px] text-[#9A948E]">{classification} · {leadStatus}</div>
           )}
         </div>
@@ -352,6 +446,20 @@ function Message({ role, content, attachments, citations }) {
 }
 
 /* ─── Challenge brief banner ─── */
+// A Markdown brief's policy list and document table, styled to sit in the banner.
+const BRIEF_MARKDOWN = {
+  p: ({ children }) => <p style={{ margin: '0 0 8px' }}>{children}</p>,
+  ul: ({ children }) => <ul style={{ margin: '0 0 8px', paddingLeft: '18px', listStyle: 'disc' }}>{children}</ul>,
+  li: ({ children }) => <li style={{ marginBottom: '2px' }}>{children}</li>,
+  table: ({ children }) => (
+    <div style={{ overflowX: 'auto', margin: '0 0 8px' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '12.5px', background: '#FFFFFF' }}>{children}</table>
+    </div>
+  ),
+  th: ({ children, style }) => <th style={{ ...style, border: '1px solid #E7E0D8', padding: '5px 8px', background: '#F7F3EE', fontWeight: 600, color: '#16120E' }}>{children}</th>,
+  td: ({ children, style }) => <td style={{ ...style, border: '1px solid #E7E0D8', padding: '5px 8px' }}>{children}</td>,
+}
+
 function ChallengeBanner({ context, onUseSeed }) {
   const [expanded, setExpanded] = useState(true)
   if (!context) return null
@@ -369,7 +477,10 @@ function ChallengeBanner({ context, onUseSeed }) {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#C8102E" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
           </svg>
-          <span style={{ fontSize: '12px', fontWeight: 700, color: '#C8102E' }}>Challenge: {context.title}</span>
+          {/* Participants already have the title in the top bar: no repeat here. */}
+          <span style={{ fontSize: '12px', fontWeight: 700, color: '#C8102E' }}>
+            {isParticipant() ? 'Task brief' : `Challenge: ${context.title}`}
+          </span>
         </div>
         <button
           onClick={() => setExpanded(e => !e)}
@@ -380,13 +491,23 @@ function ChallengeBanner({ context, onUseSeed }) {
       </div>
       {expanded && (
         <>
-          <p style={{ fontSize: '12px', color: '#9E0B24', marginBottom: '8px', lineHeight: 1.6 }}>
-            <strong>Goal:</strong> {context.goal}
-          </p>
-          <div style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px', fontSize: '12px', color: '#4A4440', lineHeight: 1.7, marginBottom: '10px', whiteSpace: 'pre-wrap' }}>
-            {context.brief}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
+          {/* A Markdown brief (Lucy's study tasks only) ends with its own
+              "Your task" line, so it carries no separate goal. */}
+          {context.brief_format !== 'markdown' && (
+            <p style={{ fontSize: '12px', color: '#9E0B24', marginBottom: '8px', lineHeight: 1.6 }}>
+              <strong>Goal:</strong> {context.goal}
+            </p>
+          )}
+          {context.brief_format === 'markdown' ? (
+            <div data-testid="brief-markdown" className="study-brief" style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px 12px', fontSize: '13px', color: '#4A4440', lineHeight: 1.6, marginBottom: '10px' }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={BRIEF_MARKDOWN}>{context.brief}</ReactMarkdown>
+            </div>
+          ) : (
+            <div style={{ background: 'rgba(255,255,255,0.6)', borderRadius: '8px', padding: '10px', fontSize: '12px', color: '#4A4440', lineHeight: 1.7, marginBottom: '10px', whiteSpace: 'pre-wrap' }}>
+              {context.brief}
+            </div>
+          )}
+          {!(isParticipant() && !context.seed_question) && <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
             <p style={{ fontSize: '12px', color: '#9E0B24', fontStyle: 'italic', flex: 1, margin: 0, lineHeight: 1.6 }}>
               "{context.seed_question}"
             </p>
@@ -396,7 +517,7 @@ function ChallengeBanner({ context, onUseSeed }) {
             >
               Use this →
             </button>
-          </div>
+          </div>}
         </>
       )}
     </div>
@@ -411,6 +532,25 @@ export default function Workspace() {
   const [searchParams] = useSearchParams()
   const challengeId  = searchParams.get('challenge')
   const sessionNum   = searchParams.get('session')
+  // Study survey links (/study?code=...&task=N) land here with these.
+  const studyTask    = searchParams.get('task')
+  const studyEmbed   = searchParams.get('embed') === '1'
+  const embeddedInSurvey = studyEmbed && isParticipant()
+  // A survey task (per-task link, or framed in the survey): no way back to
+  // the task list, which is not part of the survey flow.
+  const fromSurvey = Boolean(studyTask) || embeddedInSurvey
+  // No sidebar on a survey task either way (framed, or a per-task link opened
+  // on its own): its "Study tasks" entry would be the way back to the task
+  // list that fromSurvey takes away. Participants only; anyone else keeps it.
+  const hideSidebar = isParticipant() && (studyEmbed || Boolean(studyTask))
+  // Participants get the compact composer (see the input area) and a centred
+  // reading column: the brief, the messages and the composer share one width,
+  // at most STUDY_COLUMN_PX, by side padding (so no wrapper is needed). On a
+  // narrow screen the padding bottoms out at 16px.
+  const studyComposer = isParticipant()
+  const studyColumnPad = studyComposer
+    ? { paddingLeft: STUDY_COLUMN_PAD, paddingRight: STUDY_COLUMN_PAD }
+    : undefined
   const demoChallengeSlug = searchParams.get('demoChallenge')
 
   const token = localStorage.getItem('token')
@@ -447,6 +587,19 @@ export default function Workspace() {
   // the score is deliberately not shown. revisionRequired: the feed has been
   // shown for the designated turn and the next submission is the one that counts.
   const [feedSuppressed, setFeedSuppressed] = useState(false)
+  // Study mode second layer. A participant starts with feedback hidden (fail
+  // closed) and sees it only once session_init says feedback_visible: true;
+  // while hidden, score frames are masked and every score surface is hidden.
+  // The server already withholds them. Normal users never get the field.
+  const [feedbackHidden, setFeedbackHidden] = useState(() => isParticipant())
+  const feedbackHiddenRef = useRef(feedbackHidden)
+  // Participants only: the feedback panel can be hidden. It starts hidden on
+  // a narrow screen (a phone in the survey frame) and opens over the chat
+  // there. Every change is logged: the panel is the intervention.
+  const narrowScreen = useNarrowScreen()
+  const [panelOpen, setPanelOpen] = useState(() => !narrowNow())
+  const panelLoggedRef = useRef(false)
+  const [taskUnavailable, setTaskUnavailable] = useState(false)
   const [revisionRequired, setRevisionRequired] = useState(null)
   const [revisionDone, setRevisionDone]   = useState(false)
   // Turn whose feedback still needs a graded revision (server-decided, sent in
@@ -465,6 +618,10 @@ export default function Workspace() {
   const [deadlineMs, setDeadlineMs]       = useState(null)
   const [remainingMs, setRemainingMs]     = useState(null)
   const [timeWarning, setTimeWarning]     = useState(false)
+  // The task's full length, for the participant's time-left bar.
+  const [timeLimitMs, setTimeLimitMs]     = useState(null)
+  // A participant's finished task: its owed page of questions, then its code.
+  const study = useCompletion(sessionEnded && isParticipant() ? challengeId : null, studyEmbed)
 
   const wsRef              = useRef(null)
   const reconnectTimer     = useRef(null)
@@ -564,14 +721,91 @@ export default function Workspace() {
       navigate('/', { replace: true })
       return
     }
+    // Read before clearSession, which drops the participant marker.
+    const participant = isParticipant()
     clearSession()
     wsRef.current?.close()
-    navigate('/login', { replace: true })
+    // A participant's token stops working when their study session ends.
+    navigate(participant ? '/study?ended=1' : '/login', { replace: true })
   }
 
+  const sendPanelState = (open, reason) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify({ type: 'study_panel', open, reason })) } catch { /* closing */ }
+    }
+  }
+  const togglePanel = () => {
+    const open = !panelOpen
+    setPanelOpen(open)
+    sendPanelState(open, 'user')
+  }
+
+  // Resizing the narrow-screen overlay. The width is kept for the rest of the
+  // page (hiding and reopening keeps it) and logged once per drag or key press:
+  // how much of the screen the feedback took is part of the exposure record.
+  const panelRef = useRef(null)
+  const [panelWidth, setPanelWidth] = useState(null)
+  const panelWidthRef = useRef(null)
+  const panelDragRef = useRef(null)
+  const panelContainerWidth = () =>
+    panelRef.current?.parentElement?.getBoundingClientRect().width || 0
+  const applyPanelWidth = (px, containerPx) => {
+    const w = clampPanelWidth(px, containerPx)
+    panelWidthRef.current = w
+    setPanelWidth(w)
+  }
+  const sendPanelResize = (containerPx) => {
+    const ws = wsRef.current
+    if (panelWidthRef.current == null || !ws || ws.readyState !== 1) return
+    try {
+      ws.send(JSON.stringify({ type: 'study_panel_resize', width_px: panelWidthRef.current,
+        container_px: Math.round(containerPx) }))
+    } catch { /* closing */ }
+  }
+  const onPanelResizeStart = (e) => {
+    const box = panelRef.current?.parentElement?.getBoundingClientRect()
+    if (!box) return
+    e.preventDefault()
+    panelDragRef.current = { right: box.right, width: box.width, start: panelWidthRef.current }
+    try { e.currentTarget.setPointerCapture?.(e.pointerId) } catch { /* not capturable */ }
+  }
+  const onPanelResizeMove = (e) => {
+    const d = panelDragRef.current
+    if (d) applyPanelWidth(d.right - e.clientX, d.width)
+  }
+  const onPanelResizeEnd = () => {
+    const d = panelDragRef.current
+    if (!d) return
+    panelDragRef.current = null
+    if (panelWidthRef.current !== d.start) sendPanelResize(d.width)
+  }
+  const onPanelResizeKey = (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+    e.preventDefault()
+    const containerPx = panelContainerWidth()
+    const current = panelWidthRef.current ?? panelRef.current?.getBoundingClientRect().width ?? PANEL_MIN_PX
+    // The panel grows leftwards, so Left widens it.
+    applyPanelWidth(current + (e.key === 'ArrowLeft' ? PANEL_KEY_STEP_PX : -PANEL_KEY_STEP_PX), containerPx)
+    sendPanelResize(containerPx)
+  }
+  // A panel that starts hidden (narrow screen) is logged once, when the
+  // session says feedback is shown, so its absence is in the log too.
+  useEffect(() => {
+    if (!isParticipant() || feedbackHidden || connStatus !== 'connected' || panelLoggedRef.current) return
+    panelLoggedRef.current = true
+    if (!panelOpen) sendPanelState(false, 'auto_narrow')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedbackHidden, connStatus])
+
   const handleWsMessage = useCallback((data) => {
+    if (feedbackHiddenRef.current) data = maskFeedbackFrame(data)
     switch (data.type) {
       case 'session_init':
+        if (typeof data.feedback_visible === 'boolean') {
+          feedbackHiddenRef.current = !data.feedback_visible
+          setFeedbackHidden(!data.feedback_visible)
+        }
         setConversationId(data.conversation_id)
         setMinTurns(typeof data.min_turns === 'number' ? data.min_turns : null)
         if (typeof data.turn_count === 'number') setTurnCount(data.turn_count)
@@ -593,6 +827,8 @@ export default function Workspace() {
           setTimeWarning(false)
           setDeadlineMs(Date.now() + data.remaining_seconds * 1000)
           setRemainingMs(data.remaining_seconds * 1000)
+          setTimeLimitMs(typeof data.time_limit_minutes === 'number' && data.time_limit_minutes > 0
+            ? data.time_limit_minutes * 60000 : null)
         } else {
           setDeadlineMs(null)
           setRemainingMs(null)
@@ -760,7 +996,7 @@ export default function Workspace() {
       setConnStatus('disconnected'); setIsStreaming(false); setIsTyping(false); setIsEvaluating(false)
       if (e.code === 4001) { handleLogout(); return }
       // Not allowed to play this challenge: retrying every 3s cannot fix that.
-      if (e.code === 4003) { setConnStatus('error'); return }
+      if (e.code === 4003) { setConnStatus('error'); if (isParticipant()) setTaskUnavailable(true); return }
       if (sessionEndedRef.current) return
       reconnectTimer.current = setTimeout(connect, 3000)
     }
@@ -853,8 +1089,11 @@ export default function Workspace() {
         setEndReason(data.end_reason ?? null)
         ok = true
         // Surface the analysis panel and start polling for the background result.
-        setShowAnalysis(true)
-        pollAnalysis(conversationId)
+        // Not on a survey task link: there the completion code is what matters.
+        if (!feedbackHiddenRef.current && !(isParticipant() && studyTask)) {
+          setShowAnalysis(true)
+          pollAnalysis(conversationId)
+        }
       } else if (!auto) {
         // Normally unreachable: the button is disabled while a gate applies.
         // Shown inline for a stale tab, instead of failing silently.
@@ -988,20 +1227,42 @@ export default function Workspace() {
   }
 
   if (!isDemo && !token) return <Navigate to="/login" replace />
+  // Past page 1 of a finished task's questions: the task and chat are gone.
+  if (isParticipant() && sessionEnded && studyTakesOver(study)) {
+    return <StudyTaskFinishedPage study={study} fromSurvey={fromSurvey} />
+  }
 
   const connDot = { connected: '#16A34A', connecting: '#F97316', error: '#C8102E', disconnected: '#9A948E' }
 
   return (
     <div className="flex h-screen bg-[#F7F3EE] overflow-hidden">
-      <Sidebar onLogout={handleLogout} />
+      {/* A survey task: no sidebar. Its only entries (study tasks, sign out)
+          are not for use mid-survey, and the frame needs the width. */}
+      {!hideSidebar && <Sidebar onLogout={handleLogout} />}
 
       {/* Main area */}
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ marginLeft: hideSidebar ? 0 : 'var(--sidebar-width, 220px)', transition: 'margin-left 200ms ease' }}>
 
         {/* Topbar */}
         <div className="h-14 bg-[#FDFCFB] border-b border-[#E7E0D8] flex items-center px-8 gap-3 flex-shrink-0 sticky top-0 z-10" style={{ borderBottomWidth: '1.5px' }}>
+          {/* Participants: a thin time-left bar along the bottom edge, shrinking
+              as the task runs down and turning orange in the last minute (the
+              same moment the clock chip warns). */}
+          {isParticipant() && !isDemo && !sessionEnded && timeLimitMs && remainingMs != null && (
+            <div className="absolute left-0 right-0 bottom-0 h-[3px] pointer-events-none" data-testid="time-left-bar"
+              role="progressbar" aria-label="Time left in this task" aria-valuemin={0} aria-valuemax={100}
+              aria-valuenow={Math.round(Math.max(0, Math.min(1, remainingMs / timeLimitMs)) * 100)}>
+              <div className="h-full" style={{
+                width: `${Math.max(0, Math.min(1, remainingMs / timeLimitMs)) * 100}%`,
+                background: timeWarning ? '#F97316' : '#C8102E',
+                opacity: timeWarning ? 1 : 0.55,
+                transition: 'width 1s linear, background 300ms ease',
+              }} />
+            </div>
+          )}
           {challengeId ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {!isParticipant() && <>
               <button
                 onClick={() => navigate(`${isDemo ? '/demo' : ''}/challenges/${challengeId}`)}
                 style={{ display: 'flex', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', color: '#9A948E', fontSize: '12px', padding: 0 }}
@@ -1010,14 +1271,17 @@ export default function Workspace() {
                 Challenge
               </button>
               <span style={{ color: '#E7E0D8' }}>/</span>
+              </>}
               <span className="text-[14px] font-semibold text-[#16120E]">
                 {challengeContext?.title || 'Session ' + sessionNum}
               </span>
-              {sessionNum && (
+              {sessionNum && (isParticipant() && studyTask
+                ? <TaskStepper current={Number(studyTask)} total={STUDY_TASK_COUNT} />
+                : (
                 <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: '#FDE8EC', color: '#C8102E' }}>
-                  Session {sessionNum}
+                  {`Session ${sessionNum}`}
                 </span>
-              )}
+              ))}
             </div>
           ) : (
             <div>
@@ -1046,7 +1310,8 @@ export default function Workspace() {
                 <span aria-hidden>⏱</span>{fmtClock(remainingMs)}
               </div>
             )}
-            {conversationId && !isDemo && messages.length > 0 && (
+            {/* Never for participants, in either condition: the server refuses it too. */}
+            {conversationId && !isDemo && messages.length > 0 && !feedbackHidden && !isParticipant() && (
               <button
                 onClick={handleExport}
                 disabled={exporting}
@@ -1067,13 +1332,47 @@ export default function Workspace() {
                 {exporting ? 'Exporting…' : 'Export chat'}
               </button>
             )}
-            {conversationId && !isDemo && (() => {
+            {conversationId && !isDemo && isParticipant() && (() => {
+              // A participant finishes after at least one saved turn; the server
+              // enforces the same rule (and the timer ends the task regardless).
+              // turnCount moves when the server confirms the turn is saved (the
+              // eval / eval_suppressed / eval_pending frame), not when the reply
+              // finishes streaming: the save comes after scoring.
+              const saved = turnCount >= 1 && !isEvaluating && !isStreaming && !isTyping
+              const disabled = sessionEnded || endingSession || !saved
+              return (
+                <>
+                {endError && <span role="alert" style={{ fontSize: '12px', color: '#C8102E' }}>{endError}</span>}
+                <button
+                  onClick={() => handleEndSession()}
+                  disabled={disabled}
+                  title={sessionEnded || saved ? undefined
+                    : (turnCount >= 1 || isEvaluating || isStreaming || isTyping ? 'Saving your message…' : 'Send at least one message first')}
+                  style={{
+                    padding: '5px 14px',
+                    background: disabled ? '#F7F3EE' : '#FDE8EC',
+                    color: disabled ? '#9A948E' : '#C8102E',
+                    border: '1.5px solid',
+                    borderColor: disabled ? '#E7E0D8' : '#F9BFCA',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: disabled ? 'default' : 'pointer',
+                    opacity: endingSession ? 0.6 : 1,
+                  }}
+                >
+                  {sessionEnded ? 'Task finished' : endingSession ? 'Finishing…' : 'Finish task'}
+                </button>
+                </>
+              )
+            })()}
+            {conversationId && !isDemo && !isParticipant() && (() => {
               const minTurnsMet = minTurns == null || scoredTurns >= minTurns
               const turnsLeft = minTurns != null ? Math.max(0, minTurns - scoredTurns) : 0
               const revisionPending = revisionOwedTurn != null && !revisionDone
               const disabled = sessionEnded || endingSession || !minTurnsMet || revisionPending
               const title = sessionEnded ? undefined
-                : !minTurnsMet ? `Send ${turnsLeft} more scored turn${turnsLeft !== 1 ? 's' : ''} to end`
+                : !minTurnsMet ? `Send ${turnsLeft} more ${feedbackHidden ? '' : 'scored '}turn${turnsLeft !== 1 ? 's' : ''} to end`
                 : revisionPending
                   ? (turnCount < revisionOwedTurn
                     ? `After the feedback on turn ${revisionOwedTurn} you'll send one revised attempt; you can end the session after that`
@@ -1126,12 +1425,12 @@ export default function Workspace() {
         </div>
 
         {/* Two-panel layout */}
-        <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 flex overflow-hidden relative">
 
           {/* Chat panel */}
           <div className="flex flex-col flex-1 overflow-hidden bg-[#F7F3EE]">
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4">
+            <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4" style={studyColumnPad}>
               {/* Challenge brief banner */}
               {challengeContext && (
                 <ChallengeBanner
@@ -1140,7 +1439,8 @@ export default function Workspace() {
                 />
               )}
 
-              {messages.length === 0 && !isTyping && !isStreaming && (
+              {taskUnavailable && <StudyTaskUnavailable fromSurvey={fromSurvey} />}
+              {messages.length === 0 && !isTyping && !isStreaming && !taskUnavailable && (
                 <div className="flex-1 flex flex-col items-center justify-center text-center py-20">
                   <div className="w-12 h-12 bg-[#C8102E] rounded-[14px] flex items-center justify-center mb-4 mx-auto">
                     <svg className="w-6 h-6 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1152,9 +1452,11 @@ export default function Workspace() {
                     {challengeContext ? 'Challenge ready' : 'Start your session'}
                   </h2>
                   <p className="text-[13px] text-[#9A948E] max-w-[320px] leading-[1.65]">
-                    {challengeContext
-                      ? 'Click "Use this →" above to load the seed question, or write your own.'
-                      : 'Ask a question. Your prompting style will be scored in real time.'}
+                    {challengeContext && isParticipant() && !challengeContext.seed_question
+                      ? 'Write your first message to the AI assistant below.'
+                      : challengeContext
+                        ? 'Click "Use this →" above to load the seed question, or write your own.'
+                        : 'Ask a question. Your prompting style will be scored in real time.'}
                   </p>
                 </div>
               )}
@@ -1165,7 +1467,7 @@ export default function Workspace() {
                   {/* Under the latest user turn, once it has been scored (not in demo). */}
                   {!isDemo
                     && i === messages.findLastIndex((mm) => mm.role === 'user')
-                    && evalData?.scores?.PEI != null && (
+                    && evalData?.scores?.PEI != null && !feedbackHidden && (
                       <StrongerPromptCard
                         prompt={m.content}
                         scores={evalData?.scores}
@@ -1213,9 +1515,17 @@ export default function Workspace() {
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Input area */}
-            <div className="flex-shrink-0 px-6 py-4 border-t border-[#E7E0D8] bg-[#FDFCFB]" style={{ borderTopWidth: '1.5px' }}>
-              {sessionEnded ? (
+            {/* Input area. Participants get a compact composer: a single
+                rounded box floating on the chat background, no attach button,
+                a short placeholder. Everyone else keeps the original bar. */}
+            <div className={studyComposer
+              ? 'flex-shrink-0 pt-1 pb-3 bg-[#F7F3EE]'
+              : 'flex-shrink-0 px-6 py-4 border-t border-[#E7E0D8] bg-[#FDFCFB]'}
+              style={studyComposer ? studyColumnPad : { borderTopWidth: '1.5px' }}>
+              {sessionEnded && isParticipant() ? (
+                <StudyTaskEnded canViewAnalysis={!feedbackHidden && !fromSurvey} onViewAnalysis={() => setShowAnalysis(true)}
+                  study={study} fromSurvey={fromSurvey} />
+              ) : sessionEnded ? (
                 <div style={{
                   background: '#F7F3EE',
                   border: '1.5px solid #E7E0D8',
@@ -1255,7 +1565,9 @@ export default function Workspace() {
                   </div>
                 </div>
               ) : (
-                <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3"
+                <div className={studyComposer
+                       ? 'bg-white border border-[#E7E0D8] rounded-[16px] pl-4 pr-2 py-2 shadow-[0_2px_12px_rgba(22,18,14,0.07)]'
+                       : 'bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] px-4 py-3'}
                      style={{ borderWidth: '1.5px',
                               borderColor: revisionRequired && !revisionDone ? '#C8102E' : undefined }}>
                   {/* Consequential revision (Phase 3). The next submission is the
@@ -1296,7 +1608,8 @@ export default function Workspace() {
                       ))}
                     </div>
                   )}
-                  <div className="flex gap-3 items-end">
+                  <div className={studyComposer ? 'flex gap-2 items-end' : 'flex gap-3 items-end'}>
+                    {!studyComposer && <>
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1317,6 +1630,7 @@ export default function Workspace() {
                         <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                       </svg>
                     </button>
+                    </>}
                     <textarea
                       ref={textareaRef}
                       value={input}
@@ -1324,15 +1638,19 @@ export default function Workspace() {
                       onKeyDown={handleKeyDown}
                       placeholder={revisionRequired && !revisionDone
                         ? 'Write your revised attempt — this one counts…'
+                        : studyComposer ? 'Message the AI assistant…'
                         : (challengeContext ? 'Respond to the challenge brief… (Shift+Enter for new line)' : 'Ask a question… (Shift+Enter for new line)')}
                       rows={1}
-                      className="flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans"
+                      // Participants: 5px padding makes one line exactly the
+                      // send button's height, so they sit level.
+                      className={`flex-1 resize-none outline-none bg-transparent text-[14px] text-[#16120E] placeholder-[#9A948E] leading-[1.6] max-h-[160px] font-sans${studyComposer ? ' py-[5px]' : ''}`}
                       style={{ fontFamily: "'DM Sans', sans-serif" }}
                     />
                     <button
                       onClick={handleSend}
+                      aria-label="Send"
                       disabled={(!input.trim() && attachments.length === 0) || isStreaming || isTyping || isEvaluating || (!isDemo && connStatus !== 'connected')}
-                      className="w-9 h-9 rounded-[9px] bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer"
+                      className={`${studyComposer ? 'w-8 h-8 rounded-[10px]' : 'w-9 h-9 rounded-[9px]'} bg-[#C8102E] hover:bg-[#9E0B24] disabled:opacity-40 flex items-center justify-center flex-shrink-0 transition-colors border-none cursor-pointer`}
                     >
                       <svg className="w-4 h-4 stroke-white fill-none" viewBox="0 0 24 24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                         <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
@@ -1349,15 +1667,56 @@ export default function Workspace() {
             </div>
           </div>
 
-          {/* Eval panel */}
-          <div className="w-[380px] flex-shrink-0 overflow-hidden">
-            <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} scoreNotice={scoreNotice} />
-          </div>
+          {/* Eval panel. A participant whose session shows no feedback gets no
+              panel at all (standard condition, and every post-test task). */}
+          {!isParticipant() && (
+            <div className="w-[380px] flex-shrink-0 overflow-hidden">
+              <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed || feedbackHidden} scoreNotice={scoreNotice} neutral={feedbackHidden} />
+            </div>
+          )}
+          {isParticipant() && !feedbackHidden && !panelOpen && (
+            <div className="w-[40px] flex-shrink-0 bg-[#FDFCFB] border-l border-[#E7E0D8] flex justify-center pt-3" style={{ borderLeftWidth: '1.5px' }}>
+              <button type="button" onClick={togglePanel} aria-expanded="false" aria-controls="study-feedback-panel"
+                data-testid="feedback-panel-show"
+                className="[writing-mode:vertical-rl] rotate-180 px-1 py-3 bg-[#C8102E] text-white text-[12px] font-semibold border-none rounded-[8px] cursor-pointer">
+                Show feedback
+              </button>
+            </div>
+          )}
+          {isParticipant() && !feedbackHidden && panelOpen && (
+            <div id="study-feedback-panel" data-testid="feedback-panel" ref={panelRef}
+              style={narrowScreen && panelWidth != null ? { width: `min(${panelWidth}px, 100%)` } : undefined}
+              className={narrowScreen
+                ? 'absolute top-0 right-0 bottom-0 z-20 w-[min(380px,100%)] flex flex-col bg-[#FDFCFB] shadow-[-8px_0_24px_rgba(22,18,14,0.18)] pl-[14px]'
+                : 'w-[380px] flex-shrink-0 flex flex-col overflow-hidden'}>
+              {narrowScreen && (
+                <div role="separator" aria-orientation="vertical" aria-label="Resize feedback panel"
+                  aria-valuemin={PANEL_MIN_PX} aria-valuenow={panelWidth ?? undefined} tabIndex={0}
+                  data-testid="feedback-panel-resize" title="Drag to resize"
+                  onPointerDown={onPanelResizeStart} onPointerMove={onPanelResizeMove}
+                  onPointerUp={onPanelResizeEnd} onPointerCancel={onPanelResizeEnd}
+                  onKeyDown={onPanelResizeKey}
+                  className="absolute left-0 top-0 bottom-0 w-[14px] z-30 flex items-center justify-center cursor-ew-resize touch-none select-none bg-[#F7F3EE] border-l-[1.5px] border-r border-[#E7E0D8]">
+                  <span aria-hidden className="block w-[4px] h-[44px] rounded-full bg-[#B8AEA3]" />
+                </div>
+              )}
+              <div className="flex-1 overflow-hidden">
+                <EvalSidebar evalData={evalData} isEvaluating={isEvaluating} turnCount={turnCount} feedSuppressed={feedSuppressed} scoreNotice={scoreNotice} neutral={false}
+                  headerAction={(
+                    <button type="button" onClick={togglePanel} aria-expanded="true" aria-controls="study-feedback-panel"
+                      data-testid="feedback-panel-hide"
+                      className="flex-shrink-0 whitespace-nowrap px-3 py-[5px] bg-[#FDFCFB] text-[#4A4440] border-[1.5px] border-[#E7E0D8] rounded-[8px] text-[12px] font-semibold cursor-pointer hover:bg-[#F7F3EE]">
+                      Hide feedback
+                    </button>
+                  )} />
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Post-session analysis modal */}
-      {showAnalysis && !isDemo && (
+      {showAnalysis && !isDemo && !feedbackHidden && (
         <div
           onClick={() => setShowAnalysis(false)}
           style={{

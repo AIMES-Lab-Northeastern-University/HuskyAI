@@ -11,11 +11,11 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,6 +79,22 @@ log = logging.getLogger("admin")
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+def study_mode_not_participant(user_id_column):
+    """study_mode.not_participant, imported late (study_mode imports auth)."""
+    from study_mode import not_participant
+    return not_participant(user_id_column)
+
+
+def study_mode_prefix() -> str:
+    from study_mode import STUDY_CHALLENGE_PREFIX
+    return STUDY_CHALLENGE_PREFIX
+
+
+async def _is_study_participant(user_id: str | None) -> bool:
+    from study_mode import is_participant_user
+    return await is_participant_user(user_id)
+
+
 async def get_current_user(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header required")
@@ -109,19 +125,35 @@ async def admin_overview(
     _: str = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    n_users = await db.scalar(select(func.count()).select_from(User)) or 0
+    # Study participants and their data are left out of every count below
+    # (study_mode.not_participant); the study has its own admin page.
+    from study_mode import not_participant
+
+    n_users = await db.scalar(select(func.count()).select_from(User).where(not_participant(User.id))) or 0
     n_classrooms = await db.scalar(select(func.count()).select_from(Classroom)) or 0
     n_memberships = await db.scalar(select(func.count()).select_from(ClassroomMembership)) or 0
-    n_challenges = await db.scalar(select(func.count()).select_from(Challenge)) or 0
+    n_challenges = await db.scalar(select(func.count()).select_from(Challenge).where(
+        Challenge.id.not_like(f"{study_mode_prefix()}%"))) or 0
     n_links = await db.scalar(select(func.count()).select_from(ClassroomChallenge)) or 0
 
-    n_conversations = await db.scalar(select(func.count()).select_from(Conversation)) or 0
-    n_messages = await db.scalar(select(func.count()).select_from(Message)) or 0
-    n_eval_rows = await db.scalar(select(func.count()).select_from(EvalResult)) or 0
-    avg_eval_pei = await db.scalar(select(func.avg(EvalResult.pei)).where(EvalResult.pei.is_not(None)))
+    n_conversations = await db.scalar(
+        select(func.count()).select_from(Conversation).where(not_participant(Conversation.user_id))) or 0
+    n_messages = await db.scalar(
+        select(func.count()).select_from(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(not_participant(Conversation.user_id))) or 0
+    n_eval_rows = await db.scalar(
+        select(func.count()).select_from(EvalResult)
+        .join(Conversation, Conversation.id == EvalResult.conversation_id)
+        .where(not_participant(Conversation.user_id))) or 0
+    avg_eval_pei = await db.scalar(
+        select(func.avg(EvalResult.pei))
+        .join(Conversation, Conversation.id == EvalResult.conversation_id)
+        .where(EvalResult.pei.is_not(None), not_participant(Conversation.user_id)))
 
     week_ago = datetime.utcnow() - timedelta(days=7)
-    users_joined_7d = await db.scalar(select(func.count()).select_from(User).where(User.created_at >= week_ago)) or 0
+    users_joined_7d = await db.scalar(select(func.count()).select_from(User).where(
+        User.created_at >= week_ago, not_participant(User.id))) or 0
 
     student_memberships = await db.scalar(
         select(func.count()).select_from(ClassroomMembership).where(ClassroomMembership.role == "student")
@@ -129,14 +161,17 @@ async def admin_overview(
 
     ch_sess_started = await db.scalar(
         select(func.count()).select_from(UserChallengeSession).where(
-            UserChallengeSession.status.in_(("in_progress", "completed"))
+            UserChallengeSession.status.in_(("in_progress", "completed")),
+            not_participant(UserChallengeSession.user_id),
         )
     ) or 0
     ch_sess_completed = await db.scalar(
-        select(func.count()).select_from(UserChallengeSession).where(UserChallengeSession.status == "completed")
+        select(func.count()).select_from(UserChallengeSession).where(
+            UserChallengeSession.status == "completed", not_participant(UserChallengeSession.user_id))
     ) or 0
     avg_sess_pei = await db.scalar(
-        select(func.avg(UserChallengeSession.best_pei)).where(UserChallengeSession.best_pei.is_not(None))
+        select(func.avg(UserChallengeSession.best_pei)).where(
+            UserChallengeSession.best_pei.is_not(None), not_participant(UserChallengeSession.user_id))
     )
 
     n_classrooms_active = await db.scalar(
@@ -206,6 +241,7 @@ async def list_users(
             func.count(ClassroomMembership.id).label("section_count"),
         )
         .outerjoin(ClassroomMembership, ClassroomMembership.user_id == User.id)
+        .where(study_mode_not_participant(User.id))
         .group_by(User.id)
         .order_by(User.created_at.desc())
         .limit(1000)
@@ -251,7 +287,7 @@ async def user_activity(
     db: AsyncSession = Depends(get_db),
 ):
     u = await db.get(User, user_id)
-    if not u:
+    if not u or await _is_study_participant(user_id):
         raise HTTPException(status_code=404, detail="User not found")
 
     # Workspace stats
@@ -406,7 +442,7 @@ async def conversation_detail(
     """Full transcript of one conversation interleaved with each turn's PEI
     scores and the evaluator's feedback. Admin-only; shows raw content."""
     conv = await db.get(Conversation, conversation_id)
-    if not conv:
+    if not conv or await _is_study_participant(conv.user_id):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     owner = await db.get(User, conv.user_id)
@@ -668,7 +704,8 @@ async def _gather_export_rows(db: AsyncSession, consent_only: bool) -> list[dict
     # Bulk-load conversation metadata + messages for just those conversations.
     cr = await db.execute(
         select(Conversation.id, Conversation.user_id, Conversation.started_at)
-        .where(Conversation.id.in_(conv_ids))
+        # Study participants' conversations never leave through this export.
+        .where(Conversation.id.in_(conv_ids), study_mode_not_participant(Conversation.user_id))
     )
     conv_meta = {row[0]: {"user_id": row[1], "started_at": row[2]} for row in cr.all()}
 
@@ -788,3 +825,154 @@ async def export_conversations(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="huskyai-export-{stamp}.csv"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Study mode: mint anonymous participant codes. 404 unless STUDY_MODE_ENABLED.
+# ---------------------------------------------------------------------------
+
+# One request mints one batch in one transaction, each with a bcrypt hash, so
+# the cap keeps a single call to well under a minute.
+STUDY_MINT_MAX = 200
+
+
+class StudyMintRequest(BaseModel):
+    n: int = Field(ge=1, le=STUDY_MINT_MAX)
+    # "feedback" | "control" puts every new participant in that arm (to try
+    # one arm by hand); omitted, conditions are balanced in pairs.
+    condition: Literal["feedback", "control"] | None = None
+
+    @model_validator(mode="after")
+    def even_when_balanced(self) -> "StudyMintRequest":
+        if self.condition is None and self.n % 2:
+            raise ValueError("n must be even, so every pair holds one of each condition")
+        return self
+
+
+async def _require_study_mode() -> None:
+    import study_mode
+
+    if not study_mode.study_mode_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.post("/study/participants", status_code=201, include_in_schema=False,
+             dependencies=[Depends(_require_study_mode)])
+async def mint_study_participants(
+    body: StudyMintRequest,
+    response: Response,
+    admin_id: str = Depends(require_platform_admin),
+):
+    """Create participants and return their codes, once.
+
+    Only the hash of each code is stored, so this response is the only place a
+    code exists in plaintext: it is never logged (the log line below carries a
+    count only) and the response is marked uncacheable. The summary fields hold
+    no codes; the code-to-condition mapping is confined to `codes`."""
+    import study_mode
+
+    conditions = ((study_mode.QUALTRICS_CONDITIONS[body.condition],) if body.condition
+                  else study_mode.STUDY_CONDITIONS)
+    try:
+        minted = await study_mode.mint_codes(body.n, conditions)
+    except ValueError as e:
+        # Lucy's design assigns conditions round-robin; one cannot be picked.
+        raise HTTPException(status_code=422, detail=str(e))
+    response.headers["Cache-Control"] = "no-store"
+    log.info("admin %s minted %d study participants", admin_id[:8], len(minted))
+    by_condition: dict[str, int] = {}
+    for m in minted:
+        by_condition[m["condition"]] = by_condition.get(m["condition"], 0) + 1
+    return {
+        "created": len(minted),
+        "by_condition": by_condition,
+        "participant_ids": [m["participant_id"] for m in minted],
+        "codes": [{"participant_id": m["participant_id"], "code": m["code"],
+                   "condition": m["condition"], "order": m["order"],
+                   **{k: m[k] for k in ("set_order", "error_order", "cell") if k in m},
+                   "link_base": study_mode.link_base(m["code"])} for m in minted],
+    }
+
+
+@router.get("/study/status", include_in_schema=False,
+            dependencies=[Depends(_require_study_mode)])
+async def study_status(
+    response: Response,
+    include_conditions: bool = False,
+    _: str = Depends(require_platform_admin),
+):
+    """/study-admin's table. The condition is only sent when asked for (the
+    page's "show conditions" toggle); no code is ever sent."""
+    import study_mode
+
+    response.headers["Cache-Control"] = "no-store"
+    return {"participants": await study_mode.admin_status(include_conditions),
+            "task_minutes": study_mode.task_minutes(),
+            "session_minutes": study_mode.session_minutes()}
+
+
+@router.post("/study/participants/{participant_id}/revoke", include_in_schema=False,
+             dependencies=[Depends(_require_study_mode)])
+async def study_revoke(participant_id: str, admin_id: str = Depends(require_platform_admin)):
+    import study_mode
+
+    if not await study_mode.revoke(participant_id):
+        raise HTTPException(status_code=404, detail="Participant not found")
+    log.info("admin %s revoked study participant %s", admin_id[:8], participant_id[:8])
+    return {"revoked": True}
+
+
+@router.post("/study/exposure/rejudge", include_in_schema=False,
+             dependencies=[Depends(_require_study_mode)])
+async def study_rejudge_exposure(admin_id: str = Depends(require_platform_admin)):
+    """Run the exposure judge on every completed post-test task that has no
+    successful judgment yet (never judged, or failed)."""
+    import study_exposure
+
+    counts = await study_exposure.rejudge_missing()
+    log.info("admin %s re-ran the exposure judge: %s", admin_id[:8], counts)
+    return counts
+
+
+@router.get("/study/export.csv", include_in_schema=False,
+            dependencies=[Depends(_require_study_mode)])
+async def study_export(_: str = Depends(require_platform_admin)):
+    """Participant id, response_id, condition, per-task status, times and end
+    reasons. No sign-in or completion codes."""
+    import study_mode
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=study_mode.EXPORT_COLUMNS)
+    w.writeheader()
+    for row in await study_mode.admin_export_rows():
+        w.writerow(row)
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="huskyai-study-{stamp}.csv"',
+                 "Cache-Control": "no-store"},
+    )
+
+
+@router.get("/study/messages.{fmt}", include_in_schema=False,
+            dependencies=[Depends(_require_study_mode)])
+async def study_messages_export(fmt: Literal["csv", "json"],
+                                _: str = Depends(require_platform_admin)):
+    """Every participant message with the AI reply, the turn's scores, the
+    feedback shown (HuskyAI sessions only), mode, phase, set and error type.
+    A turn the evaluator failed on exports empty (CSV) / null (JSON) scores."""
+    import study_mode
+
+    rows = await study_mode.admin_message_rows()
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    name = f"huskyai-study-messages-{stamp}.{fmt}"
+    headers = {"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"}
+    if fmt == "json":
+        return Response(content=json.dumps(rows, ensure_ascii=False, indent=1),
+                        media_type="application/json", headers=headers)
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=study_mode.MESSAGE_EXPORT_COLUMNS)
+    w.writeheader()
+    for row in rows:
+        w.writerow({k: " | ".join(v) if isinstance(v, list) else v for k, v in row.items()})
+    return Response(content=buf.getvalue(), media_type="text/csv", headers=headers)

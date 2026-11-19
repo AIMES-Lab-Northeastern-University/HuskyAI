@@ -12,7 +12,7 @@ Fix 7: TSI judge — Add creative brainstorming and writing casual examples
 Fix 8: PSQ judge — Add data and casual high-context completeness examples
 Fix 9: RAS judge — Add staged-work / user-reserves-creative-task example
 
-Stage 1 — Domain detector       (gpt-4.1-nano)
+Stage 1 — Domain detector       (gpt-5-nano)
 Stage 2 — Five parallel dimension judges, one per PEI dimension
           (gpt-4.1-mini each, FileSearch grounded on dimension rubrics):
             * PSQ judge
@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+from openai.types.shared import Reasoning
 from pydantic import BaseModel
 from agents import (
     Agent,
@@ -188,8 +189,11 @@ Read the student's conversation and classify it into exactly one domain.
 ## Output
 domain (one of the 5), confidence (0.0-1.0), reasoning (one sentence).
 """,
-    model="gpt-4.1-nano",
-    model_settings=ModelSettings(temperature=0.2, top_p=0.9, max_tokens=256, store=True),
+    # gpt-4.1-nano was retired by OpenAI. gpt-5-nano is a reasoning model: it
+    # takes no temperature/top_p, and its reasoning tokens count against
+    # max_tokens, so effort is minimal and the cap leaves room for both.
+    model="gpt-5-nano",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="minimal"), max_tokens=1024, store=True),
 )
 
 
