@@ -547,7 +547,11 @@ export default function Workspace() {
   // reading column: the brief, the messages and the composer share one width,
   // at most STUDY_COLUMN_PX, by side padding (so no wrapper is needed). On a
   // narrow screen the padding bottoms out at 16px.
-  const studyComposer = isParticipant()
+  // Switched off: participants use the original composer at full width again.
+  // Set back to isParticipant() to restore the compact one.
+  const studyComposer = false
+  // Participants still never attach files, whichever composer they get.
+  const hideAttach = isParticipant()
   const studyColumnPad = studyComposer
     ? { paddingLeft: STUDY_COLUMN_PAD, paddingRight: STUDY_COLUMN_PAD }
     : undefined
@@ -631,6 +635,7 @@ export default function Workspace() {
   const autoEndRef         = useRef(false)
   const streamBuffer       = useRef('')
   const messagesEndRef     = useRef(null)
+  const messagesBoxRef     = useRef(null)
   const textareaRef        = useRef(null)
   const fileInputRef       = useRef(null)
 
@@ -1026,7 +1031,16 @@ export default function Workspace() {
     if (ctx) setChallengeContext(ctx)
   }, [isDemo, demoChallengeSlug])
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent])
+  useEffect(() => {
+    // Framed in the survey: scrollIntoView also scrolls every ancestor,
+    // including the Qualtrics page around the iframe, so there only the
+    // message list itself is scrolled. Everyone else is unchanged.
+    const box = messagesBoxRef.current
+    if (embeddedInSurvey && box) {
+      if (typeof box.scrollTo === 'function') box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' })
+      else box.scrollTop = box.scrollHeight
+    } else messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, streamingContent, embeddedInSurvey])
 
   // Poll the post-session analysis until it's ready or failed (it generates in
   // the background on the server). Capped so a stuck job doesn't poll forever.
@@ -1430,7 +1444,7 @@ export default function Workspace() {
           {/* Chat panel */}
           <div className="flex flex-col flex-1 overflow-hidden bg-[#F7F3EE]">
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4" style={studyColumnPad}>
+            <div ref={messagesBoxRef} className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4" style={studyColumnPad}>
               {/* Challenge brief banner */}
               {challengeContext && (
                 <ChallengeBanner
@@ -1609,7 +1623,7 @@ export default function Workspace() {
                     </div>
                   )}
                   <div className={studyComposer ? 'flex gap-2 items-end' : 'flex gap-3 items-end'}>
-                    {!studyComposer && <>
+                    {!studyComposer && !hideAttach && <>
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1659,11 +1673,21 @@ export default function Workspace() {
                   </div>
                 </div>
               )}
-              {!sessionEnded && (
+              {!sessionEnded && (isParticipant() && isEvaluating ? (
+                // Participants often have no feedback panel (standard condition,
+                // post-test tasks, or hidden), so its "Scoring…" is out of sight
+                // and the send button just goes grey. Neutral wording on purpose:
+                // it must not tell the standard condition that turns are scored.
+                <div role="status" data-testid="study-saving"
+                  className="flex items-center justify-center gap-1.5 text-[11px] text-[#6B6560] mt-2">
+                  <span aria-hidden className="w-1.5 h-1.5 rounded-full bg-[#C8102E] live-dot" />
+                  Saving your message…
+                </div>
+              ) : (
                 <div className="text-[11px] text-[#9A948E] mt-2 text-center">
                   Powered by Gemini 2.5 Pro · Prompts are evaluated for learning purposes
                 </div>
-              )}
+              ))}
             </div>
           </div>
 
