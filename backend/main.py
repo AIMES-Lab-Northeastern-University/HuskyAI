@@ -109,7 +109,10 @@ async def seed_dev_platform_admin() -> None:
 api_key = os.getenv("GOOGLE_API_KEY", "")
 if not api_key:
     log.warning("GOOGLE_API_KEY is not set — requests will fail")
-client = genai.Client(api_key=api_key)
+# Pinned to v1beta: system_instruction ("developer instruction") is refused on
+# v1, and newer google-genai releases default to v1, so an unpinned install
+# would break every chat turn with a 400.
+client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
 
 # Explicit OpenAI client for document-citation retrieval (separate from Gemini
 # chat above). Instantiated here rather than relying on OPENAI_API_KEY being
