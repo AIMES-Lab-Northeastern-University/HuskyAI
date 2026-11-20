@@ -4196,6 +4196,10 @@ async def stronger_prompt(
     the student's input. Powers the 'Show me a stronger prompt' button in the eval
     sidebar. Grounded in the turn's two weakest dimensions + coach suggestions.
     """
+    # Study participants never get a rewrite, feedback visible or not: a
+    # suggested prompt would confound the study's prompt-quality measures.
+    if await study_mode.active_participant(user_id) is not None:
+        raise HTTPException(status_code=403, detail="Not available in the study.")
     if await study_mode.feedback_hidden_now(user_id):
         raise HTTPException(status_code=403, detail="Not available in this session.")
     original = (body.prompt or "").strip()

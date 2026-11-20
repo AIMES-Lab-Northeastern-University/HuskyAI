@@ -252,8 +252,9 @@ function EvalSidebar({ evalData, isEvaluating, turnCount, feedSuppressed, scoreN
           ))}
         </div>
 
-        {/* Suggestions */}
-        {suggestions.length > 0 && (
+        {/* Suggestions. Never for study participants: prompting advice would
+            confound the study's prompt-quality measures. */}
+        {suggestions.length > 0 && !isParticipant() && (
           <div className="bg-[#FDFCFB] border border-[#E7E0D8] rounded-[14px] p-5" style={{ borderWidth: '1.5px' }}>
             <div className="text-[11px] font-bold text-[#9A948E] uppercase tracking-[0.7px] mb-3">Coach Suggestions</div>
             {suggestions.map((s, i) => (
@@ -1478,8 +1479,10 @@ export default function Workspace() {
               {messages.map((m, i) => (
                 <div key={i} className="flex flex-col gap-2">
                   <Message role={m.role} content={m.content} attachments={m.attachments} citations={m.citations} />
-                  {/* Under the latest user turn, once it has been scored (not in demo). */}
-                  {!isDemo
+                  {/* Under the latest user turn, once it has been scored (not in demo).
+                      Never for study participants: a suggested prompt would confound
+                      the study's prompt-quality measures. */}
+                  {!isDemo && !isParticipant()
                     && i === messages.findLastIndex((mm) => mm.role === 'user')
                     && evalData?.scores?.PEI != null && !feedbackHidden && (
                       <StrongerPromptCard
